@@ -1,0 +1,21 @@
+const express = require('express');
+const router = express.Router();
+const verificarToken = require('../middleware/authMiddleware');
+const { permitirRoles } = require('../middleware/rbacMiddleware');
+const c = require('../controllers/mantenimientosController');
+
+router.use(verificarToken);
+
+router.get('/frecuencias', c.listarFrecuencias);
+router.get('/instancias', c.listarInstancias);
+router.get('/exportar', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.exportar);
+router.get('/', c.listar);
+router.post('/', permitirRoles('super_admin', 'admin', 'coordinador'), c.crear);
+router.put('/:id', permitirRoles('super_admin', 'admin'), c.actualizar);
+router.post(
+  '/eventos/:id/crear-servicio',
+  permitirRoles('super_admin', 'admin', 'coordinador'),
+  c.materializarEvento
+);
+
+module.exports = router;

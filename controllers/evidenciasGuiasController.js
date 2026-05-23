@@ -1,0 +1,81 @@
+const prisma = require('../config/prisma');
+const { registrarAuditoria } = require('../utils/auditoria');
+const { estaServicioFinalizado } = require('../utils/estadoServicio');
+
+const subirEvidencia = async (req, res) => {
+  try {
+    const id_servicio = Number(req.params.id);
+    const { id_archivo, tipo_evidencia, descripcion } = req.body;
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: id_servicio }, include: { asignaciones: { where: { estado: 1 } } }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (estaServicioFinalizado(servicio.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se puede subir evidencias` });
+    }
+    const id_tecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
+    if (!id_tecnico) return res.status(400).json({ error: 'No hay técnico asignado' });
+
+    const evidencia = await prisma.tbl_servicios_evidencias.create({
+      data: {
+        id_servicio, id_tecnico,
+        id_archivo: id_archivo || null,
+        tipo_evidencia: tipo_evidencia || 'Foto',
+        descripcion: descripcion || null,
+        user_id_registration: req.user.id
+      }
+    });
+    res.status(201).json({ data: evidencia });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al subir evidencia' });
+  }
+};
+
+const listarEvidencias = async (req, res) => {
+  try {
+    const id_servicio = Number(req.params.id);
+    const list = await prisma.tbl_servicios_evidencias.findMany({
+      where: { id_servicio, estado: 1 },
+      include: { archivo: true, tecnico: true },
+      orderBy: { id: 'desc' }
+    });
+    res.json({ data: list });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al listar evidencias' });
+  }
+};
+
+const eliminarEvidencia = async (req, res) => {
+  try {
+    if (!['super_admin', 'admin'].includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'Solo Super Admin o Admin pueden eliminar evidencias' });
+    }
+    const id = Number(req.params.id);
+    const previa = await prisma.tbl_servicios_evidencias.findUnique({
+      where: { id },
+      include: { archivo: true, servicio: { select: { estado_servicio: true } } }
+    });
+    if (!previa) return res.status(404).json({ error: 'Evidencia no encontrada' });
+    if (previa.estado === 0) return res.status(400).json({ error: 'Evidencia ya eliminada' });
+    if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se puede eliminar evidencias` });
+    }
+
+    await prisma.tbl_servicios_evidencias.update({
+      where: { id },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_evidencias', id_entidad: id,
+      accion: 'DELETE', valor_anterior: previa, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar evidencia' });
+  }
+};
+
+module.exports = { subirEvidencia, listarEvidencias, eliminarEvidencia };

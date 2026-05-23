@@ -1,0 +1,1337 @@
+const prisma = require('../config/prisma');
+const { registrarAuditoria } = require('../utils/auditoria');
+const { generarCodigoServicio } = require('../utils/codigoServicio');
+const {
+  cambiarEstadoServicio,
+  esServicioEditable,
+  esServicioPostRevision,
+  estaServicioFinalizado,
+  ESTADO_SERVICIO_FINALIZADO_TECNICO,
+  ESTADO_SERVICIO_FINALIZADO_OBSERVADO
+} = require('../utils/estadoServicio');
+const {
+  ESTADO_GUIA_ADJUNTA,
+  ESTADO_GUIA_OBSERVADA,
+  estadoGuiaSegunArchivo,
+  esEstadoGuiaValido
+} = require('../utils/estadoGuia');
+const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
+const { crearCobroInicial } = require('../utils/crearCobroInicial');
+const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+const { colorPorTipo } = require('../utils/visibilidadCalendario');
+
+const tipoEventoDesdeRegistro = (tipoRegistro) =>
+  tipoRegistro === 'proyecto' ? 'proyecto' : 'servicio';
+const { paginar } = require('../utils/paginacion');
+const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
+const { replicarEnModulo, resolverModulo } = require('../utils/replicarEnModulo');
+const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
+const { _recalcEstadoChecklist } = require('./checklistController');
+
+const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
+const TOLERANCIA_SUMA_ASCENSORES = 0.01;
+
+function sanitizarPrecio(servicio, rolCodigo) {
+  if (!servicio) return servicio;
+  if (ROLES_PRECIO.includes(rolCodigo)) return servicio;
+  const clon = { ...servicio };
+  clon.precio_interno = null;
+  if (Array.isArray(clon.ascensores)) {
+    clon.ascensores = clon.ascensores.map(a => ({ ...a, monto: null }));
+  }
+  return clon;
+}
+
+/**
+ * Valida y normaliza el arreglo de ascensores recibido en el body de creación
+ * o edición de servicio. Retorna { ok, error, items } donde items es una lista
+ * de { id_ascensor: Number, monto: Number }.
+ */
+async function validarAscensores(input, idCliente, precioInterno, monedaServicio) {
+  if (!Array.isArray(input) || input.length === 0) {
+    return { ok: false, error: 'Debe seleccionar al menos un ascensor' };
+  }
+  const items = [];
+  const vistos = new Set();
+  let suma = 0;
+  for (const raw of input) {
+    const idAsc = Number(raw?.id_ascensor);
+    const monto = Number(raw?.monto);
+    if (!Number.isFinite(idAsc) || idAsc <= 0) {
+      return { ok: false, error: 'id_ascensor inválido en la lista de ascensores' };
+    }
+    if (!Number.isFinite(monto) || monto < 0) {
+      return { ok: false, error: 'monto inválido en la lista de ascensores' };
+    }
+    if (vistos.has(idAsc)) {
+      return { ok: false, error: 'No se puede repetir un mismo ascensor' };
+    }
+    vistos.add(idAsc);
+    suma += monto;
+    items.push({ id_ascensor: idAsc, monto });
+  }
+  // Validar que todos los ascensores pertenezcan al cliente
+  const ascBD = await prisma.tbl_ascensores.findMany({
+    where: { id: { in: items.map(i => i.id_ascensor) }, estado: 1 }
+  });
+  if (ascBD.length !== items.length) {
+    return { ok: false, error: 'Uno o más ascensores no existen o están inactivos' };
+  }
+  for (const a of ascBD) {
+    if (a.id_cliente !== Number(idCliente)) {
+      return { ok: false, error: `El ascensor ${a.codigo} no pertenece al cliente seleccionado` };
+    }
+  }
+  // Validar que la suma de montos coincida con el precio total (tolerancia centavo)
+  const precio = Number(precioInterno);
+  if (Number.isFinite(precio) && Math.abs(suma - precio) > TOLERANCIA_SUMA_ASCENSORES) {
+    return { ok: false, error: `La suma de montos por ascensor (S/ ${suma.toFixed(2)}) no coincide con el precio total (S/ ${precio.toFixed(2)})` };
+  }
+  return { ok: true, items, moneda: monedaServicio || 'PEN' };
+}
+
+const listar = async (req, res) => {
+  try {
+    const { q, estado_servicio, id_cliente, id_ascensor, tipo_registro, id_tipo_servicio, origen, id_tecnico, desde, hasta } = req.query;
+    const where = { estado: 1 };
+    if (q) where.OR = [
+      // Código y título del servicio
+      { codigo: { contains: q, mode: 'insensitive' } },
+      { titulo: { contains: q, mode: 'insensitive' } },
+      // Cliente
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      // Ascensores asociados: código y tipo (Pasajeros / Camillero / Carga)
+      { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } },
+      { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+      // Código de la cotización origen (si fue aprobada)
+      { cotizacion: { codigo: { contains: q, mode: 'insensitive' } } }
+    ];
+    if (estado_servicio) where.estado_servicio = estado_servicio;
+    if (id_cliente) where.id_cliente = Number(id_cliente);
+    if (id_ascensor) where.ascensores = { some: { id_ascensor: Number(id_ascensor), estado: 1 } };
+    if (tipo_registro) where.tipo_registro = tipo_registro;
+    if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
+    if (origen) where.origen = origen;
+    if (desde || hasta) {
+      where.fecha_programada = {};
+      if (desde) where.fecha_programada.gte = parseYMDLima(desde);
+      if (hasta) where.fecha_programada.lte = parseYMDFinDiaLima(hasta);
+    }
+
+    // Si el rol es tecnico, solo ve servicios donde está asignado
+    if (req.user.rol_codigo === 'tecnico') {
+      where.asignaciones = { some: { id_tecnico: req.user.id_tecnico || -1, estado: 1 } };
+    } else if (id_tecnico) {
+      where.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
+    }
+
+    const result = await paginar(
+      prisma.tbl_servicios_proyectos,
+      {
+        where, orderBy: { id: 'desc' },
+        include: {
+          cliente: { select: { id: true, nombre: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } },
+          ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
+          tipo_servicio: true,
+          asignaciones: { where: { estado: 1 }, include: { tecnico: true } }
+        }
+      },
+      req.query
+    );
+    res.json({ ...result, data: result.data.map(s => sanitizarPrecio(s, req.user.rol_codigo)) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al listar servicios' });
+  }
+};
+
+const obtener = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: {
+        cliente: true,
+        ascensores: { where: { estado: 1 }, include: { ascensor: true }, orderBy: { id: 'asc' } },
+        tipo_servicio: true,
+        cotizacion: {
+          select: {
+            id: true,
+            codigo: true,
+            estado_global: true,
+            version_activa: true,
+            titulo: true
+          }
+        },
+        mantenimiento_plan: {
+          select: {
+            id: true,
+            tipo_plan: true,
+            frecuencia: true,
+            frecuencia_dias_custom: true,
+            cantidad_mantenimientos: true,
+            cantidad_mantenimientos_gratuitos: true,
+            fecha_inicio: true,
+            estado_plan: true,
+            tipo_servicio: { select: { id: true, nombre: true, categoria: true } }
+          }
+        },
+        emergencia: { select: { id: true, id_ascensor: true, motivo: true, nivel_urgencia: true, estado_emergencia: true, fecha_reporte: true } },
+        correctivo: { select: { id: true, id_ascensor: true, falla: true, nivel_urgencia: true, estado_correctivo: true, fecha_reporte: true } },
+        asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
+        checklists: { include: { items: { where: { estado: 1 } } } },
+        guias: { include: { archivo: true, tecnico: true } },
+        evidencias: { include: { archivo: true, tecnico: true } },
+        entregas: { include: { archivo: true } },
+        cobro: { include: { pagos: { where: { estado: 1 }, include: { archivo: true } }, cuotas: { where: { estado: 1 } } } },
+        facturas: { include: { archivo: true } },
+        historial_estados: { orderBy: { fecha_cambio: 'desc' } },
+        servicio_realizado: { include: { archivo_ot: true } },
+        finalizacion_checklist: { include: { archivo_pdf: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } } }
+      }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    res.json({ data: sanitizarPrecio(servicio, req.user.rol_codigo) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al obtener servicio' });
+  }
+};
+
+const crear = async (req, res) => {
+  try {
+    const d = req.body;
+    if (!d.id_cliente || !d.id_tipo_servicio || !d.fecha_programada) {
+      return res.status(400).json({ error: 'Cliente, tipo y fecha son obligatorios' });
+    }
+    if (!ROLES_PRECIO.includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'Rol no autorizado para crear servicios con precio' });
+    }
+    if (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '') {
+      return res.status(400).json({ error: 'El precio es obligatorio' });
+    }
+    const validacion = await validarAscensores(d.ascensores, d.id_cliente, d.precio_interno, d.moneda);
+    if (!validacion.ok) return res.status(400).json({ error: validacion.error });
+
+    const esBorrador = d.es_borrador === true || d.es_borrador === 1 || d.estado_servicio === 'Borrador';
+    const estadoInicial = esBorrador ? 'Borrador' : 'Pendiente';
+
+    // Cargar tipo de servicio para saber si tiene módulo asociado (Emergencias /
+    // Correctivos / Mantenimientos / Atención Rápida). Si lo tiene, se crea
+    // también la fila correspondiente atómicamente con el servicio.
+    const tipoServicio = await prisma.tbl_tipos_servicio.findUnique({
+      where: { id: Number(d.id_tipo_servicio) },
+      select: { id: true, modulo_asociado: true, categoria: true }
+    });
+    if (!tipoServicio) return res.status(400).json({ error: 'Tipo de servicio inválido' });
+
+    // `origen` se deriva del módulo del tipo de servicio (no se acepta del
+    // body para evitar inconsistencias). Si el tipo no tiene módulo asociado,
+    // el servicio queda como 'directo'. Los demás controllers (emergencias,
+    // correctivos, mantenimientos, etc.) siguen seteando su propio origen
+    // cuando crean servicios desde sus respectivos flujos.
+    const origenDerivado = tipoServicio.modulo_asociado || 'directo';
+
+    const codigo = await generarCodigoServicio();
+    const servicio = await prisma.$transaction(async (tx) => {
+      const s = await tx.tbl_servicios_proyectos.create({
+        data: {
+          codigo,
+          tipo_registro: d.tipo_registro || 'servicio',
+          id_tipo_servicio: Number(d.id_tipo_servicio),
+          id_cliente: Number(d.id_cliente),
+          origen: origenDerivado,
+          titulo: d.titulo || `Servicio ${codigo}`,
+          descripcion: d.descripcion || null,
+          fecha_programada: parseYMDLima(d.fecha_programada),
+          hora_programada: d.hora_programada || null,
+          fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null,
+          prioridad: d.prioridad || 'media',
+          estado_servicio: estadoInicial,
+          precio_interno: d.precio_interno,
+          moneda: validacion.moneda,
+          sin_cobro: d.sin_cobro ? 1 : 0,
+          observaciones: d.observaciones || null,
+          user_id_registration: req.user.id,
+          ascensores: {
+            create: validacion.items.map(it => ({
+              id_ascensor: it.id_ascensor,
+              monto: it.monto,
+              moneda: validacion.moneda,
+              user_id_registration: req.user.id
+            }))
+          }
+        }
+      });
+
+      // Replicar en el módulo operativo (no-op si tipo no tiene módulo asociado).
+      await replicarEnModulo(tx, {
+        servicio: s,
+        tipoServicio,
+        idsAscensores: validacion.items.map(it => it.id_ascensor),
+        idCliente: Number(d.id_cliente),
+        horaProgramada: d.hora_programada || null,
+        fechaProgramada: parseYMDLima(d.fecha_programada),
+        usuarioId: req.user.id,
+        datosModulo: d,
+        origenEtiqueta: `servicio ${codigo}`
+      });
+
+      return s;
+    });
+
+    // Solo registrar en calendario, historiales y notificar a otros módulos si NO es borrador.
+    // Los borradores quedan invisibles para todos los flujos operativos hasta promoverse.
+    if (!esBorrador) {
+      const fechaInicio = combinarFechaHoraLima(d.fecha_programada, d.hora_programada);
+      const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
+      await prisma.tbl_calendario_eventos.create({
+        data: {
+          id_servicio: servicio.id,
+          titulo: `${servicio.codigo} – ${servicio.titulo}`,
+          tipo_evento: tipoEvento,
+          fecha_inicio: fechaInicio,
+          estado_evento: 'programado',
+          color: colorPorTipo(tipoEvento)
+        }
+      });
+      sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));
+
+      await prisma.tbl_clientes_historial.create({
+        data: {
+          id_cliente: servicio.id_cliente, id_servicio: servicio.id,
+          tipo_evento: 'servicio_creado',
+          descripcion: `Servicio ${servicio.codigo} creado`,
+          creado_por: req.user.id
+        }
+      });
+      for (const it of validacion.items) {
+        await prisma.tbl_ascensores_historial.create({
+          data: {
+            id_ascensor: it.id_ascensor, id_servicio: servicio.id,
+            tipo_evento: 'servicio_creado',
+            descripcion: `Servicio ${servicio.codigo} creado`,
+            creado_por: req.user.id
+          }
+        });
+      }
+    }
+
+    await prisma.tbl_servicios_estados_historial.create({
+      data: { id_servicio: servicio.id, estado_anterior: null, estado_nuevo: estadoInicial, cambiado_por: req.user.id }
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: servicio.id,
+      accion: 'CREATE', valor_nuevo: servicio, ip: req.ip
+    });
+    res.status(201).json({ data: servicio });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al crear servicio: ' + err.message });
+  }
+};
+
+/**
+ * Promueve un borrador a estado Pendiente, generando evento de calendario e historiales.
+ */
+const promoverBorrador = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: { ascensores: { where: { estado: 1 } } }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'Borrador') {
+      return res.status(400).json({ error: 'Solo se pueden promover servicios en Borrador' });
+    }
+    // cambiarEstadoServicio registra historial, recordatorio y sincroniza
+    // estado_global de la cotización (si la hay).
+    await cambiarEstadoServicio(id, 'Pendiente', req.user.id);
+    const fechaInicio = combinarFechaHoraLima(servicio.fecha_programada, servicio.hora_programada);
+    const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
+    await prisma.tbl_calendario_eventos.create({
+      data: {
+        id_servicio: servicio.id,
+        titulo: `${servicio.codigo} – ${servicio.titulo}`,
+        tipo_evento: tipoEvento,
+        fecha_inicio: fechaInicio,
+        estado_evento: 'programado',
+        color: colorPorTipo(tipoEvento)
+      }
+    });
+    await prisma.tbl_clientes_historial.create({
+      data: {
+        id_cliente: servicio.id_cliente, id_servicio: servicio.id,
+        tipo_evento: 'servicio_creado',
+        descripcion: `Servicio ${servicio.codigo} promovido desde borrador`,
+        creado_por: req.user.id
+      }
+    });
+    for (const sa of servicio.ascensores) {
+      await prisma.tbl_ascensores_historial.create({
+        data: {
+          id_ascensor: sa.id_ascensor, id_servicio: servicio.id,
+          tipo_evento: 'servicio_creado',
+          descripcion: `Servicio ${servicio.codigo} promovido desde borrador`,
+          creado_por: req.user.id
+        }
+      });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al promover borrador' });
+  }
+};
+
+/**
+ * Marca el servicio como revisado por Admin/Contabilidad y lo envía a gestión de cobro.
+ */
+const revisarServicio = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { observaciones } = req.body;
+    if (!['super_admin', 'admin', 'contabilidad'].includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'Solo Admin o Contabilidad pueden revisar' });
+    }
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id }, include: { servicio_realizado: true, cobro: true }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'En revisión administrativa') {
+      return res.status(400).json({ error: 'El servicio no está en revisión administrativa' });
+    }
+
+    await prisma.tbl_servicios_realizados.updateMany({
+      where: { id_servicio: id },
+      data: {
+        estado_administrativo: 'Revisado',
+        user_id_modification: req.user.id, date_time_modification: new Date()
+      }
+    });
+
+    const monto = Number(servicio.cobro?.monto_total || servicio.precio_interno || 0);
+    const destino = (monto > 0 && servicio.sin_cobro !== 1) ? 'A gestión de cobro' : 'Cobrado total';
+    await cambiarEstadoServicio(id, destino, req.user.id, observaciones || 'Revisión administrativa aprobada');
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'REVIEW', valor_nuevo: { estado_administrativo: 'Revisado', estado_servicio: destino }, ip: req.ip
+    });
+    res.json({ ok: true, estado: destino });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al revisar servicio: ' + err.message });
+  }
+};
+
+const actualizar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const d = req.body;
+    const previo = await prisma.tbl_servicios_proyectos.findUnique({ where: { id } });
+    if (!previo) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+    // Solo super_admin o admin pueden editar
+    if (!['super_admin', 'admin'].includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'No autorizado para editar' });
+    }
+
+    // Gate de estado: solo se edita en estados pre-ejecución. Una vez que el
+    // servicio sale a campo (En camino / En curso / Finalizado...) la edición
+    // libre rompería historial, evidencias, guías, cobros y facturación.
+    if (!esServicioEditable(previo.estado_servicio)) {
+      return res.status(409).json({
+        error: `No se puede editar un servicio en estado "${previo.estado_servicio}". Solo es editable antes de salir a campo.`
+      });
+    }
+
+    const puedeCambiarPrecio = ROLES_PRECIO.includes(req.user.rol_codigo);
+    const nuevoIdCliente = d.id_cliente ? Number(d.id_cliente) : previo.id_cliente;
+    const nuevoPrecio = puedeCambiarPrecio && d.precio_interno !== undefined ? Number(d.precio_interno) : Number(previo.precio_interno);
+    const nuevaMoneda = d.moneda ?? previo.moneda;
+
+    // Si se reciben ascensores, validar y sincronizar la junction
+    let validacion = null;
+    if (d.ascensores !== undefined) {
+      validacion = await validarAscensores(d.ascensores, nuevoIdCliente, nuevoPrecio, nuevaMoneda);
+      if (!validacion.ok) return res.status(400).json({ error: validacion.error });
+    }
+
+    const nuevaFechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : previo.fecha_programada;
+    const nuevaHoraProgramada = d.hora_programada ?? previo.hora_programada;
+    const cambiaFechaHora =
+      (d.fecha_programada !== undefined && nuevaFechaProgramada.getTime() !== previo.fecha_programada.getTime()) ||
+      (d.hora_programada !== undefined && d.hora_programada !== previo.hora_programada);
+
+    const servicio = await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: {
+        id_tipo_servicio: d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio,
+        id_cliente: nuevoIdCliente,
+        tipo_registro: d.tipo_registro ?? previo.tipo_registro,
+        // `origen` no se actualiza desde el form: representa el canal de
+        // creación original (trazabilidad), no algo editable.
+        origen: previo.origen,
+        titulo: d.titulo ?? previo.titulo,
+        descripcion: d.descripcion ?? previo.descripcion,
+        fecha_programada: nuevaFechaProgramada,
+        hora_programada: nuevaHoraProgramada,
+        fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : previo.fecha_estimada_entrega,
+        prioridad: d.prioridad ?? previo.prioridad,
+        precio_interno: puedeCambiarPrecio && d.precio_interno !== undefined ? d.precio_interno : previo.precio_interno,
+        moneda: nuevaMoneda,
+        sin_cobro: d.sin_cobro !== undefined ? (d.sin_cobro ? 1 : 0) : previo.sin_cobro,
+        observaciones: d.observaciones ?? previo.observaciones,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      }
+    });
+
+    if (validacion) {
+      const idsNuevos = validacion.items.map(i => i.id_ascensor);
+      // Soft-delete los que ya no están
+      await prisma.tbl_servicios_ascensores.updateMany({
+        where: { id_servicio: id, id_ascensor: { notIn: idsNuevos } },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      // Upsert por (id_servicio, id_ascensor)
+      for (const it of validacion.items) {
+        await prisma.tbl_servicios_ascensores.upsert({
+          where: { id_servicio_id_ascensor: { id_servicio: id, id_ascensor: it.id_ascensor } },
+          update: {
+            monto: it.monto, moneda: validacion.moneda, estado: 1,
+            user_id_modification: req.user.id, date_time_modification: new Date()
+          },
+          create: {
+            id_servicio: id, id_ascensor: it.id_ascensor,
+            monto: it.monto, moneda: validacion.moneda,
+            user_id_registration: req.user.id
+          }
+        });
+      }
+    }
+
+    // Sincronizar evento de calendario y título si cambió fecha/hora/título.
+    // Solo aplica a servicios fuera de borrador (los borradores no tienen evento creado).
+    if (previo.estado_servicio !== 'Borrador') {
+      const cambiaTitulo = d.titulo !== undefined && d.titulo !== previo.titulo;
+      if (cambiaFechaHora || cambiaTitulo) {
+        const nuevaFechaInicio = combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada);
+        await prisma.tbl_calendario_eventos.updateMany({
+          where: { id_servicio: id, estado: 1 },
+          data: {
+            ...(cambiaFechaHora ? { fecha_inicio: nuevaFechaInicio } : {}),
+            ...(cambiaTitulo ? { titulo: `${servicio.codigo} – ${servicio.titulo}` } : {}),
+            user_id_modification: req.user.id,
+            date_time_modification: new Date()
+          }
+        });
+      }
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE', valor_anterior: previo, valor_nuevo: servicio, ip: req.ip
+    });
+    sincronizarRecordatorioServicio(id).catch(err => console.error('Sync recordatorio:', err));
+    res.json({ data: servicio });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar servicio' });
+  }
+};
+
+const cambiarEstado = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { estado_servicio } = req.body;
+    const previo = await prisma.tbl_servicios_proyectos.findUnique({ where: { id } });
+    if (!previo) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+    // cambiarEstadoServicio registra historial, sincroniza recordatorio y
+    // sincroniza estado_global de la cotización origen (si la hay).
+    const servicio = await cambiarEstadoServicio(id, estado_servicio, req.user.id);
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'STATUS_CHANGE', valor_anterior: { estado: previo.estado_servicio }, valor_nuevo: { estado: estado_servicio }, ip: req.ip
+    });
+    res.json({ data: servicio });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al cambiar estado' });
+  }
+};
+
+const asignarTecnicos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { tecnicos = [], items_checklist = [] } = req.body;
+    if (!Array.isArray(tecnicos) || tecnicos.length === 0) {
+      return res.status(400).json({ error: 'Debe asignar al menos un técnico' });
+    }
+
+    const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({ where: { id }, select: { estado_servicio: true } });
+    if (!servicioActual) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicioActual.estado_servicio === 'Borrador') {
+      return res.status(400).json({ error: 'Debe promover el borrador antes de asignar técnicos' });
+    }
+    if (estaServicioFinalizado(servicioActual.estado_servicio)) {
+      return res.status(400).json({
+        error: `El servicio está ${servicioActual.estado_servicio}: ya no se pueden modificar técnicos ni ítems del checklist`
+      });
+    }
+
+    const consistencia = validarConsistenciaAsignaciones(tecnicos);
+    if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
+
+    // Validar todos los técnicos antes de tocar la BD (evita estado parcial si alguno falla)
+    const idsNuevos = tecnicos.map(t => Number(t.id_tecnico));
+    const tecsBD = await prisma.tbl_tecnicos.findMany({ where: { id: { in: idsNuevos } } });
+    const tecsMap = new Map(tecsBD.map(t => [t.id, t]));
+    for (const t of tecnicos) {
+      const tec = tecsMap.get(Number(t.id_tecnico));
+      if (!tec || tec.estado !== 1) {
+        return res.status(400).json({ error: `Técnico ${t.id_tecnico} no disponible` });
+      }
+    }
+
+    // Soft-delete sólo los técnicos que ya NO están en la nueva lista
+    await prisma.tbl_servicios_asignaciones.updateMany({
+      where: { id_servicio: id, id_tecnico: { notIn: idsNuevos } },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+
+    // Upsert por (id_servicio, id_tecnico): reactiva los previos y crea los nuevos
+    for (const t of tecnicos) {
+      await prisma.tbl_servicios_asignaciones.upsert({
+        where: { id_servicio_id_tecnico: { id_servicio: id, id_tecnico: Number(t.id_tecnico) } },
+        update: {
+          rol_asignacion: t.rol_asignacion || 'Apoyo',
+          responsable_principal: t.responsable_principal ? 1 : 0,
+          responsable_documentacion: t.responsable_documentacion ? 1 : 0,
+          responsable_checklist: t.responsable_checklist ? 1 : 0,
+          estado: 1,
+          estado_asignacion: 'activa',
+          asignado_por: req.user.id,
+          user_id_modification: req.user.id,
+          date_time_modification: new Date()
+        },
+        create: {
+          id_servicio: id,
+          id_tecnico: Number(t.id_tecnico),
+          rol_asignacion: t.rol_asignacion || 'Apoyo',
+          responsable_principal: t.responsable_principal ? 1 : 0,
+          responsable_documentacion: t.responsable_documentacion ? 1 : 0,
+          responsable_checklist: t.responsable_checklist ? 1 : 0,
+          asignado_por: req.user.id,
+          user_id_registration: req.user.id
+        }
+      });
+    }
+
+    // Checklist (sin destruir el progreso del técnico)
+    const tecChecklist = tecnicos.find(t => t.responsable_checklist) || tecnicos[0];
+    const checklistExist = await prisma.tbl_checklists_salida.findUnique({ where: { id_servicio: id } });
+    let checklist;
+    if (checklistExist) {
+      checklist = await prisma.tbl_checklists_salida.update({
+        where: { id_servicio: id },
+        data: {
+          id_tecnico_responsable: Number(tecChecklist.id_tecnico),
+          user_id_modification: req.user.id, date_time_modification: new Date()
+        }
+      });
+    } else {
+      checklist = await prisma.tbl_checklists_salida.create({
+        data: {
+          id_servicio: id,
+          id_tecnico_responsable: Number(tecChecklist.id_tecnico),
+          estado_checklist: 'Pendiente',
+          user_id_registration: req.user.id
+        }
+      });
+    }
+
+    // Merge de ítems por id: preserva estado_item del técnico.
+    // - id existente → update de campos editables (sin tocar estado_item)
+    // - sin id (o id desconocido) → create con estado_item = 'Pendiente' (default)
+    // - ítems activos que ya no vienen → soft-delete (estado = 0)
+    const itemsExistentes = await prisma.tbl_checklists_salida_items.findMany({
+      where: { id_checklist: checklist.id, estado: 1 },
+      select: { id: true }
+    });
+    const idsExistentes = new Set(itemsExistentes.map(it => it.id));
+    const idsEntrantes = new Set();
+    for (const it of items_checklist) {
+      if (!it.nombre) continue;
+      const idInc = Number(it.id) || null;
+      const base = {
+        tipo_item: it.tipo_item || 'Herramienta',
+        nombre: it.nombre,
+        cantidad: it.cantidad || 1,
+        unidad: it.unidad || 'Unidad',
+        observaciones: it.observaciones || null
+      };
+      if (idInc && idsExistentes.has(idInc)) {
+        idsEntrantes.add(idInc);
+        await prisma.tbl_checklists_salida_items.update({
+          where: { id: idInc },
+          data: { ...base, user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+      } else {
+        await prisma.tbl_checklists_salida_items.create({
+          data: { id_checklist: checklist.id, ...base, user_id_registration: req.user.id }
+        });
+      }
+    }
+    const idsAEliminar = [...idsExistentes].filter(idx => !idsEntrantes.has(idx));
+    if (idsAEliminar.length > 0) {
+      await prisma.tbl_checklists_salida_items.updateMany({
+        where: { id: { in: idsAEliminar } },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+    }
+
+    // Recalcular estado_checklist según los ítems que sobrevivieron al merge.
+    // El helper sólo promueve estado_servicio (Checklist de salida pendiente → Listo para salida),
+    // nunca lo demota, así que es seguro llamarlo aun si el servicio está más avanzado.
+    await _recalcEstadoChecklist(checklist.id, req.user.id);
+
+    // estado_servicio: ajustar sólo si el servicio aún está en la fase pre-checklist.
+    // Si el técnico ya completó el checklist y el servicio avanzó (Listo para salida / En camino /
+    // En curso / etc.), una re-asignación administrativa no debe demotarlo.
+    // 'Pendiente' es el estado inicial al crear el servicio: incluirlo aquí es
+    // lo que mueve el servicio de la fase "recién creado" a la fase operativa.
+    // Sin esto, asignar técnicos a un servicio recién creado deja el estado en
+    // 'Pendiente' indefinidamente y los botones de Iniciar/Finalizar nunca aparecen.
+    const estadosPreChecklist = ['Pendiente', 'Asignado', 'Checklist de salida pendiente'];
+    const estadoActual = servicioActual.estado_servicio;
+    const nuevoEstadoServicio = estadosPreChecklist.includes(estadoActual)
+      ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado')
+      : estadoActual;
+    if (nuevoEstadoServicio !== estadoActual) {
+      // cambiarEstadoServicio registra historial, sincroniza recordatorio y
+      // sincroniza estado_global de la cotización origen (si la hay).
+      await cambiarEstadoServicio(id, nuevoEstadoServicio, req.user.id);
+    } else {
+      await prisma.tbl_servicios_proyectos.update({
+        where: { id },
+        data: { user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al asignar técnicos: ' + err.message });
+  }
+};
+
+const iniciarServicio = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { accion = 'iniciar_servicio' } = req.body;
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: { checklists: { include: { items: { where: { estado: 1 } } } }, asignaciones: { where: { estado: 1 } } }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio === 'Cancelado' || servicio.estado_servicio.startsWith('Finalizado')) {
+      return res.status(400).json({ error: 'Servicio no se puede iniciar' });
+    }
+
+    // Validar checklist completo si la acción es iniciar_servicio
+    const chk = servicio.checklists[0];
+    if (chk && chk.estado_checklist !== 'Completo' && chk.estado_checklist !== 'Aprobado' && chk.items.length > 0 && accion === 'iniciar_servicio') {
+      return res.status(400).json({ error: 'El checklist de salida debe estar completo' });
+    }
+
+    let nuevoEstado = servicio.estado_servicio;
+    if (accion === 'en_camino') nuevoEstado = 'En camino';
+    else if (accion === 'iniciar_servicio') nuevoEstado = 'En curso';
+
+    await cambiarEstadoServicio(id, nuevoEstado, req.user.id);
+
+    // Marcar técnicos como ocupados
+    for (const a of servicio.asignaciones) {
+      await prisma.tbl_tecnicos.update({
+        where: { id: a.id_tecnico },
+        data: { estado_operativo: nuevoEstado === 'En curso' ? 'En servicio' : 'Ocupado' }
+      });
+    }
+
+    res.json({ ok: true, estado: nuevoEstado });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al iniciar servicio: ' + err.message });
+  }
+};
+
+const finalizarServicio = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { observaciones_tecnicas, descargo_tecnico, codigo_guia, id_archivo_guia, finalizar_observado, id_archivos_evidencias, numero_ot, id_archivo_ot } = req.body;
+    const numeroOtNormalizado = typeof numero_ot === 'string' ? numero_ot.trim() : '';
+    const idArchivoOtNormalizado = Number.isFinite(Number(id_archivo_ot)) && Number(id_archivo_ot) > 0
+      ? Number(id_archivo_ot)
+      : null;
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: {
+        asignaciones: { where: { estado: 1 } },
+        guias: { where: { estado: 1 } },
+        ascensores: { where: { estado: 1 } }
+      }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'En curso') {
+      return res.status(400).json({ error: 'El servicio debe estar en curso para finalizarlo' });
+    }
+    const sinGuia = !id_archivo_guia && servicio.guias.length === 0;
+    const sinObservaciones = !observaciones_tecnicas;
+    if (sinGuia && sinObservaciones) {
+      return res.status(400).json({ error: 'Se requiere guía o al menos observación técnica' });
+    }
+    // Checklist de finalización: obligatorio para todos los roles. El frontend
+    // debe completarlo (POST /servicios/:id/finalizacion) antes de invocar
+    // este endpoint; aquí solo validamos que exista con PDF generado.
+    const checklistFin = await prisma.tbl_servicios_finalizacion_checklist.findUnique({
+      where: { id_servicio: id }
+    });
+    if (!checklistFin || !checklistFin.id_archivo_pdf) {
+      return res.status(400).json({ error: 'Debe completar el checklist de finalización del servicio antes de cerrarlo' });
+    }
+
+    // Evidencias del trabajo terminado: obligatorias para técnicos al finalizar.
+    // Admin/SuperAdmin pueden cerrar sin evidencias (igual que con la guía).
+    const evidenciasIds = Array.isArray(id_archivos_evidencias)
+      ? id_archivos_evidencias.map(Number).filter(Number.isFinite)
+      : [];
+    if (req.user.rol_codigo === 'tecnico' && evidenciasIds.length === 0) {
+      return res.status(400).json({ error: 'Debe adjuntar al menos una foto de evidencia del trabajo terminado' });
+    }
+    // OT (Orden de Trabajo): obligatoria para técnicos al finalizar.
+    // Admin/SuperAdmin pueden cerrar sin OT (mismo patrón que guía y evidencias).
+    if (req.user.rol_codigo === 'tecnico' && (!numeroOtNormalizado || !idArchivoOtNormalizado)) {
+      return res.status(400).json({ error: 'Debe adjuntar la OT (número y documento) para finalizar' });
+    }
+    // Si no hay guía: solo Admin/Super Admin puede cerrar marcándolo como observado
+    if (sinGuia && !finalizar_observado) {
+      // permitir si hay observación técnica (regla original)
+    } else if (sinGuia && finalizar_observado && !['super_admin', 'admin'].includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'Solo Admin o Super Admin pueden finalizar como observado sin guía' });
+    }
+
+    // Permiso: técnico responsable documental o admin
+    if (req.user.rol_codigo === 'tecnico') {
+      const esResponsable = servicio.asignaciones.find(a => a.id_tecnico === req.user.id_tecnico && a.responsable_documentacion === 1);
+      const cantidad = servicio.asignaciones.length;
+      const unicoTec = cantidad === 1 && servicio.asignaciones[0].id_tecnico === req.user.id_tecnico;
+      if (!esResponsable && !unicoTec) {
+        return res.status(403).json({ error: 'Solo el responsable documental puede finalizar' });
+      }
+    }
+
+    const responsableDoc = servicio.asignaciones.find(a => a.responsable_documentacion === 1) || servicio.asignaciones[0];
+    const responsablePrincipal = servicio.asignaciones.find(a => a.responsable_principal === 1) || responsableDoc;
+
+    // Crear guía si llegó id_archivo o se está marcando observado
+    if (id_archivo_guia || codigo_guia || (sinGuia && finalizar_observado)) {
+      await prisma.tbl_servicios_guias.create({
+        data: {
+          id_servicio: id,
+          id_tecnico: responsableDoc ? responsableDoc.id_tecnico : null,
+          codigo_guia: codigo_guia || null,
+          id_archivo: id_archivo_guia || null,
+          observaciones_tecnicas: observaciones_tecnicas || null,
+          estado_guia: (sinGuia && finalizar_observado) ? ESTADO_GUIA_OBSERVADA : ESTADO_GUIA_ADJUNTA,
+          user_id_registration: req.user.id
+        }
+      });
+    }
+
+    // Registrar evidencias del trabajo terminado. Cada id corresponde a un tbl_archivos
+    // subido previamente vía POST /archivos con tipo=evidencias.
+    if (evidenciasIds.length > 0) {
+      const idTecnicoEvidencia = req.user.id_tecnico || (responsableDoc ? responsableDoc.id_tecnico : null);
+      if (idTecnicoEvidencia) {
+        for (const idArchivo of evidenciasIds) {
+          await prisma.tbl_servicios_evidencias.create({
+            data: {
+              id_servicio: id,
+              id_tecnico: idTecnicoEvidencia,
+              id_archivo: idArchivo,
+              tipo_evidencia: 'Foto',
+              descripcion: null,
+              user_id_registration: req.user.id
+            }
+          });
+        }
+      }
+    }
+
+    // Actualizar estado servicio (cambiarEstadoServicio registra historial,
+    // recordatorios y sincroniza estado_global de cotización).
+    const estadoFinal = (sinGuia && finalizar_observado) ? ESTADO_SERVICIO_FINALIZADO_OBSERVADO : ESTADO_SERVICIO_FINALIZADO_TECNICO;
+    await cambiarEstadoServicio(
+      id, estadoFinal, req.user.id,
+      (sinGuia && finalizar_observado) ? 'Finalización observada por admin' : null
+    );
+
+    // Si el cobro ya existe (servicio aprobado desde cotización), heredamos
+    // su estado para no pisar pagos/facturas que ya pudieron haberse
+    // registrado contra el adelanto antes de finalizar la ejecución.
+    const cobroPrevio = await prisma.tbl_cobros.findUnique({
+      where: { id_servicio: id },
+      include: {
+        cuotas: { where: { estado: 1 } },
+        facturas: { where: { estado: 1, estado_factura: { not: 'Anulada' } } }
+      }
+    });
+    // Mantenimiento gratuito / cobertura: nunca debe ir a "Pendiente de iniciar"
+    // porque no se le crea cobro (ver fallback más abajo). Si por error legacy
+    // existiera un cobroPrevio para este servicio, su estado tampoco aplica.
+    const esGratuito = servicio.sin_cobro === 1;
+    const estadoCobroInicial = esGratuito
+      ? 'Sin cobro'
+      : (cobroPrevio?.estado_cobro || 'Pendiente de iniciar');
+    let estadoFacturacionInicial = 'Sin factura';
+    if (cobroPrevio && cobroPrevio.facturas.length > 0) {
+      const tieneGeneral = cobroPrevio.facturas.some(f => f.id_cuota === null);
+      if (tieneGeneral) {
+        estadoFacturacionInicial = 'Facturado';
+      } else {
+        const cuotasFacturadas = new Set(cobroPrevio.facturas.map(f => f.id_cuota));
+        const todas = cobroPrevio.cuotas.length > 0 && cobroPrevio.cuotas.every(c => cuotasFacturadas.has(c.id));
+        estadoFacturacionInicial = todas ? 'Facturado' : 'Parcialmente facturado';
+      }
+    }
+
+    // Crear/actualizar folder contable. Caso típico: el folder ya fue creado
+    // al aprobar la cotización (estado 'En ejecución'); aquí transicionamos a
+    // 'Pendiente revisión', completamos datos técnicos y registramos la fecha
+    // REAL de realización. Caso legacy (servicio sin cotización aprobada o sin
+    // folder previo): se crea desde cero con los defaults históricos.
+    await prisma.tbl_servicios_realizados.upsert({
+      where: { id_servicio: id },
+      update: {
+        id_tecnico_principal: responsablePrincipal?.id_tecnico || null,
+        id_responsable_documentacion: responsableDoc?.id_tecnico || null,
+        observaciones_tecnicas: observaciones_tecnicas || null,
+        descargo_tecnico: descargo_tecnico || null,
+        numero_ot: numeroOtNormalizado || null,
+        id_archivo_ot: idArchivoOtNormalizado,
+        // Salir de 'En ejecución' (creado al aprobar) → 'Pendiente revisión'.
+        // No pisamos estados ya avanzados (Revisado/Cerrado/etc.) al finalizar.
+        estado_administrativo: 'Pendiente revisión',
+        // Sobrescribir con la fecha REAL de finalización para que reportes y
+        // dashboards muestren la fecha de ejecución, no la de aprobación.
+        fecha_realizacion: new Date(),
+        // Heredar estados financieros del cobro vigente al finalizar.
+        estado_cobro: estadoCobroInicial,
+        estado_facturacion: estadoFacturacionInicial,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      },
+      create: {
+        id_servicio: id,
+        id_cliente: servicio.id_cliente,
+        id_tecnico_principal: responsablePrincipal?.id_tecnico || null,
+        id_responsable_documentacion: responsableDoc?.id_tecnico || null,
+        observaciones_tecnicas: observaciones_tecnicas || null,
+        descargo_tecnico: descargo_tecnico || null,
+        numero_ot: numeroOtNormalizado || null,
+        id_archivo_ot: idArchivoOtNormalizado,
+        estado_administrativo: 'Pendiente revisión',
+        estado_contable: 'Pendiente',
+        estado_cobro: estadoCobroInicial,
+        estado_facturacion: estadoFacturacionInicial,
+        user_id_registration: req.user.id
+      }
+    });
+
+    // Fallback: crear cobro si el servicio no viene de cotización aprobada
+    // (servicios directos o mantenimientos). Los aprobados desde cotización
+    // ya tienen su cobro creado en cotizacionesController.aprobar.
+    if (!cobroPrevio && servicio.sin_cobro !== 1) {
+      await crearCobroInicial(prisma, {
+        idServicio: id,
+        idCliente: servicio.id_cliente,
+        monto: servicio.precio_interno,
+        moneda: servicio.moneda,
+        fechaCuotaUnica: servicio.fecha_programada,
+        idUsuario: req.user.id
+      });
+    }
+    // Transición a "En revisión administrativa" (gate previo al envío a cobros)
+    if (estadoFinal === ESTADO_SERVICIO_FINALIZADO_TECNICO) {
+      await cambiarEstadoServicio(id, 'En revisión administrativa', req.user.id, 'Servicio pendiente de revisión administrativa');
+    }
+
+    // Liberar técnicos
+    for (const a of servicio.asignaciones) {
+      await prisma.tbl_tecnicos.update({ where: { id: a.id_tecnico }, data: { estado_operativo: 'Disponible' } });
+    }
+
+    // Para planes continuos: auto-materializa el siguiente evento del plan
+    // como servicio (queda listo para asignar técnico, checklist y cobro)
+    // y actualiza `proximo_mantenimiento` del ascensor del plan (el plan es 1 a 1 con un ascensor).
+    if (servicio.id_mantenimiento_plan) {
+      try {
+        const siguienteServicio = await materializarSiguienteEventoDelPlan({
+          idPlan: servicio.id_mantenimiento_plan,
+          fechaServicioFinalizado: servicio.fecha_programada,
+          userId: req.user.id
+        });
+        if (siguienteServicio) {
+          const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id: servicio.id_mantenimiento_plan }, select: { id_ascensor: true } });
+          if (plan) {
+            await prisma.tbl_ascensores.update({
+              where: { id: plan.id_ascensor },
+              data: { proximo_mantenimiento: siguienteServicio.fecha_programada }
+            });
+          }
+        }
+      } catch (err) {
+        // No bloqueamos la finalización si la materialización falla;
+        // queda el botón manual "+ Crear servicio" en el calendario.
+        console.error('Auto-materializar siguiente mantenimiento falló:', err);
+      }
+    }
+
+    // Historial: una entrada por cliente y una por cada ascensor del servicio
+    await prisma.tbl_clientes_historial.create({
+      data: {
+        id_cliente: servicio.id_cliente, id_servicio: id,
+        tipo_evento: 'servicio_finalizado',
+        descripcion: `Servicio ${servicio.codigo} finalizado`,
+        creado_por: req.user.id
+      }
+    });
+    for (const sa of servicio.ascensores) {
+      await prisma.tbl_ascensores_historial.create({
+        data: {
+          id_ascensor: sa.id_ascensor, id_servicio: id,
+          tipo_evento: 'servicio_finalizado',
+          descripcion: `Servicio ${servicio.codigo} finalizado`,
+          creado_por: req.user.id
+        }
+      });
+    }
+
+    // Evento calendario
+    await prisma.tbl_calendario_eventos.updateMany({
+      where: { id_servicio: id }, data: { estado_evento: 'finalizado' }
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al finalizar: ' + err.message });
+  }
+};
+
+const cancelar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { motivo } = req.body;
+    const previo = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: { asignaciones: { where: { estado: 1 } } }
+    });
+    if (!previo) return res.status(404).json({ error: 'Servicio no encontrado' });
+    // Anota el motivo en observaciones del servicio + cambia estado vía helper
+    // (registra historial, sincroniza recordatorio y sincroniza estado_global
+    // de la cotización origen).
+    await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: {
+        observaciones: previo.observaciones ? `${previo.observaciones}\n[Cancelado] ${motivo || ''}` : `[Cancelado] ${motivo || ''}`,
+        user_id_modification: req.user.id, date_time_modification: new Date()
+      }
+    });
+    await cambiarEstadoServicio(id, 'Cancelado', req.user.id, motivo || null);
+    await prisma.tbl_calendario_eventos.updateMany({
+      where: { id_servicio: id }, data: { estado_evento: 'cancelado' }
+    });
+
+    // Si existía folder contable (creado al aprobar la cotización), darlo de
+    // baja lógica para que Contabilidad no siga viendo el caso como activo.
+    await prisma.tbl_servicios_realizados.updateMany({
+      where: { id_servicio: id },
+      data: {
+        estado: 0,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      }
+    });
+
+    // Liberar técnicos: volver a Disponible si no quedan otros servicios activos
+    for (const a of previo.asignaciones) {
+      const otrasActivas = await prisma.tbl_servicios_asignaciones.count({
+        where: {
+          id_tecnico: a.id_tecnico,
+          estado: 1,
+          id_servicio: { not: id },
+          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+        }
+      });
+      if (otrasActivas === 0) {
+        await prisma.tbl_tecnicos.update({
+          where: { id: a.id_tecnico },
+          data: { estado_operativo: 'Disponible' }
+        });
+      }
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'CANCEL', valor_anterior: { estado: previo.estado_servicio }, valor_nuevo: { estado: 'Cancelado', motivo }, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al cancelar' });
+  }
+};
+
+const realizados = async (req, res) => {
+  try {
+    const where = { estado: 1 };
+    if (req.user.rol_codigo === 'tecnico') {
+      where.OR = [
+        { id_tecnico_principal: req.user.id_tecnico || -1 },
+        { id_responsable_documentacion: req.user.id_tecnico || -1 }
+      ];
+    }
+    const result = await paginar(
+      prisma.tbl_servicios_realizados,
+      {
+        where, orderBy: { id: 'desc' },
+        include: {
+          archivo_ot: true,
+          servicio: {
+            include: {
+              cliente: true,
+              ascensores: { where: { estado: 1 }, include: { ascensor: true } },
+              tipo_servicio: true,
+              asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
+              guias: { where: { estado: 1 }, include: { archivo: true } },
+              evidencias: { where: { estado: 1 } },
+              checklists: { include: { items: { where: { estado: 1 } } } },
+              cobro: { include: { facturas: true } }
+            }
+          }
+        }
+      },
+      req.query
+    );
+    res.json({ ...result, data: result.data.map(r => ({ ...r, servicio: sanitizarPrecio(r.servicio, req.user.rol_codigo) })) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al listar servicios realizados' });
+  }
+};
+
+/**
+ * Verifica si el usuario puede gestionar guías (crear/editar) sobre un servicio.
+ * super_admin/admin/coordinador: siempre.
+ * tecnico: solo si es responsable_documentacion del servicio o es el único técnico asignado.
+ */
+function puedeUsuarioGestionarGuia(user, asignaciones) {
+  if (['super_admin', 'admin', 'coordinador'].includes(user.rol_codigo)) return true;
+  if (user.rol_codigo !== 'tecnico') return false;
+  const list = asignaciones || [];
+  const esResponsable = list.find(a => a.id_tecnico === user.id_tecnico && a.responsable_documentacion === 1);
+  const unicoTec = list.length === 1 && list[0].id_tecnico === user.id_tecnico;
+  return !!(esResponsable || unicoTec);
+}
+
+/**
+ * Si el servicio está finalizado observado y la guía resultante tiene archivo,
+ * regulariza el servicio pasándolo a finalizado por técnico.
+ */
+async function regularizarSiObservado(servicio, idArchivo, idUsuario) {
+  if (!idArchivo) return;
+  if (servicio.estado_servicio !== ESTADO_SERVICIO_FINALIZADO_OBSERVADO) return;
+  await cambiarEstadoServicio(
+    servicio.id,
+    ESTADO_SERVICIO_FINALIZADO_TECNICO,
+    idUsuario,
+    'Guía regularizada por coordinador/admin'
+  );
+}
+
+const crearGuia = async (req, res) => {
+  try {
+    const id_servicio = Number(req.params.id);
+    const { codigo_guia, id_archivo, observaciones_tecnicas, estado_guia } = req.body || {};
+
+    const codigoNormalizado = typeof codigo_guia === 'string' ? codigo_guia.trim() : '';
+    const observNormalizado = typeof observaciones_tecnicas === 'string' ? observaciones_tecnicas.trim() : '';
+    const archivoNormalizado = Number.isFinite(Number(id_archivo)) && Number(id_archivo) > 0
+      ? Number(id_archivo)
+      : null;
+
+    if (!archivoNormalizado && !codigoNormalizado && !observNormalizado) {
+      return res.status(400).json({ error: 'Debe ingresar al menos código, archivo u observaciones' });
+    }
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: id_servicio },
+      include: { asignaciones: { where: { estado: 1 } } }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+    if (!puedeUsuarioGestionarGuia(req.user, servicio.asignaciones)) {
+      return res.status(403).json({ error: 'No tiene permisos para gestionar guías de este servicio' });
+    }
+    if (esServicioPostRevision(servicio.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se pueden registrar guías de salida` });
+    }
+
+    const responsableDoc = servicio.asignaciones.find(a => a.responsable_documentacion === 1) || servicio.asignaciones[0];
+    const id_tecnico = req.user.id_tecnico || responsableDoc?.id_tecnico || null;
+    if (!id_tecnico) {
+      return res.status(400).json({ error: 'No hay técnico asignado al servicio para asociar la guía' });
+    }
+
+    const estadoNormalizado = esEstadoGuiaValido(estado_guia)
+      ? estado_guia
+      : estadoGuiaSegunArchivo(archivoNormalizado);
+
+    const guia = await prisma.tbl_servicios_guias.create({
+      data: {
+        id_servicio,
+        id_tecnico,
+        codigo_guia: codigoNormalizado || null,
+        id_archivo: archivoNormalizado,
+        observaciones_tecnicas: observNormalizado || null,
+        estado_guia: estadoNormalizado,
+        user_id_registration: req.user.id
+      },
+      include: { archivo: true, tecnico: true }
+    });
+
+    await regularizarSiObservado(servicio, archivoNormalizado, req.user.id);
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: guia.id,
+      accion: 'CREATE', valor_nuevo: guia, ip: req.ip
+    });
+    res.status(201).json({ data: guia });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al crear guía: ' + err.message });
+  }
+};
+
+const actualizarGuia = async (req, res) => {
+  try {
+    const id_servicio = Number(req.params.id);
+    const id_guia = Number(req.params.guiaId);
+    const { codigo_guia, id_archivo, observaciones_tecnicas, estado_guia } = req.body || {};
+
+    const guiaPrevia = await prisma.tbl_servicios_guias.findUnique({
+      where: { id: id_guia },
+      include: { servicio: { include: { asignaciones: { where: { estado: 1 } } } } }
+    });
+    if (!guiaPrevia) return res.status(404).json({ error: 'Guía no encontrada' });
+    if (guiaPrevia.estado === 0) return res.status(400).json({ error: 'La guía está eliminada' });
+    if (guiaPrevia.id_servicio !== id_servicio) {
+      return res.status(400).json({ error: 'La guía no pertenece a este servicio' });
+    }
+
+    if (!puedeUsuarioGestionarGuia(req.user, guiaPrevia.servicio.asignaciones)) {
+      return res.status(403).json({ error: 'No tiene permisos para gestionar guías de este servicio' });
+    }
+    if (esServicioPostRevision(guiaPrevia.servicio.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${guiaPrevia.servicio.estado_servicio}: no se pueden modificar guías de salida` });
+    }
+
+    const data = {
+      user_id_modification: req.user.id,
+      date_time_modification: new Date()
+    };
+    if (codigo_guia !== undefined) {
+      const c = typeof codigo_guia === 'string' ? codigo_guia.trim() : '';
+      data.codigo_guia = c || null;
+    }
+    if (observaciones_tecnicas !== undefined) {
+      const o = typeof observaciones_tecnicas === 'string' ? observaciones_tecnicas.trim() : '';
+      data.observaciones_tecnicas = o || null;
+    }
+    if (id_archivo !== undefined) {
+      data.id_archivo = Number.isFinite(Number(id_archivo)) && Number(id_archivo) > 0
+        ? Number(id_archivo)
+        : null;
+    }
+    if (estado_guia !== undefined) {
+      if (!esEstadoGuiaValido(estado_guia)) {
+        return res.status(400).json({ error: 'Estado de guía inválido' });
+      }
+      data.estado_guia = estado_guia;
+    }
+
+    const guia = await prisma.tbl_servicios_guias.update({
+      where: { id: id_guia },
+      data,
+      include: { archivo: true, tecnico: true }
+    });
+
+    const archivoResultante = guia.id_archivo;
+    await regularizarSiObservado(guiaPrevia.servicio, archivoResultante, req.user.id);
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: id_guia,
+      accion: 'UPDATE', valor_anterior: guiaPrevia, valor_nuevo: guia, ip: req.ip
+    });
+    res.json({ data: guia });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar guía: ' + err.message });
+  }
+};
+
+const eliminarGuia = async (req, res) => {
+  try {
+    const id_servicio = Number(req.params.id);
+    const id_guia = Number(req.params.guiaId);
+
+    const previa = await prisma.tbl_servicios_guias.findUnique({
+      where: { id: id_guia },
+      include: { archivo: true, servicio: { select: { estado_servicio: true } } }
+    });
+    if (!previa) return res.status(404).json({ error: 'Guía no encontrada' });
+    if (previa.estado === 0) return res.status(400).json({ error: 'Guía ya eliminada' });
+    if (previa.id_servicio !== id_servicio) {
+      return res.status(400).json({ error: 'La guía no pertenece a este servicio' });
+    }
+    if (esServicioPostRevision(previa.servicio?.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se pueden eliminar guías de salida` });
+    }
+
+    await prisma.tbl_servicios_guias.update({
+      where: { id: id_guia },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: id_guia,
+      accion: 'DELETE', valor_anterior: previa, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar guía: ' + err.message });
+  }
+};
+
+module.exports = {
+  listar, obtener, crear, actualizar, cambiarEstado,
+  asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, realizados,
+  promoverBorrador, revisarServicio,
+  crearGuia, actualizarGuia, eliminarGuia
+};
