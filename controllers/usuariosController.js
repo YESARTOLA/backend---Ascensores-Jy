@@ -1,14 +1,26 @@
 const prisma = require('../config/prisma');
 const bcrypt = require('bcrypt');
 const { registrarAuditoria } = require('../utils/auditoria');
+const { paginar } = require('../utils/paginacion');
 
-const listar = async (_req, res) => {
+const listar = async (req, res) => {
   try {
-    const users = await prisma.tbl_usuarios.findMany({
-      orderBy: { id: 'asc' },
-      include: { rol: true, tecnico: true }
-    });
-    res.json({ data: users.map(u => ({ ...u, contrasena: undefined })) });
+    const { q } = req.query;
+    const where = {};
+    if (q) where.OR = [
+      { nombres: { contains: q, mode: 'insensitive' } },
+      { correo: { contains: q, mode: 'insensitive' } }
+    ];
+
+    // paginar() devuelve { data } sin ?page= (compatibilidad) o el sobre
+    // completo cuando la vista pagina. En ambos casos se enmascara la contraseña.
+    const result = await paginar(
+      prisma.tbl_usuarios,
+      { where, orderBy: { id: 'asc' }, include: { rol: true, tecnico: true } },
+      req.query
+    );
+    result.data = result.data.map(u => ({ ...u, contrasena: undefined }));
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar usuarios' });

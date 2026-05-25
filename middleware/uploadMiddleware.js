@@ -18,6 +18,9 @@ const TIPOS_VALIDOS = new Set([
   'cotizaciones',
   'contratos',
   'ot',
+  'clientes',           // adjuntos libres del expediente del cliente
+  'observaciones',      // adjuntos de tbl_servicios_observaciones
+  'informes-servicio',  // PDFs auto-generados por checklist de finalización
   'documents'
 ]);
 const TIPO_DEFECTO = 'documents';

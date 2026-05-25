@@ -59,6 +59,45 @@ function agruparAbonosPorCuenta(pagos) {
 }
 
 /**
+ * Ordena el array de cobros (ya con métricas calculadas) por la columna pedida.
+ * Las columnas que pueden ser null se relegan al final independientemente de la
+ * dirección, para que el usuario nunca pierda los registros con dato faltante
+ * arriba de la lista. El criterio del campo "servicio" es el código completo
+ * (SRV-YYYY-NNNNNN); como el correlativo está zero-padded, la comparación
+ * lexicográfica refleja el orden correlativo dentro del mismo año.
+ */
+function ordenarCobros(arr, orden, direccion) {
+  const dir = direccion === 'desc' ? -1 : 1;
+  const getters = {
+    cliente: c => (c.cliente?.nombre || '').toLowerCase(),
+    proyecto: c => (c.servicio?.titulo || '').toLowerCase(),
+    servicio: c => c.servicio?.codigo || '',
+    ot: c => c.servicio?.servicio_realizado?.numero_ot || '',
+    precio: c => Number(c.monto_total || 0),
+    abonos: c => Number(c.total_abonado || 0),
+    cuotas: c => Number(c.cuotas_pagadas || 0),
+    saldo: c => Number(c.saldo_pendiente || 0),
+    proximo: c => c.fecha_proximo_abono ? new Date(c.fecha_proximo_abono).getTime() : null,
+    mora: c => Number(c.dias_mora || 0),
+    estado: c => c.estado_cobro || ''
+  };
+  const getter = getters[orden];
+  if (!getter) return arr;
+  const vacio = v => v === null || v === undefined || v === '';
+  return arr.slice().sort((a, b) => {
+    const va = getter(a);
+    const vb = getter(b);
+    const aVacio = vacio(va);
+    const bVacio = vacio(vb);
+    if (aVacio && bVacio) return 0;
+    if (aVacio) return 1;
+    if (bVacio) return -1;
+    if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
+    return String(va).localeCompare(String(vb)) * dir;
+  });
+}
+
+/**
  * Persiste el estado real del cobro (Vencido / En mora) cuando aplica.
  * Solo modifica si el estado base permite la transición (no toca Pagado/Cerrado/Incobrable).
  */
@@ -83,7 +122,8 @@ const listar = async (req, res) => {
     const {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
       id_cliente, id_tecnico, id_tipo_servicio, id_proyecto,
-      fecha_proximo_desde, fecha_proximo_hasta
+      fecha_proximo_desde, fecha_proximo_hasta,
+      orden, direccion
     } = req.query;
 
     const where = { estado: 1 };
@@ -136,6 +176,8 @@ const listar = async (req, res) => {
     if (en_mora === '1') data = data.filter(c => c.dias_mora > 0);
     if (pagados === '1') data = data.filter(c => Number(c.saldo_pendiente) === 0);
     if (pendientes === '1') data = data.filter(c => Number(c.saldo_pendiente) > 0);
+
+    if (orden) data = ordenarCobros(data, orden, direccion);
 
     res.json(paginarArray(data, req.query));
   } catch (err) {

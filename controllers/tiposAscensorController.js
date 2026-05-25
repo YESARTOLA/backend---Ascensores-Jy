@@ -7,7 +7,7 @@ const listar = async (req, res) => {
     const where = incluirInactivos ? {} : { estado: 1 };
     const tipos = await prisma.tbl_tipos_ascensor.findMany({
       where,
-      orderBy: [{ orden: 'asc' }, { nombre: 'asc' }]
+      orderBy: [{ nombre: 'asc' }]
     });
     res.json({ data: tipos });
   } catch (err) {
@@ -18,7 +18,7 @@ const listar = async (req, res) => {
 
 const crear = async (req, res) => {
   try {
-    const { nombre, descripcion, orden } = req.body;
+    const { nombre, descripcion } = req.body;
     if (!nombre || !String(nombre).trim()) {
       return res.status(400).json({ error: 'Nombre obligatorio' });
     }
@@ -30,7 +30,6 @@ const crear = async (req, res) => {
       data: {
         nombre: nombreLimpio,
         descripcion: descripcion || null,
-        orden: Number.isFinite(Number(orden)) ? Number(orden) : 0,
         user_id_registration: req.user.id
       }
     });
@@ -48,7 +47,7 @@ const crear = async (req, res) => {
 const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { nombre, descripcion, orden } = req.body;
+    const { nombre, descripcion } = req.body;
     const previo = await prisma.tbl_tipos_ascensor.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'Tipo no encontrado' });
 
@@ -64,7 +63,6 @@ const actualizar = async (req, res) => {
       data: {
         nombre: nombre !== undefined ? String(nombre).trim() : previo.nombre,
         descripcion: descripcion !== undefined ? (descripcion || null) : previo.descripcion,
-        orden: orden !== undefined && Number.isFinite(Number(orden)) ? Number(orden) : previo.orden,
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       }

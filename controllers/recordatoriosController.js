@@ -1,6 +1,6 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, finDelDiaLima, parseDateTimeLocalLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, finDelDiaLima, parseDateTimeLocalLima, inicioDelMinutoActual } = require('../utils/tiempo');
 const { COLORES } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
 const {
@@ -67,6 +67,18 @@ function andWhere(base, extra) {
  * el recordatorio haya sido cargado con el `includeRel` de arriba (en
  * particular las asignaciones del servicio y de la emergencia.servicio).
  */
+/**
+ * True si el valor (string del input datetime-local o ISO) representa un
+ * instante anterior al minuto actual. La fecha de un recordatorio no puede
+ * quedar en el pasado, ni al crear ni al editar.
+ */
+function fechaEnPasado(valor) {
+  if (!valor) return false;
+  const fecha = parseDateTimeLocalLima(valor);
+  if (!fecha || isNaN(fecha.getTime())) return false;
+  return fecha.getTime() < inicioDelMinutoActual().getTime();
+}
+
 function puedeAcceder(rec, user) {
   const tipos = tiposRecordatorioPermitidos(user.rol_codigo);
   if (!tipos.includes(rec.tipo)) return false;
@@ -152,6 +164,9 @@ const crear = async (req, res) => {
     if (!d.titulo || !d.fecha_recordatorio) {
       return res.status(400).json({ error: 'Título y fecha son obligatorios' });
     }
+    if (fechaEnPasado(d.fecha_recordatorio)) {
+      return res.status(400).json({ error: 'La fecha no puede ser anterior al momento actual' });
+    }
     const tipo = d.tipo || 'manual';
     const r = await prisma.tbl_recordatorios.create({
       data: {
@@ -197,6 +212,9 @@ const actualizar = async (req, res) => {
     const d = req.body;
     const previo = await cargarSiAcceso(id, req.user);
     if (!previo) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    if (d.fecha_recordatorio !== undefined && fechaEnPasado(d.fecha_recordatorio)) {
+      return res.status(400).json({ error: 'La fecha no puede ser anterior al momento actual' });
+    }
 
     const r = await prisma.tbl_recordatorios.update({
       where: { id },

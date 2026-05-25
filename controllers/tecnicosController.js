@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
+const { paginar } = require('../utils/paginacion');
 
 const listar = async (req, res) => {
   try {
@@ -7,15 +8,24 @@ const listar = async (req, res) => {
     const where = { estado: 1 };
     if (q) where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
-      { documento: { contains: q, mode: 'insensitive' } }
+      { documento: { contains: q, mode: 'insensitive' } },
+      { telefono: { contains: q, mode: 'insensitive' } },
+      { especialidades: { contains: q, mode: 'insensitive' } }
     ];
     if (estado_operativo) where.estado_operativo = estado_operativo;
 
-    const tecnicos = await prisma.tbl_tecnicos.findMany({
-      where, orderBy: { id: 'asc' },
-      include: { usuario: { select: { id: true, correo: true } } }
-    });
-    res.json({ data: tecnicos });
+    // paginar() devuelve { data } cuando no llega ?page= (los dropdowns que usan
+    // tecnicosService.list() siguen recibiendo el arreglo completo) y el sobre
+    // { data, total, page, pageSize, totalPages } cuando la vista pagina.
+    const result = await paginar(
+      prisma.tbl_tecnicos,
+      {
+        where, orderBy: { id: 'asc' },
+        include: { usuario: { select: { id: true, correo: true } } }
+      },
+      req.query
+    );
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar técnicos' });

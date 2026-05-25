@@ -1,7 +1,15 @@
 const prisma = require('../config/prisma');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima } = require('../utils/tiempo');
+const { parseYMDLima, combinarFechaHoraLima } = require('../utils/tiempo');
+const { colorPorTipo } = require('../utils/visibilidadCalendario');
+const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+const {
+  ESTADO_LEAD_CONSULTA,
+  ESTADO_LEAD_INGRESADO,
+  esEstadoLeadValido,
+  ESTADOS_LEAD
+} = require('../utils/estadoLead');
 
 const listar = async (req, res) => {
   try {
@@ -13,7 +21,8 @@ const listar = async (req, res) => {
         include: {
           cliente: true,
           tipo_servicio: true,
-          usuario_registrador: { select: { id: true, nombres: true } }
+          usuario_registrador: { select: { id: true, nombres: true } },
+          vendedor: { select: { id: true, nombres: true } }
         }
       },
       req.query
@@ -56,7 +65,8 @@ const crear = async (req, res) => {
         id_tipo_servicio_solicitado: d.id_tipo_servicio_solicitado ? Number(d.id_tipo_servicio_solicitado) : null,
         cliente_existente: d.cliente_existente ? 1 : 0,
         id_cliente: d.id_cliente ? Number(d.id_cliente) : null,
-        estado_lead: 'nuevo',
+        id_vendedor: d.id_vendedor ? Number(d.id_vendedor) : null,
+        estado_lead: ESTADO_LEAD_CONSULTA,
         observaciones: d.observaciones || null,
         user_id_registration: req.user.id,
         rol_codigo_registrador: req.user.rol_codigo || null
@@ -73,6 +83,9 @@ const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const d = req.body;
+    if (d.estado_lead !== undefined && !esEstadoLeadValido(d.estado_lead)) {
+      return res.status(400).json({ error: `Estado inválido. Permitidos: ${ESTADOS_LEAD.join(', ')}` });
+    }
     const lead = await prisma.tbl_leads.update({
       where: { id },
       data: {
@@ -82,6 +95,7 @@ const actualizar = async (req, res) => {
         id_tipo_servicio_solicitado: d.id_tipo_servicio_solicitado ? Number(d.id_tipo_servicio_solicitado) : null,
         cliente_existente: d.cliente_existente ? 1 : 0,
         id_cliente: d.id_cliente ? Number(d.id_cliente) : null,
+        id_vendedor: d.id_vendedor ? Number(d.id_vendedor) : null,
         estado_lead: d.estado_lead,
         observaciones: d.observaciones,
         user_id_modification: req.user.id, date_time_modification: new Date()
@@ -105,13 +119,15 @@ const convertir = async (req, res) => {
     }
 
     const codigo = await generarCodigoServicio();
+    const moneda = d.moneda || 'PEN';
+    // El ascensor se vincula por la tabla puente tbl_servicios_ascensores (el
+    // servicio no tiene columna id_ascensor). El monto de la línea es el precio.
     const servicio = await prisma.tbl_servicios_proyectos.create({
       data: {
         codigo,
         tipo_registro: d.tipo_registro || 'servicio',
         id_tipo_servicio: Number(d.id_tipo_servicio),
         id_cliente: Number(d.id_cliente),
-        id_ascensor: Number(d.id_ascensor),
         origen: 'lead',
         titulo: d.titulo || `Servicio desde lead ${lead.nombre_contacto}`,
         descripcion: d.descripcion || lead.observaciones,
@@ -119,16 +135,38 @@ const convertir = async (req, res) => {
         hora_programada: d.hora_programada || null,
         prioridad: d.prioridad || 'media',
         precio_interno: d.precio_interno,
-        moneda: d.moneda || 'PEN',
+        moneda,
         observaciones: d.observaciones || null,
-        user_id_registration: req.user.id
+        user_id_registration: req.user.id,
+        ascensores: {
+          create: [{
+            id_ascensor: Number(d.id_ascensor),
+            monto: d.precio_interno,
+            moneda,
+            user_id_registration: req.user.id
+          }]
+        }
       }
     });
+
+    // Registrar el evento en el calendario, igual que el alta normal de servicios,
+    // para que el servicio convertido figure en el calendario operativo.
+    await prisma.tbl_calendario_eventos.create({
+      data: {
+        id_servicio: servicio.id,
+        titulo: `${servicio.codigo} – ${servicio.titulo}`,
+        tipo_evento: 'servicio',
+        fecha_inicio: combinarFechaHoraLima(d.fecha_programada, d.hora_programada),
+        estado_evento: 'programado',
+        color: colorPorTipo('servicio')
+      }
+    });
+    sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));
 
     await prisma.tbl_leads.update({
       where: { id },
       data: {
-        estado_lead: 'convertido',
+        estado_lead: ESTADO_LEAD_INGRESADO,
         id_servicio_convertido: servicio.id,
         id_cliente: Number(d.id_cliente),
         user_id_modification: req.user.id, date_time_modification: new Date()
@@ -141,4 +179,24 @@ const convertir = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar, convertir };
+const cambiarEstado = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { estado_lead } = req.body;
+    if (!esEstadoLeadValido(estado_lead)) {
+      return res.status(400).json({ error: `Estado inválido. Permitidos: ${ESTADOS_LEAD.join(', ')}` });
+    }
+    const previo = await prisma.tbl_leads.findUnique({ where: { id } });
+    if (!previo) return res.status(404).json({ error: 'Lead no encontrado' });
+    const lead = await prisma.tbl_leads.update({
+      where: { id },
+      data: { estado_lead, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    res.json({ data: lead });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al cambiar estado del lead' });
+  }
+};
+
+module.exports = { listar, crear, actualizar, convertir, cambiarEstado };

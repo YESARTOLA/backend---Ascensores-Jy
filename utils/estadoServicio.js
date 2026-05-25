@@ -58,6 +58,21 @@ const ESTADOS_SERVICIO_EDITABLES = [
  *  - evidenciasGuiasController (subir / eliminar)
  *  - frontend (Entregas.jsx, ServicioDetalle.jsx) vía utils/estadoServicio.js
  */
+/**
+ * Estados "en gestión": el servicio está vivo en el flujo operativo, desde que
+ * se crea hasta que el técnico lo finaliza (antes de revisión/cobro). Es el
+ * universo que lista la pantalla de Asignaciones. Espejo del frontend.
+ */
+const ESTADOS_SERVICIO_EN_GESTION = [
+  'Borrador',
+  'Pendiente',
+  'Asignado',
+  'Checklist de salida pendiente',
+  'Listo para salida',
+  'En camino',
+  'En curso'
+];
+
 const ESTADOS_POST_EJECUCION = [
   'En revisión administrativa',
   'A gestión de cobro',
@@ -175,6 +190,7 @@ module.exports = {
   ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
   ESTADOS_SERVICIO,
   ESTADOS_SERVICIO_EDITABLES,
+  ESTADOS_SERVICIO_EN_GESTION,
   ESTADOS_POST_EJECUCION,
   ESTADOS_EMERGENCIA,
   ESTADOS_CORRECTIVO,

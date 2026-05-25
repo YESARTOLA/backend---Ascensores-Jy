@@ -113,6 +113,16 @@ function parseDateTimeLocalLima(s) {
   return new Date(`${completo}${OFFSET}`);
 }
 
+/**
+ * Instante actual truncado al minuto. Los inputs datetime-local tienen
+ * granularidad de minuto, así que truncar evita rechazar el minuto en curso
+ * al validar que una fecha no sea anterior a "ahora".
+ */
+const MS_POR_MINUTO = 60000;
+function inicioDelMinutoActual() {
+  return new Date(Math.floor(Date.now() / MS_POR_MINUTO) * MS_POR_MINUTO);
+}
+
 function diffDiasLima(a, b) {
   const da = inicioDelDiaLima(new Date(a)).getTime();
   const db = inicioDelDiaLima(new Date(b)).getTime();
@@ -127,5 +137,6 @@ module.exports = {
   parseYMDLima, parseYMDFinDiaLima,
   combinarFechaHoraLima,
   parseDateTimeLocalLima,
+  inicioDelMinutoActual,
   diffDiasLima
 };

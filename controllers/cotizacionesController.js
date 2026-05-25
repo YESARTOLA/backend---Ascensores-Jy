@@ -10,6 +10,8 @@ const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto'
 const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const configuracion = require('../utils/configuracion');
+const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
+const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO } = require('../utils/estadoLead');
 
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
@@ -391,6 +393,15 @@ const crear = async (req, res) => {
             orden: i + 1,
             user_id_registration: req.user.id
           }
+        });
+      }
+
+      // Si la cotización nace de un lead, marcarlo como 'Cotizado' (salvo que ya
+      // esté 'Ingresado', para no degradar un lead ya convertido en servicio).
+      if (cot.id_lead) {
+        await tx.tbl_leads.updateMany({
+          where: { id: cot.id_lead, estado_lead: { not: ESTADO_LEAD_INGRESADO } },
+          data: { estado_lead: ESTADO_LEAD_COTIZADO, user_id_modification: req.user.id, date_time_modification: new Date() }
         });
       }
 
@@ -949,7 +960,7 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
         estado_administrativo: 'En ejecución',
         estado_contable: 'Pendiente',
         estado_cobro: cobroActualizado.estado_cobro || 'Pendiente de iniciar',
-        estado_facturacion: 'Sin factura',
+        estado_facturacion: ESTADO_FACTURACION_SIN,
         user_id_registration: userId
       }
     });
@@ -1202,7 +1213,7 @@ const aprobar = async (req, res) => {
           estado_administrativo: 'En ejecución',
           estado_contable: 'Pendiente',
           estado_cobro: 'Pendiente de iniciar',
-          estado_facturacion: 'Sin factura',
+          estado_facturacion: ESTADO_FACTURACION_SIN,
           user_id_registration: req.user.id
         }
       });
@@ -1272,12 +1283,13 @@ const aprobar = async (req, res) => {
         data: { id_servicio: servicio.id, estado_anterior: null, estado_nuevo: 'Pendiente', cambiado_por: req.user.id }
       });
 
-      // 7. Si la cotización viene de un lead, marcar lead como ganado / convertido
+      // 7. Si la cotización viene de un lead, marcarlo como 'Ingresado'
+      //    (ingresó como servicio) y enlazar el servicio generado.
       if (cot.id_lead) {
         await tx.tbl_leads.update({
           where: { id: cot.id_lead },
           data: {
-            estado_lead: 'ganado',
+            estado_lead: ESTADO_LEAD_INGRESADO,
             id_servicio_convertido: servicio.id,
             user_id_modification: req.user.id,
             date_time_modification: new Date()
@@ -1286,7 +1298,7 @@ const aprobar = async (req, res) => {
       }
 
       return { servicio, version: versionApro };
-    });
+    }, { maxWait: 15000, timeout: 30000 });
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,

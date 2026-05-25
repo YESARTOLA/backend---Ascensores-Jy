@@ -1056,5 +1056,8 @@ const exportar = async (req, res) => {
 
 module.exports = {
   listar, crear, actualizar, materializarEvento, listarFrecuencias,
-  materializarSiguienteEventoDelPlan, listarInstancias, exportar
+  materializarSiguienteEventoDelPlan, listarInstancias, exportar,
+  // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
+  // para no duplicar la lógica de instancias + proyecciones por rango de fechas.
+  construirDatasetReporteMantenimientos: _construirDatasetReporte
 };

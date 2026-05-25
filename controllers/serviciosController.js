@@ -15,6 +15,10 @@ const {
   estadoGuiaSegunArchivo,
   esEstadoGuiaValido
 } = require('../utils/estadoGuia');
+const {
+  ESTADO_FACTURA_ANULADA,
+  calcularEstadoFacturacion
+} = require('../utils/estadoFactura');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
@@ -92,7 +96,7 @@ async function validarAscensores(input, idCliente, precioInterno, monedaServicio
 
 const listar = async (req, res) => {
   try {
-    const { q, estado_servicio, id_cliente, id_ascensor, tipo_registro, id_tipo_servicio, origen, id_tecnico, desde, hasta } = req.query;
+    const { q, estado_servicio, estados, prioridad, id_cliente, id_ascensor, tipo_registro, id_tipo_servicio, origen, id_tecnico, desde, hasta } = req.query;
     const where = { estado: 1 };
     if (q) where.OR = [
       // Código y título del servicio
@@ -106,7 +110,14 @@ const listar = async (req, res) => {
       // Código de la cotización origen (si fue aprobada)
       { cotizacion: { codigo: { contains: q, mode: 'insensitive' } } }
     ];
-    if (estado_servicio) where.estado_servicio = estado_servicio;
+    // `estados` (lista separada por comas) tiene prioridad sobre `estado_servicio`
+    // (valor único). Permite a la vista de Asignaciones pedir el conjunto de
+    // estados "en gestión" sin traerse todo y filtrar en cliente.
+    const estadosLista = (estados ? String(estados).split(',') : [])
+      .map(s => s.trim()).filter(Boolean);
+    if (estadosLista.length > 0) where.estado_servicio = { in: estadosLista };
+    else if (estado_servicio) where.estado_servicio = estado_servicio;
+    if (prioridad) where.prioridad = prioridad;
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_ascensor) where.ascensores = { some: { id_ascensor: Number(id_ascensor), estado: 1 } };
     if (tipo_registro) where.tipo_registro = tipo_registro;
@@ -888,7 +899,7 @@ const finalizarServicio = async (req, res) => {
       where: { id_servicio: id },
       include: {
         cuotas: { where: { estado: 1 } },
-        facturas: { where: { estado: 1, estado_factura: { not: 'Anulada' } } }
+        facturas: { where: { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } } }
       }
     });
     // Mantenimiento gratuito / cobertura: nunca debe ir a "Pendiente de iniciar"
@@ -898,17 +909,10 @@ const finalizarServicio = async (req, res) => {
     const estadoCobroInicial = esGratuito
       ? 'Sin cobro'
       : (cobroPrevio?.estado_cobro || 'Pendiente de iniciar');
-    let estadoFacturacionInicial = 'Sin factura';
-    if (cobroPrevio && cobroPrevio.facturas.length > 0) {
-      const tieneGeneral = cobroPrevio.facturas.some(f => f.id_cuota === null);
-      if (tieneGeneral) {
-        estadoFacturacionInicial = 'Facturado';
-      } else {
-        const cuotasFacturadas = new Set(cobroPrevio.facturas.map(f => f.id_cuota));
-        const todas = cobroPrevio.cuotas.length > 0 && cobroPrevio.cuotas.every(c => cuotasFacturadas.has(c.id));
-        estadoFacturacionInicial = todas ? 'Facturado' : 'Parcialmente facturado';
-      }
-    }
+    const estadoFacturacionInicial = calcularEstadoFacturacion({
+      facturas: cobroPrevio?.facturas || [],
+      cuotas: cobroPrevio?.cuotas || []
+    });
 
     // Crear/actualizar folder contable. Caso típico: el folder ya fue creado
     // al aprobar la cotización (estado 'En ejecución'); aquí transicionamos a

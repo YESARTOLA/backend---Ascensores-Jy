@@ -1,5 +1,10 @@
 const prisma = require('../config/prisma');
 const { inicioDelDiaLima, parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
+const {
+  ESTADO_FACTURACION_SIN,
+  ESTADO_FACTURACION_PENDIENTE,
+  ESTADOS_FACTURACION_COMPLETA
+} = require('../utils/estadoFactura');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
 
@@ -428,7 +433,9 @@ const facturados = async (req, res) => {
     const realizados = await prisma.tbl_servicios_realizados.findMany({
       where: {
         estado: 1,
-        estado_facturacion: facturados ? 'Facturado' : { in: ['Sin factura', 'Pendiente de emitir'] }
+        estado_facturacion: facturados
+          ? { in: ESTADOS_FACTURACION_COMPLETA }
+          : { in: [ESTADO_FACTURACION_SIN, ESTADO_FACTURACION_PENDIENTE] }
       },
       include: {
         servicio: {
@@ -572,80 +579,90 @@ const ingresosPorBanco = async (req, res) => {
   }
 };
 
+// Estados de ejecución que produce el dataset de mantenimientos. Se nombran
+// para no repetir literales en el conteo. 'Proyectado' es la ocurrencia teórica
+// del cronograma de un plan continuo que aún no se ha materializado en servicio.
+const EJEC_REALIZADO = 'Realizado';
+const EJEC_EN_CURSO = 'En curso';
+const EJEC_CANCELADO = 'Cancelado';
+
 /**
- * Reporte: mantenimientos por cliente.
- * Para cada cliente con planes activos, agrega:
- *   - gratuitos_hechos: servicios completados marcados como gratuitos
- *   - pagados_hechos: servicios completados NO gratuitos
- *   - cupo_inicial: suma de cantidad_mantenimientos_gratuitos al CREAR cada plan (audit log)
- *   - cupo_actual: suma del cupo gratuito vigente en los planes
- *   - adicionados: cupo_actual - cupo_inicial
+ * Reporte: mantenimientos por cliente (maestro-detalle).
+ * Para cada cliente con planes activos devuelve el desglose POR PLAN de sus
+ * mantenimientos programados, contando por estado de ejecución. Cuando se
+ * recibe un rango (desde/hasta) los conteos reflejan solo las ocurrencias cuya
+ * fecha programada cae dentro del rango.
+ *
+ * Reutiliza el dataset del módulo de mantenimientos (instancias materializadas
+ * + proyecciones del cronograma) para no duplicar esa lógica.
+ *
+ * Query: id_cliente?, desde?, hasta?
  */
-const mantenimientosPorCliente = async (_req, res) => {
+const mantenimientosPorCliente = async (req, res) => {
   try {
-    const planes = await prisma.tbl_mantenimientos_planes.findMany({
-      where: { estado: 1 },
-      include: {
-        cliente: { select: { id: true, nombre: true } },
-        servicios_generados: {
-          where: { estado: 1 },
-          select: {
-            id: true,
-            es_mantenimiento_gratuito: true,
-            servicio_realizado: { select: { id: true, estado: true } }
-          }
+    const { id_cliente, desde, hasta } = req.query;
+    const { construirDatasetReporteMantenimientos } = require('./mantenimientosController');
+    const idsCliente = id_cliente ? [Number(id_cliente)] : null;
+
+    const dataset = await construirDatasetReporteMantenimientos({
+      idsCliente, idsAscensor: null, estadoEjecucion: null, desde, hasta
+    });
+
+    const data = dataset
+      .map(grupo => {
+        const progsPorPlan = new Map();
+        for (const pr of grupo.programaciones) {
+          const arr = progsPorPlan.get(pr.id_plan) || [];
+          arr.push(pr);
+          progsPorPlan.set(pr.id_plan, arr);
         }
-      }
-    });
 
-    // Cargar audit CREATE para todos los planes activos. Cada registro contiene
-    // valor_nuevo con el snapshot del plan al momento de crearse.
-    const ids = planes.map(p => p.id);
-    const audits = ids.length === 0 ? [] : await prisma.tbl_auditoria.findMany({
-      where: { entidad: 'tbl_mantenimientos_planes', id_entidad: { in: ids }, accion: 'CREATE', estado: 1 },
-      select: { id_entidad: true, valor_nuevo: true, fecha_evento: true },
-      orderBy: { fecha_evento: 'asc' }
-    });
-    const cupoInicialPorPlan = {};
-    audits.forEach(a => {
-      // Si hay más de un CREATE (raro), nos quedamos con el primero por orderBy.
-      if (cupoInicialPorPlan[a.id_entidad] !== undefined) return;
-      const valor = a.valor_nuevo;
-      const n = valor && typeof valor === 'object' ? Number(valor.cantidad_mantenimientos_gratuitos || 0) : 0;
-      cupoInicialPorPlan[a.id_entidad] = Number.isFinite(n) ? n : 0;
-    });
+        const planes = grupo.planes.map(plan => {
+          const progs = progsPorPlan.get(plan.id) || [];
+          const programados = progs.length;
+          const realizados = progs.filter(p => p.estado_ejecucion === EJEC_REALIZADO).length;
+          const en_curso = progs.filter(p => p.estado_ejecucion === EJEC_EN_CURSO).length;
+          const cancelados = progs.filter(p => p.estado_ejecucion === EJEC_CANCELADO).length;
+          // "Faltan" = programados aún por realizar (pendientes + proyectados),
+          // descontando los ya realizados, en curso o cancelados.
+          const faltan = programados - realizados - en_curso - cancelados;
+          return {
+            id_plan: plan.id,
+            ascensor_codigo: plan.ascensor?.codigo || null,
+            ascensor_ubicacion: plan.ascensor?.ubicacion || null,
+            tipo_servicio: plan.tipo_servicio?.nombre || null,
+            tipo_plan: plan.tipo_plan,
+            frecuencia: plan.frecuencia || null,
+            programados,
+            realizados,
+            faltan,
+            en_curso,
+            cancelados,
+            gratuitos_cupo: Number(plan.cantidad_mantenimientos_gratuitos || 0),
+            gratuitos_ejecutados: Number(plan.mantenimientos_gratuitos_ejecutados || 0)
+          };
+        });
 
-    // Agrupar por cliente.
-    const acum = new Map();
-    planes.forEach(plan => {
-      const idCli = plan.id_cliente;
-      const entry = acum.get(idCli) || {
-        id_cliente: idCli,
-        cliente_nombre: plan.cliente?.nombre || '—',
-        planes_total: 0,
-        gratuitos_hechos: 0,
-        pagados_hechos: 0,
-        cupo_inicial: 0,
-        cupo_actual: 0,
-        adicionados: 0
-      };
-      entry.planes_total += 1;
-      const realizados = (plan.servicios_generados || []).filter(s =>
-        s.servicio_realizado && s.servicio_realizado.estado === 1
-      );
-      realizados.forEach(s => {
-        if (s.es_mantenimiento_gratuito === 1) entry.gratuitos_hechos += 1;
-        else entry.pagados_hechos += 1;
-      });
-      const inicial = cupoInicialPorPlan[plan.id] ?? Number(plan.cantidad_mantenimientos_gratuitos || 0);
-      const actual = Number(plan.cantidad_mantenimientos_gratuitos || 0);
-      entry.cupo_inicial += inicial;
-      entry.cupo_actual += actual;
-      entry.adicionados += Math.max(0, actual - inicial);
-      acum.set(idCli, entry);
-    });
+        const resumen = planes.reduce((acc, p) => ({
+          programados: acc.programados + p.programados,
+          realizados: acc.realizados + p.realizados,
+          faltan: acc.faltan + p.faltan,
+          en_curso: acc.en_curso + p.en_curso,
+          cancelados: acc.cancelados + p.cancelados
+        }), { programados: 0, realizados: 0, faltan: 0, en_curso: 0, cancelados: 0 });
 
-    const data = Array.from(acum.values()).sort((a, b) => a.cliente_nombre.localeCompare(b.cliente_nombre));
+        return {
+          id_cliente: grupo.cliente?.id ?? null,
+          cliente_nombre: grupo.cliente?.nombre || '—',
+          planes_total: planes.length,
+          ...resumen,
+          planes
+        };
+      })
+      // Solo clientes con planes activos (un cliente sin planes no aporta filas).
+      .filter(c => c.planes_total > 0)
+      .sort((a, b) => a.cliente_nombre.localeCompare(b.cliente_nombre));
+
     res.json({ data });
   } catch (err) {
     console.error(err);

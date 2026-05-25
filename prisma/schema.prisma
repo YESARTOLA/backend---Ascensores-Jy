@@ -82,6 +82,7 @@ model tbl_usuarios {
   rol                    tbl_roles     @relation(fields: [id_rol], references: [id])
   tecnico                tbl_tecnicos? @relation(fields: [id_tecnico], references: [id])
   leads_registrados      tbl_leads[]   @relation("LeadRegistrador")
+  leads_como_vendedor    tbl_leads[]   @relation("LeadVendedor")
 }
 
 // ---------------------------------------------------------------------
@@ -245,7 +246,6 @@ model tbl_tipos_ascensor {
   id                     Int       @id @default(autoincrement())
   nombre                 String    @unique @db.VarChar(50)
   descripcion            String?
-  orden                  Int       @default(0)
   estado                 Int       @default(1)
   user_id_registration   Int?
   date_time_registration DateTime? @default(now()) @db.Timestamptz(6)
@@ -667,7 +667,8 @@ model tbl_leads {
   id_tipo_servicio_solicitado Int?
   cliente_existente           Int                 @default(0)
   id_cliente                  Int?
-  estado_lead                 String              @default("nuevo") @db.VarChar(30)
+  id_vendedor                 Int?
+  estado_lead                 String              @default("Consulta") @db.VarChar(30)
   observaciones               String?
   id_servicio_convertido      Int?
   rol_codigo_registrador      String?             @db.VarChar(50)
@@ -679,6 +680,7 @@ model tbl_leads {
   cliente                     tbl_clientes?       @relation(fields: [id_cliente], references: [id])
   tipo_servicio               tbl_tipos_servicio? @relation(fields: [id_tipo_servicio_solicitado], references: [id])
   usuario_registrador         tbl_usuarios?       @relation("LeadRegistrador", fields: [user_id_registration], references: [id])
+  vendedor                    tbl_usuarios?       @relation("LeadVendedor", fields: [id_vendedor], references: [id])
   cotizaciones                tbl_cotizaciones[]
 }
 

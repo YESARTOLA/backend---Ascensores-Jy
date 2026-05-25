@@ -1,5 +1,9 @@
 const prisma = require('../config/prisma');
 const { inicioDelDiaLima, finDelDiaLima, inicioMesLima, finMesLima } = require('../utils/tiempo');
+const {
+  ESTADO_FACTURACION_SIN,
+  ESTADOS_FACTURACION_COMPLETA
+} = require('../utils/estadoFactura');
 
 const resumen = async (req, res) => {
   try {
@@ -73,8 +77,8 @@ const resumen = async (req, res) => {
           _sum: { monto: true },
           where: { fecha_pago: { gte: inicioMes, lte: finMes }, estado: 1 }
         }),
-        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: 'Sin factura', estado: 1 } }),
-        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: 'Facturado', estado: 1 } })
+        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: ESTADO_FACTURACION_SIN, estado: 1 } }),
+        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA }, estado: 1 } })
       ]);
       data.totalAbonadoMes = Number(totalAbonadoMes._sum.monto || 0);
       data.sinFactura = sinFactura;

@@ -2,18 +2,59 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado } = require('../utils/estadoServicio');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { descartarAlertaFacturarServicio } = require('../utils/recordatoriosAuto');
+const {
+  ESTADO_FACTURA_EMITIDA,
+  ESTADO_FACTURA_ANULADA,
+  ESTADOS_FACTURA,
+  esEstadoFacturaValido,
+  esFacturado,
+  calcularEstadoFacturacion
+} = require('../utils/estadoFactura');
 
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio } = req.query;
+    const { id_cliente, id_servicio, q, estado_factura, cobertura, desde, hasta } = req.query;
     const where = { estado: 1 };
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_servicio) where.id_servicio = Number(id_servicio);
+    if (estado_factura) where.estado_factura = estado_factura;
+    // Cobertura: 'general' = factura por todo el servicio (sin cuota);
+    // 'cuota' = factura ligada a una cuota específica del plan.
+    if (cobertura === 'general') where.id_cuota = null;
+    else if (cobertura === 'cuota') where.id_cuota = { not: null };
+    if (desde || hasta) {
+      where.fecha_emision = {};
+      if (desde) where.fecha_emision.gte = parseYMDLima(desde);
+      if (hasta) where.fecha_emision.lte = parseYMDFinDiaLima(hasta);
+    }
+    if (q) where.OR = [
+      { numero_factura: { contains: q, mode: 'insensitive' } },
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
+    ];
+
+    // Orden configurable por columna (whitelist para evitar inyección). El
+    // correlativo refleja el orden de creación (id), por eso "correlativo" mapea
+    // a id. Por defecto: id ascendente (el correlativo 1 queda arriba).
+    const { sort, dir } = req.query;
+    const direccion = dir === 'desc' ? 'desc' : 'asc';
+    const ORDEN = {
+      correlativo: { id: direccion },
+      numero_factura: { numero_factura: direccion },
+      cliente: { cliente: { nombre: direccion } },
+      servicio: { servicio: { codigo: direccion } },
+      fecha_emision: { fecha_emision: direccion },
+      monto: { monto: direccion },
+      cobertura: { id_cuota: direccion },
+      estado_factura: { estado_factura: direccion }
+    };
+    const orderBy = ORDEN[sort] || { id: 'asc' };
+
     const result = await paginar(
       prisma.tbl_facturas,
-      { where, orderBy: { id: 'desc' }, include: { cliente: true, servicio: true, archivo: true, cobro: true, cuota: true } },
+      { where, orderBy, include: { cliente: true, servicio: true, archivo: true, cobro: true, cuota: true } },
       req.query
     );
     res.json(result);
@@ -36,6 +77,35 @@ const obtener = async (req, res) => {
     res.status(500).json({ error: 'Error al obtener factura' });
   }
 };
+
+/**
+ * Recalcula el estado_facturacion agregado del servicio en base a sus
+ * facturas y cuotas activas (centralizado en utils/estadoFactura.js).
+ * Se llama desde crear() y desde cambiarEstado() para que el cambio en una
+ * factura quede reflejado inmediatamente en Contabilidad / Reportes / Dashboard.
+ */
+async function recomputarEstadoFacturacionServicio(idServicio, idUsuario) {
+  const facturas = await prisma.tbl_facturas.findMany({
+    where: { id_servicio: idServicio, estado: 1 }
+  });
+  const cobro = await prisma.tbl_cobros.findUnique({
+    where: { id_servicio: idServicio },
+    include: { cuotas: { where: { estado: 1 } } }
+  });
+  const estadoFacturacion = calcularEstadoFacturacion({
+    facturas,
+    cuotas: cobro?.cuotas || []
+  });
+  await prisma.tbl_servicios_realizados.updateMany({
+    where: { id_servicio: idServicio },
+    data: {
+      estado_facturacion: estadoFacturacion,
+      user_id_modification: idUsuario,
+      date_time_modification: new Date()
+    }
+  });
+  return estadoFacturacion;
+}
 
 const crear = async (req, res) => {
   try {
@@ -65,7 +135,7 @@ const crear = async (req, res) => {
     // Mutuamente excluyentes a nivel servicio.
     const idCuota = d.id_cuota ? Number(d.id_cuota) : null;
     const facturasExistentes = await prisma.tbl_facturas.findMany({
-      where: { id_servicio: Number(d.id_servicio), estado: 1, estado_factura: { not: 'Anulada' } }
+      where: { id_servicio: Number(d.id_servicio), estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } }
     });
     const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
     const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
@@ -100,6 +170,10 @@ const crear = async (req, res) => {
       }
     }
 
+    const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
+      ? d.estado_factura
+      : ESTADO_FACTURA_EMITIDA;
+
     const factura = await prisma.tbl_facturas.create({
       data: {
         id_servicio: Number(d.id_servicio),
@@ -110,31 +184,17 @@ const crear = async (req, res) => {
         fecha_emision: parseYMDLima(d.fecha_emision),
         monto: d.monto,
         id_archivo: d.id_archivo || null,
-        estado_factura: d.estado_factura || 'Emitida',
+        estado_factura: estadoFacturaInicial,
         registrado_por: req.user.id,
         user_id_registration: req.user.id
       }
     });
-    // Estado de facturación: en modo general una sola factura cubre todo el servicio
-    // (Facturado). En modo por-cuota se considera Facturado solo cuando todas las
-    // cuotas activas tienen una factura no anulada.
-    let estadoFacturacion = 'Facturado';
-    if (idCuota !== null && servicio.cobro) {
-      const cuotasActivas = await prisma.tbl_cobros_cuotas.findMany({
-        where: { id_cobro: servicio.cobro.id, estado: 1 }
-      });
-      const facturasPorCuota = await prisma.tbl_facturas.findMany({
-        where: { id_servicio: Number(d.id_servicio), estado: 1, estado_factura: { not: 'Anulada' }, id_cuota: { not: null } }
-      });
-      const cuotasFacturadas = new Set(facturasPorCuota.map(f => f.id_cuota));
-      const todasFacturadas = cuotasActivas.length > 0 && cuotasActivas.every(c => cuotasFacturadas.has(c.id));
-      estadoFacturacion = todasFacturadas ? 'Facturado' : 'Parcialmente facturado';
-    }
 
-    await prisma.tbl_servicios_realizados.updateMany({
-      where: { id_servicio: Number(d.id_servicio) },
-      data: { estado_facturacion: estadoFacturacion, user_id_modification: req.user.id, date_time_modification: new Date() }
-    });
+    // Recalcular estado_facturacion agregado vía helper centralizado.
+    const estadoFacturacion = await recomputarEstadoFacturacionServicio(
+      Number(d.id_servicio),
+      req.user.id
+    );
 
     // Transición de estado de servicio: solo si el servicio ya está en
     // post-ejecución. Si la factura se emitió contra el adelanto antes que
@@ -145,7 +205,7 @@ const crear = async (req, res) => {
         estado_cobro: cobro?.estado_cobro,
         total_abonado: cobro?.total_abonado,
         saldo_pendiente: cobro?.saldo_pendiente,
-        facturado: estadoFacturacion === 'Facturado'
+        facturado: esFacturado(estadoFacturacion)
       });
       await cambiarEstadoServicio(Number(d.id_servicio), nuevoEstadoServ, req.user.id, `Factura ${d.numero_factura} adjunta`);
     }
@@ -171,21 +231,43 @@ const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { estado_factura } = req.body;
-    const validos = ['Sin factura', 'Pendiente de emitir', 'Emitida', 'Adjunta', 'Observada', 'Anulada'];
-    if (!validos.includes(estado_factura)) return res.status(400).json({ error: 'Estado inválido' });
+    if (!esEstadoFacturaValido(estado_factura)) {
+      return res.status(400).json({ error: `Estado inválido. Permitidos: ${ESTADOS_FACTURA.join(', ')}` });
+    }
     const previo = await prisma.tbl_facturas.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'Factura no encontrada' });
     const f = await prisma.tbl_facturas.update({
       where: { id },
       data: { estado_factura, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
-    // Si se anula, marcar servicio realizado como sin factura
-    if (estado_factura === 'Anulada') {
-      await prisma.tbl_servicios_realizados.updateMany({
-        where: { id_servicio: previo.id_servicio },
-        data: { estado_facturacion: 'Sin factura', user_id_modification: req.user.id, date_time_modification: new Date() }
+
+    // Recalcular estado_facturacion agregado del servicio. Si la factura se
+    // anula y queda sin facturas activas, el helper devuelve 'Sin factura'.
+    const estadoFacturacion = await recomputarEstadoFacturacionServicio(
+      previo.id_servicio,
+      req.user.id
+    );
+
+    // Si el servicio ya está en post-ejecución, sincronizar su estado contable.
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: previo.id_servicio }, include: { cobro: true }
+    });
+    if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
+      const cobro = servicio.cobro;
+      const nuevoEstadoServ = estadoServicioDesdeCobro({
+        estado_cobro: cobro?.estado_cobro,
+        total_abonado: cobro?.total_abonado,
+        saldo_pendiente: cobro?.saldo_pendiente,
+        facturado: esFacturado(estadoFacturacion)
       });
+      await cambiarEstadoServicio(
+        previo.id_servicio,
+        nuevoEstadoServ,
+        req.user.id,
+        `Factura ${previo.numero_factura} pasó a ${estado_factura}`
+      );
     }
+
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: id,
       accion: 'STATUS_CHANGE', valor_anterior: { estado: previo.estado_factura }, valor_nuevo: { estado: estado_factura }, ip: req.ip
