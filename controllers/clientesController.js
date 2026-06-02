@@ -136,7 +136,7 @@ async function reemplazarPreciosCliente(tx, idCliente, payload, idUsuario) {
  * Centralizado para que listar() y exportar() apliquen exactamente los mismos criterios.
  *
  * Filtros soportados:
- *   q                — texto libre sobre nombre / numero_documento / telefono
+ *   q                — texto libre sobre nombre / nombre_edificio / numero_documento / telefono
  *   distrito         — match exacto
  *   tipo_ascensor    — clientes que tengan al menos un ascensor activo de ese tipo
  *   estado           — 0 | 1 (activo/inactivo en el sistema)
@@ -149,6 +149,7 @@ async function construirWhereClientes(query) {
   if (q) {
     where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
+      { nombre_edificio: { contains: q, mode: 'insensitive' } },
       { numero_documento: { contains: q, mode: 'insensitive' } },
       { telefono: { contains: q, mode: 'insensitive' } }
     ];
