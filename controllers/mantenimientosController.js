@@ -709,7 +709,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
     where: wherePlanFecha,
     orderBy: { fecha_programada: 'desc' },
     include: {
-      cliente: { select: { id: true, nombre: true } },
+      cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true } },
       tipo_servicio: { select: { id: true, nombre: true } },
       mantenimiento_plan: {
         select: {
@@ -735,7 +735,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         codigo_servicio: s.codigo,
         id_plan: s.id_mantenimiento_plan,
         id_cliente: s.id_cliente,
-        cliente_nombre: s.cliente?.nombre || null,
+        cliente_nombre: s.cliente?.nombre_edificio || s.cliente?.nombre || null,
         id_ascensor: s.mantenimiento_plan?.id_ascensor || null,
         ascensor_codigo: s.mantenimiento_plan?.ascensor?.codigo || null,
         ascensor_ubicacion: s.mantenimiento_plan?.ascensor?.ubicacion || null,
@@ -781,7 +781,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
               id: true,
               id_cliente: true,
               id_ascensor: true,
-              cliente: { select: { id: true, nombre: true } },
+              cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true } },
               ascensor: { select: { id: true, codigo: true, ubicacion: true, tipo: true } },
               tipo_servicio: { select: { id: true, nombre: true } }
             }
@@ -798,7 +798,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
       id_evento: e.id,
       id_plan: e.id_mantenimiento_plan,
       id_cliente: e.mantenimiento_plan.id_cliente,
-      cliente_nombre: e.mantenimiento_plan.cliente?.nombre || null,
+      cliente_nombre: e.mantenimiento_plan.cliente?.nombre_edificio || e.mantenimiento_plan.cliente?.nombre || null,
       id_ascensor: e.mantenimiento_plan.id_ascensor,
       ascensor_codigo: e.mantenimiento_plan.ascensor?.codigo || null,
       ascensor_ubicacion: e.mantenimiento_plan.ascensor?.ubicacion || null,
@@ -939,7 +939,7 @@ async function _construirDatasetReporte({ idsCliente, idsAscensor, estadoEjecuci
         codigo_servicio: null,
         id_plan: plan.id,
         id_cliente: plan.id_cliente,
-        cliente_nombre: plan.cliente?.nombre || null,
+        cliente_nombre: plan.cliente?.nombre_edificio || plan.cliente?.nombre || null,
         id_ascensor: plan.id_ascensor,
         ascensor_codigo: plan.ascensor?.codigo || null,
         ascensor_ubicacion: plan.ascensor?.ubicacion || null,

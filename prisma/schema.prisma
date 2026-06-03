@@ -91,11 +91,12 @@ model tbl_usuarios {
 
 model tbl_clientes {
   id                            Int                         @id @default(autoincrement())
+  tipo                          String                      @default("Edificio") @db.VarChar(20)
   tipo_documento                String                      @db.VarChar(20)
   numero_documento              String?                     @db.VarChar(30)
   nombre                        String                      @db.VarChar(200)
   nombre_edificio               String?                     @db.VarChar(200)
-  telefono                      String                      @db.VarChar(30)
+  telefono                      String?                     @db.VarChar(30)
   whatsapp                      String?                     @db.VarChar(30)
   correo                        String?                     @db.VarChar(150)
   direccion                     String?

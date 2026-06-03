@@ -37,6 +37,7 @@ function estadoContrato(c, hoyISO) {
 
 const COLUMNAS = [
   { header: 'Nombre',                 key: 'nombre',                 width: 36 },
+  { header: 'Tipo',                   key: 'tipo',                   width: 12 },
   { header: 'Edificio',               key: 'nombre_edificio',        width: 28 },
   { header: 'Clasificación',          key: 'clasificacion',          width: 14 },
   { header: 'Tipo doc.',              key: 'tipo_documento',         width: 10 },
@@ -68,6 +69,7 @@ function formateaContacto(nombre, correo, telefono) {
 function mapearFila(c, hoyISO) {
   return {
     nombre: c.nombre || '',
+    tipo: c.tipo || '',
     nombre_edificio: c.nombre_edificio || '',
     clasificacion: c.clasificacion ? (CLASIFICACION_MAP[c.clasificacion] || c.clasificacion) : '',
     tipo_documento: c.tipo_documento || '',

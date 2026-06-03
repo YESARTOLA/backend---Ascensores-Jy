@@ -3,12 +3,26 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
-const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
+const {
+  CLASIFICACIONES,
+  CLASIFICACIONES_CODIGOS,
+  TIPOS_CLIENTE,
+  TIPOS_CLIENTE_CODIGOS,
+  TIPO_CLIENTE_DEFAULT
+} = require('../utils/catalogosClientes');
 
 const normalizarClasificacion = (v) => {
   if (v === undefined || v === null || v === '') return null;
   const s = String(v).trim();
   return CLASIFICACIONES_CODIGOS.includes(s) ? s : null;
+};
+
+// Tipo de cliente (Edificio/Obra). Es un catálogo cerrado: ante un valor
+// ausente o inválido cae al default, de modo que la columna nunca queda en un
+// estado fuera de catálogo.
+const normalizarTipo = (v) => {
+  const s = String(v ?? '').trim();
+  return TIPOS_CLIENTE_CODIGOS.includes(s) ? s : TIPO_CLIENTE_DEFAULT;
 };
 
 const parseFechaContrato = (valor) => {
@@ -215,6 +229,15 @@ const listarClasificaciones = (_req, res) => {
 };
 
 /**
+ * Catálogo de tipos de cliente (Edificio / Obra). Alimenta el select del form,
+ * el badge del listado y las etiquetas dinámicas de nombre/dirección del
+ * frontend, sirviendo como única fuente de verdad de esa terminología.
+ */
+const listarTiposCliente = (_req, res) => {
+  res.json({ data: TIPOS_CLIENTE });
+};
+
+/**
  * Tipos de ascensor activos del catálogo (tbl_tipos_ascensor). Alimenta el
  * filtro "Tipo de ascensor" en el listado de clientes y se gestiona desde
  * la pantalla "Tipos de ascensor".
@@ -223,7 +246,7 @@ const listarTiposAscensor = async (_req, res) => {
   try {
     const tipos = await prisma.tbl_tipos_ascensor.findMany({
       where: { estado: 1 },
-      orderBy: [{ orden: 'asc' }, { nombre: 'asc' }],
+      orderBy: [{ nombre: 'asc' }],
       select: { nombre: true }
     });
     res.json({ data: tipos.map(t => t.nombre) });
@@ -417,8 +440,11 @@ const vista360 = async (req, res) => {
 const crear = async (req, res) => {
   try {
     const data = req.body;
-    if (!data.nombre || !data.telefono) {
-      return res.status(400).json({ error: 'Nombre y teléfono son obligatorios' });
+    if (!data.nombre) {
+      return res.status(400).json({ error: 'La razón social / nombre es obligatorio' });
+    }
+    if (!data.nombre_edificio || !String(data.nombre_edificio).trim()) {
+      return res.status(400).json({ error: 'El nombre del edificio / obra es obligatorio' });
     }
     if (!data.distrito || !String(data.distrito).trim()) {
       return res.status(400).json({ error: 'Distrito obligatorio' });
@@ -454,13 +480,14 @@ const crear = async (req, res) => {
     const cliente = await prisma.$transaction(async (tx) => {
       const creado = await tx.tbl_clientes.create({
         data: {
+          tipo: normalizarTipo(data.tipo),
           tipo_documento: data.tipo_documento || 'RUC',
           numero_documento: data.numero_documento || null,
           nombre: data.nombre,
           nombre_edificio: trimOrNull(data.nombre_edificio),
-          telefono: data.telefono,
-          whatsapp: data.whatsapp || data.telefono,
-          correo: data.correo || null,
+          telefono: trimOrNull(data.telefono),
+          whatsapp: trimOrNull(data.whatsapp),
+          correo: trimOrNull(data.correo),
           direccion: data.direccion || null,
           distrito: String(data.distrito).trim(),
           latitud: coords.lat,
@@ -542,6 +569,11 @@ const actualizar = async (req, res) => {
       idArchivoContrato = (valor === null || valor === '' || valor === undefined) ? null : Number(valor);
     }
 
+    if (Object.prototype.hasOwnProperty.call(data, 'nombre_edificio')
+      && !String(data.nombre_edificio || '').trim()) {
+      return res.status(400).json({ error: 'El nombre del edificio / obra es obligatorio' });
+    }
+
     let distrito = previo.distrito;
     if (Object.prototype.hasOwnProperty.call(data, 'distrito')) {
       const valor = String(data.distrito || '').trim();
@@ -572,6 +604,9 @@ const actualizar = async (req, res) => {
       await tx.tbl_clientes.update({
         where: { id },
         data: {
+          tipo: Object.prototype.hasOwnProperty.call(data, 'tipo')
+            ? normalizarTipo(data.tipo)
+            : previo.tipo,
           tipo_documento: data.tipo_documento ?? previo.tipo_documento,
           numero_documento: data.numero_documento ?? previo.numero_documento,
           nombre: data.nombre ?? previo.nombre,
@@ -638,4 +673,4 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, listarDistritos, listarTiposAscensor, listarClasificaciones, exportar, obtener, vista360, crear, actualizar, cambiarEstado };
+module.exports = { listar, listarDistritos, listarTiposAscensor, listarClasificaciones, listarTiposCliente, exportar, obtener, vista360, crear, actualizar, cambiarEstado };

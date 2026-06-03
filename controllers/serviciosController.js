@@ -141,7 +141,7 @@ const listar = async (req, res) => {
       {
         where, orderBy: { id: 'desc' },
         include: {
-          cliente: { select: { id: true, nombre: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } },
+          cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } },
           ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
           tipo_servicio: true,
           asignaciones: { where: { estado: 1 }, include: { tecnico: true } }

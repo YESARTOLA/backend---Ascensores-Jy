@@ -11,6 +11,7 @@ router.get('/exportar', c.exportar);
 router.get('/distritos', c.listarDistritos);
 router.get('/tipos-ascensor', c.listarTiposAscensor);
 router.get('/clasificaciones', c.listarClasificaciones);
+router.get('/tipos', c.listarTiposCliente);
 router.get('/:id', c.obtener);
 router.get('/:id/360', c.vista360);
 router.post('/', permitirRoles('super_admin', 'admin', 'coordinador'), c.crear);
