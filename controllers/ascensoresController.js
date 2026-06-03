@@ -19,7 +19,7 @@ const listar = async (req, res) => {
 
     const result = await paginar(
       prisma.tbl_ascensores,
-      { where, orderBy: { id: 'desc' }, include: { cliente: { select: { id: true, nombre: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } } } },
+      { where, orderBy: { id: 'desc' }, include: { cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } } } },
       req.query
     );
     res.json(result);
