@@ -37,16 +37,14 @@ function estadoContrato(c, hoyISO) {
 
 const COLUMNAS = [
   { header: 'Nombre',                 key: 'nombre',                 width: 36 },
-  { header: 'Tipo',                   key: 'tipo',                   width: 12 },
-  { header: 'Edificio',               key: 'nombre_edificio',        width: 28 },
+  { header: 'Edificios / Obras',      key: 'edificios',              width: 32 },
+  { header: 'Distritos',              key: 'distritos',              width: 20 },
   { header: 'Clasificación',          key: 'clasificacion',          width: 14 },
   { header: 'Tipo doc.',              key: 'tipo_documento',         width: 10 },
   { header: 'Número doc.',            key: 'numero_documento',       width: 15 },
   { header: 'Teléfono',               key: 'telefono',               width: 14 },
   { header: 'WhatsApp',               key: 'whatsapp',               width: 14 },
   { header: 'Correo',                 key: 'correo',                 width: 26 },
-  { header: 'Dirección',              key: 'direccion',              width: 32 },
-  { header: 'Distrito',               key: 'distrito',               width: 16 },
   { header: 'Contacto principal',     key: 'contacto_principal',     width: 30 },
   { header: 'Contacto cobranzas',     key: 'contacto_cobranzas',     width: 30 },
   { header: 'Contacto administrativo',key: 'contacto_admin',         width: 30 },
@@ -67,18 +65,17 @@ function formateaContacto(nombre, correo, telefono) {
 }
 
 function mapearFila(c, hoyISO) {
+  const edificios = Array.isArray(c.edificios) ? c.edificios : [];
   return {
     nombre: c.nombre || '',
-    tipo: c.tipo || '',
-    nombre_edificio: c.nombre_edificio || '',
+    edificios: edificios.map(e => e.nombre).filter(Boolean).join(', '),
+    distritos: [...new Set(edificios.map(e => e.distrito).filter(Boolean))].join(', '),
     clasificacion: c.clasificacion ? (CLASIFICACION_MAP[c.clasificacion] || c.clasificacion) : '',
     tipo_documento: c.tipo_documento || '',
     numero_documento: c.numero_documento || '',
     telefono: c.telefono || '',
     whatsapp: c.whatsapp || '',
     correo: c.correo || '',
-    direccion: c.direccion || '',
-    distrito: c.distrito || '',
     contacto_principal: formateaContacto(c.contacto_principal_nombre, c.contacto_principal_correo, c.contacto_principal_telefono),
     contacto_cobranzas: formateaContacto(c.contacto_cobranzas_nombre, c.contacto_cobranzas_correo, c.contacto_cobranzas_telefono),
     contacto_admin: formateaContacto(c.contacto_admin_nombre, c.contacto_admin_correo, c.contacto_admin_telefono),
@@ -87,7 +84,7 @@ function mapearFila(c, hoyISO) {
     estado_contrato: estadoContrato(c, hoyISO),
     contrato_adjunto: c.archivo_contrato?.nombre_original || '',
     adjuntos: c._count?.archivos ?? (Array.isArray(c.archivos) ? c.archivos.length : 0),
-    ascensores: c._count?.ascensores ?? 0,
+    ascensores: edificios.reduce((n, e) => n + (e._count?.ascensores ?? 0), 0),
     servicios: c._count?.servicios ?? 0,
     observaciones: c.observaciones || '',
     registrado: fechaISO(c.date_time_registration)
@@ -187,11 +184,11 @@ async function generarPdfClientes(clientes) {
   // Columnas a renderizar en PDF (subset orientado a impresión)
   const cols = [
     { titulo: 'Cliente',          key: 'nombre',                 w: 100 },
-    { titulo: 'Edificio',         key: 'nombre_edificio',        w: 80 },
+    { titulo: 'Edificios / Obras',key: 'edificios',              w: 80 },
     { titulo: 'Clasif.',          key: 'clasificacion',          w: 60 },
     { titulo: 'Doc.',             key: 'numero_documento',       w: 55 },
     { titulo: 'Teléfono',         key: 'telefono',               w: 60 },
-    { titulo: 'Distrito',         key: 'distrito',               w: 55 },
+    { titulo: 'Distritos',        key: 'distritos',              w: 55 },
     { titulo: 'Contacto princ.',  key: 'contacto_principal',     w: 100 },
     { titulo: 'Inicio',           key: 'contrato_inicio',        w: 50 },
     { titulo: 'Fin',              key: 'contrato_fin',           w: 50 },

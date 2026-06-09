@@ -364,14 +364,15 @@ async function sincronizarRecordatorioCotizacionUrgente(idServicio) {
   if (!idServicio) return;
   const s = await prisma.tbl_servicios_proyectos.findUnique({
     where: { id: idServicio },
-    include: { cliente: true, tipo_servicio: true }
+    include: { cliente: true, tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: { select: { edificio: { select: { nombre: true } } } } } } }
   });
   if (!s || s.estado !== 1) {
     return descartarAuto({ tipo: 'cotizacion_urgente', id_servicio: idServicio });
   }
   const titulo = `Cotización urgente — ${s.codigo}`;
+  const edificioNombre = (s.ascensores || []).map(a => a.ascensor?.edificio?.nombre).find(Boolean);
   const detalleCliente = s.cliente
-    ? `${s.cliente.nombre}${s.cliente.nombre_edificio ? ` · ${s.cliente.nombre_edificio}` : ''}`
+    ? `${s.cliente.nombre}${edificioNombre ? ` · ${edificioNombre}` : ''}`
     : '';
   const descripcion = `Servicio finalizado con informe. Revisar y emitir cotización si corresponde.${detalleCliente ? ` · ${detalleCliente}` : ''}`;
   return upsertAuto({
@@ -406,7 +407,7 @@ async function sincronizarAlertaServicioFinalizado(tipo, idServicio) {
   if (!idServicio) return;
   const s = await prisma.tbl_servicios_proyectos.findUnique({
     where: { id: idServicio },
-    include: { cliente: true, tipo_servicio: true }
+    include: { cliente: true, tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: { select: { edificio: { select: { nombre: true } } } } } } }
   });
   if (!s || s.estado !== 1) {
     return descartarAuto({ tipo, id_servicio: idServicio });
@@ -418,8 +419,9 @@ async function sincronizarAlertaServicioFinalizado(tipo, idServicio) {
   if (!ESTADOS_SERVICIO_POST_FINALIZACION.includes(s.estado_servicio)) {
     return descartarAuto({ tipo, id_servicio: idServicio });
   }
+  const edificioNombre = (s.ascensores || []).map(a => a.ascensor?.edificio?.nombre).find(Boolean);
   const detalleCliente = s.cliente
-    ? `${s.cliente.nombre}${s.cliente.nombre_edificio ? ` · ${s.cliente.nombre_edificio}` : ''}`
+    ? `${s.cliente.nombre}${edificioNombre ? ` · ${edificioNombre}` : ''}`
     : '';
   const textos = TEXTO_ALERTA_FINALIZADO[tipo];
   if (!textos) throw new Error(`Tipo de alerta de finalización no soportado: ${tipo}`);

@@ -3,23 +3,38 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
 
+// Datos del edificio (y su cliente) que la UI muestra junto al ascensor.
+const INCLUDE_EDIFICIO = {
+  edificio: {
+    select: {
+      id: true, nombre: true, tipo: true, distrito: true, direccion: true, latitud: true, longitud: true,
+      cliente: { select: { id: true, nombre: true, telefono: true, whatsapp: true } }
+    }
+  }
+};
+
 const listar = async (req, res) => {
   try {
-    const { q, id_cliente, estado_operativo } = req.query;
+    const { q, id_cliente, id_edificio, estado_operativo } = req.query;
     const where = { estado: 1 };
     if (q) {
       where.OR = [
         { codigo: { contains: q, mode: 'insensitive' } },
         { ubicacion: { contains: q, mode: 'insensitive' } },
-        { marca: { contains: q, mode: 'insensitive' } }
+        { marca: { contains: q, mode: 'insensitive' } },
+        { edificio: { is: { nombre: { contains: q, mode: 'insensitive' } } } },
+        { edificio: { is: { cliente: { is: { nombre: { contains: q, mode: 'insensitive' } } } } } }
       ];
     }
-    if (id_cliente) where.id_cliente = Number(id_cliente);
+    // El ascensor pertenece a un edificio; el filtro por cliente se resuelve a
+    // través del edificio.
+    if (id_edificio) where.id_edificio = Number(id_edificio);
+    else if (id_cliente) where.edificio = { is: { id_cliente: Number(id_cliente) } };
     if (estado_operativo) where.estado_operativo = estado_operativo;
 
     const result = await paginar(
       prisma.tbl_ascensores,
-      { where, orderBy: { id: 'desc' }, include: { cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } } } },
+      { where, orderBy: { id: 'desc' }, include: INCLUDE_EDIFICIO },
       req.query
     );
     res.json(result);
@@ -34,7 +49,7 @@ const obtener = async (req, res) => {
     const id = Number(req.params.id);
     const ascensor = await prisma.tbl_ascensores.findUnique({
       where: { id },
-      include: { cliente: true }
+      include: { edificio: { include: { cliente: true } } }
     });
     if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
     res.json({ data: ascensor });
@@ -48,7 +63,7 @@ const historial = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const [ascensor, servicios, emergencias, mantenimientos, eventosHist] = await Promise.all([
-      prisma.tbl_ascensores.findUnique({ where: { id }, include: { cliente: true } }),
+      prisma.tbl_ascensores.findUnique({ where: { id }, include: { edificio: { include: { cliente: true } } } }),
       prisma.tbl_servicios_proyectos.findMany({
         where: { ascensores: { some: { id_ascensor: id, estado: 1 } }, estado: 1 },
         orderBy: { id: 'desc' },
@@ -121,15 +136,17 @@ const historial = async (req, res) => {
 const crear = async (req, res) => {
   try {
     const data = req.body;
-    if (!data.id_cliente || !data.codigo) {
-      return res.status(400).json({ error: 'Cliente y código son obligatorios' });
+    if (!data.id_edificio || !data.codigo) {
+      return res.status(400).json({ error: 'Edificio y código son obligatorios' });
     }
+    const edificio = await prisma.tbl_edificios.findUnique({ where: { id: Number(data.id_edificio) } });
+    if (!edificio || edificio.estado !== 1) return res.status(400).json({ error: 'Edificio no encontrado' });
     const existente = await prisma.tbl_ascensores.findUnique({ where: { codigo: data.codigo } });
     if (existente) return res.status(400).json({ error: 'Código de ascensor duplicado' });
 
     const ascensor = await prisma.tbl_ascensores.create({
       data: {
-        id_cliente: Number(data.id_cliente),
+        id_edificio: Number(data.id_edificio),
         codigo: data.codigo,
         ubicacion: data.ubicacion || null,
         tipo: data.tipo || null,
@@ -179,7 +196,7 @@ const actualizar = async (req, res) => {
     const ascensor = await prisma.tbl_ascensores.update({
       where: { id },
       data: {
-        id_cliente: data.id_cliente ? Number(data.id_cliente) : previo.id_cliente,
+        id_edificio: data.id_edificio ? Number(data.id_edificio) : previo.id_edificio,
         codigo: data.codigo ?? previo.codigo,
         ubicacion: data.ubicacion ?? previo.ubicacion,
         tipo: data.tipo ?? previo.tipo,

@@ -11,7 +11,7 @@ const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
-const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO } = require('../utils/estadoLead');
+const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
 
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
@@ -83,7 +83,7 @@ function normalizarAscensores(input) {
 const INCLUDE_ASCENSORES = {
   where: { estado: 1 },
   orderBy: { orden: 'asc' },
-  include: { ascensor: true }
+  include: { ascensor: { include: { edificio: { select: { id: true, nombre: true, tipo: true, distrito: true, direccion: true } } } } }
 };
 
 // Transiciones permitidas: Cotizado → Aprobado | Rechazado. No hay regreso.
@@ -175,9 +175,8 @@ const listar = async (req, res) => {
     const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = req.query;
     const where = { estado: 1 };
     if (q) where.OR = [
-      // Código y título de la cotización
+      // Código de la cotización
       { codigo: { contains: q, mode: 'insensitive' } },
-      { titulo: { contains: q, mode: 'insensitive' } },
       // Nombre del cliente
       { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
       // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
@@ -281,7 +280,6 @@ const crear = async (req, res) => {
 
     if (!d.id_cliente) return res.status(400).json({ error: 'Cliente obligatorio' });
     if (!d.id_tipo_servicio) return res.status(400).json({ error: 'Tipo de servicio obligatorio' });
-    if (!d.titulo) return res.status(400).json({ error: 'Título obligatorio' });
     if (!d.fecha_validez) return res.status(400).json({ error: 'Fecha de validez obligatoria' });
 
     let ascensoresLimpios;
@@ -293,6 +291,14 @@ const crear = async (req, res) => {
 
     const items = Array.isArray(d.items) ? d.items : [];
     if (items.length === 0) return res.status(400).json({ error: 'Debe agregar al menos un item' });
+
+    if (d.id_lead) {
+      const lead = await prisma.tbl_leads.findUnique({ where: { id: Number(d.id_lead) } });
+      if (!lead) return res.status(400).json({ error: 'Lead no encontrado' });
+      if (lead.estado_lead === ESTADO_LEAD_DESCARTADO) {
+        return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de cotizarlo' });
+      }
+    }
 
     const igvTasa = await configuracion.obtener('IGV_RATE');
     const totales = calcularTotalesVersion(items, igvTasa);
@@ -331,7 +337,6 @@ const crear = async (req, res) => {
           id_cliente: Number(d.id_cliente),
           id_lead: d.id_lead ? Number(d.id_lead) : null,
           id_tipo_servicio: Number(d.id_tipo_servicio),
-          titulo: d.titulo,
           descripcion: d.descripcion || null,
           estado_global: ESTADO_GLOBAL.COTIZADO,
           version_activa: 1,
@@ -450,7 +455,6 @@ const actualizarCabecera = async (req, res) => {
         data: {
           id_cliente: d.id_cliente ? Number(d.id_cliente) : prev.cotizacion.id_cliente,
           id_tipo_servicio: d.id_tipo_servicio ? Number(d.id_tipo_servicio) : prev.cotizacion.id_tipo_servicio,
-          titulo: d.titulo ?? prev.cotizacion.titulo,
           descripcion: d.descripcion ?? prev.cotizacion.descripcion,
           user_id_modification: req.user.id,
           date_time_modification: new Date()
@@ -1011,6 +1015,14 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
  * Si ya existe un servicio para esta cotización (caso re-aprobación tras
  * reapertura), delega en `_reAprobarTx` — no crea servicio/cobro nuevos.
  */
+// Título del servicio creado al aprobar una cotización. La cotización ya no
+// tiene campo `titulo`: se deriva del tipo de servicio + el nombre del edificio
+// u obra (tomado de los ascensores de la cotización). El servicio exige título
+// (NOT NULL); como último recurso usa el código.
+function tituloServicioDesdeCotizacion(cot, edificioNombre, codigoServicio) {
+  return [cot.tipo_servicio?.nombre, edificioNombre || ''].filter(Boolean).join(' – ') || codigoServicio;
+}
+
 const aprobar = async (req, res) => {
   try {
     if (!puedeEditar(req)) return res.status(403).json({ error: 'No autorizado' });
@@ -1093,11 +1105,20 @@ const aprobar = async (req, res) => {
     }
     // ────────────────────────────────────────────────────────────────────────
 
+    // Un ascensor nuevo debe indicar a qué edificio del cliente pertenece (el
+    // ascensor ya no cuelga directo del cliente). El picker de la cotización lo
+    // adjunta en `ascensor_nuevo.id_edificio`.
+    for (const fila of cot.ascensores) {
+      if (!fila.id_ascensor && !(fila.ascensor_nuevo && fila.ascensor_nuevo.id_edificio)) {
+        return res.status(400).json({ error: 'Cada ascensor nuevo debe indicar su edificio' });
+      }
+    }
+
     const resultado = await prisma.$transaction(async (tx) => {
       // 1. Resolver cada fila de la cotización a un id_ascensor. Las que tengan
       //    ascensor_nuevo crean primero el registro en tbl_ascensores con estado
       //    "Por instalar" y luego se enlazan al servicio.
-      let totalAscensoresCliente = await tx.tbl_ascensores.count({ where: { id_cliente: cot.id_cliente } });
+      let totalAscensoresCliente = await tx.tbl_ascensores.count({ where: { edificio: { is: { id_cliente: cot.id_cliente } } } });
       const idsResueltos = [];
       for (const fila of cot.ascensores) {
         if (fila.id_ascensor) {
@@ -1109,7 +1130,7 @@ const aprobar = async (req, res) => {
         const codigoAsc = `ASC-${cot.id_cliente}-${String(totalAscensoresCliente).padStart(3, '0')}-${Date.now().toString().slice(-4)}`;
         const nuevoAsc = await tx.tbl_ascensores.create({
           data: {
-            id_cliente: cot.id_cliente,
+            id_edificio: Number(datos.id_edificio),
             codigo: codigoAsc,
             ubicacion: datos.ubicacion || null,
             tipo: datos.tipo || null,
@@ -1136,6 +1157,11 @@ const aprobar = async (req, res) => {
       const totalCents = Math.round(Number(version.monto_total) * 100);
       const baseCents = Math.floor(totalCents / idsResueltos.length);
       const codigoSrv = await generarCodigoServicio();
+      // El edificio del servicio = el de los ascensores cotizados (mismo edificio).
+      const edificioServicio = await tx.tbl_edificios.findFirst({
+        where: { ascensores: { some: { id: { in: idsResueltos } } } },
+        select: { nombre: true }
+      });
       const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo: codigoSrv,
@@ -1144,7 +1170,7 @@ const aprobar = async (req, res) => {
           id_cliente: cot.id_cliente,
           id_cotizacion: cot.id,
           origen: 'cotizacion',
-          titulo: cot.titulo,
+          titulo: tituloServicioDesdeCotizacion(cot, edificioServicio?.nombre, codigoSrv),
           descripcion: cot.descripcion,
           fecha_programada: fechaProgramada,
           hora_programada: horaProgramada,
@@ -1284,12 +1310,15 @@ const aprobar = async (req, res) => {
       });
 
       // 7. Si la cotización viene de un lead, marcarlo como 'Ingresado'
-      //    (ingresó como servicio) y enlazar el servicio generado.
+      //    (ingresó como servicio) y enlazar el servicio generado. Se limpia
+      //    motivo_descarte: si el lead fue descartado tras cotizarse, la
+      //    aprobación lo reactiva y el motivo deja de aplicar.
       if (cot.id_lead) {
         await tx.tbl_leads.update({
           where: { id: cot.id_lead },
           data: {
             estado_lead: ESTADO_LEAD_INGRESADO,
+            motivo_descarte: null,
             id_servicio_convertido: servicio.id,
             user_id_modification: req.user.id,
             date_time_modification: new Date()

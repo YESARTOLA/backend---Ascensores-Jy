@@ -86,14 +86,17 @@ async function generarInformeFinalizacionPdf(ctx) {
   y += 14;
   doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto);
   doc.text(servicio.cliente?.nombre || '—', x0, y); y += 12;
-  if (servicio.cliente?.nombre_edificio) {
-    doc.fillColor(PALETA.gris).text(`Edificio: ${servicio.cliente.nombre_edificio}`, x0, y); y += 12;
+  // La ubicación física (edificio/obra, dirección, distrito) ahora vive en el
+  // edificio de los ascensores del servicio.
+  const edificioServicio = (servicio.ascensores || []).map(a => a.ascensor?.edificio).find(Boolean);
+  if (edificioServicio?.nombre) {
+    doc.fillColor(PALETA.gris).text(`Edificio: ${edificioServicio.nombre}`, x0, y); y += 12;
   }
   if (servicio.cliente?.numero_documento) {
     doc.fillColor(PALETA.gris).text(`${servicio.cliente.tipo_documento || 'Doc'}: ${servicio.cliente.numero_documento}`, x0, y); y += 12;
   }
-  if (servicio.cliente?.direccion) {
-    doc.fillColor(PALETA.gris).text(`Dirección: ${servicio.cliente.direccion}${servicio.cliente.distrito ? ' · ' + servicio.cliente.distrito : ''}`, x0, y, { width: ancho }); y += 12;
+  if (edificioServicio?.direccion) {
+    doc.fillColor(PALETA.gris).text(`Dirección: ${edificioServicio.direccion}${edificioServicio.distrito ? ' · ' + edificioServicio.distrito : ''}`, x0, y, { width: ancho }); y += 12;
   }
 
   y += 6;

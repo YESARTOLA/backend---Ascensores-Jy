@@ -5,6 +5,7 @@ const {
   ESTADO_FACTURACION_PENDIENTE,
   ESTADOS_FACTURACION_COMPLETA
 } = require('../utils/estadoFactura');
+const { ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
 
@@ -29,13 +30,17 @@ const operativos = async (req, res) => {
         cliente: { select: { nombre: true } },
         ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } },
         tipo_servicio: true,
-        asignaciones: { include: { tecnico: { select: { nombre: true } } }, where: { estado: 1 } }
+        asignaciones: { include: { tecnico: { select: { nombre: true } } }, where: { estado: 1 } },
+        // Datos financieros del cobro (fuente única, la misma de Gestión de
+        // cobros) para mostrar cuánto se lleva cobrado y cuánto falta pagar.
+        cobro: { select: { total_abonado: true, saldo_pendiente: true, moneda: true } }
       }
     });
 
+    // Roles sin acceso financiero no ven precio ni montos del cobro.
     const sanit = ROLES_PRECIO.includes(req.user.rol_codigo)
       ? servicios
-      : servicios.map(s => ({ ...s, precio_interno: null }));
+      : servicios.map(s => ({ ...s, precio_interno: null, cobro: null }));
     res.json({ data: sanit });
   } catch (err) {
     console.error(err);
@@ -358,8 +363,9 @@ const leads = async (_req, res) => {
       const k = l.canal || 'desconocido';
       porCanal[k] = (porCanal[k] || 0) + 1;
     });
-    const convertidos = list.filter(l => l.estado_lead === 'convertido').length;
-    res.json({ data: { total: list.length, convertidos, porCanal, leads: list } });
+    const convertidos = list.filter(l => l.estado_lead === ESTADO_LEAD_INGRESADO).length;
+    const descartados = list.filter(l => l.estado_lead === ESTADO_LEAD_DESCARTADO).length;
+    res.json({ data: { total: list.length, convertidos, descartados, porCanal, leads: list } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error en reporte leads' });

@@ -3,26 +3,12 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
-const {
-  CLASIFICACIONES,
-  CLASIFICACIONES_CODIGOS,
-  TIPOS_CLIENTE,
-  TIPOS_CLIENTE_CODIGOS,
-  TIPO_CLIENTE_DEFAULT
-} = require('../utils/catalogosClientes');
+const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
 
 const normalizarClasificacion = (v) => {
   if (v === undefined || v === null || v === '') return null;
   const s = String(v).trim();
   return CLASIFICACIONES_CODIGOS.includes(s) ? s : null;
-};
-
-// Tipo de cliente (Edificio/Obra). Es un catálogo cerrado: ante un valor
-// ausente o inválido cae al default, de modo que la columna nunca queda en un
-// estado fuera de catálogo.
-const normalizarTipo = (v) => {
-  const s = String(v ?? '').trim();
-  return TIPOS_CLIENTE_CODIGOS.includes(s) ? s : TIPO_CLIENTE_DEFAULT;
 };
 
 const parseFechaContrato = (valor) => {
@@ -44,22 +30,6 @@ const trimOrNull = (v) => {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
   return s.length > 0 ? s : null;
-};
-
-/**
- * Devuelve `{ lat, lng }` numéricos si el par recibido es válido, o `null` si
- * cualquiera está ausente o fuera de rango. `undefined` significa "no se envió
- * el campo" (distinto de "se envió vacío para limpiarlo").
- */
-const parseCoordenadas = (lat, lng) => {
-  if (lat === undefined || lat === null || lat === ''
-   || lng === undefined || lng === null || lng === '') return null;
-  const nLat = Number(lat);
-  const nLng = Number(lng);
-  if (!Number.isFinite(nLat) || !Number.isFinite(nLng)) return null;
-  if (nLat < -90 || nLat > 90) return null;
-  if (nLng < -180 || nLng > 180) return null;
-  return { lat: nLat, lng: nLng };
 };
 
 /**
@@ -99,6 +69,17 @@ const INCLUDE_PRECIOS = {
   where: { estado: 1 },
   include: { tipo_servicio: { select: { id: true, nombre: true } } },
   orderBy: { id: 'asc' }
+};
+
+// Edificios activos del cliente (con su conteo de ascensores). Reemplaza la
+// antigua relación directa cliente→ascensores en el detalle y la vista 360.
+const INCLUDE_EDIFICIOS = {
+  where: { estado: 1 },
+  orderBy: { id: 'desc' },
+  include: {
+    ascensores: { where: { estado: 1 } },
+    _count: { select: { ascensores: true } }
+  }
 };
 
 /**
@@ -149,11 +130,16 @@ async function reemplazarPreciosCliente(tx, idCliente, payload, idUsuario) {
  * Construye el `where` Prisma para tbl_clientes a partir de los filtros de querystring.
  * Centralizado para que listar() y exportar() apliquen exactamente los mismos criterios.
  *
+ * La ubicación física vive ahora en los edificios del cliente, así que los
+ * filtros por distrito y por tipo de ascensor se resuelven a través de la
+ * relación `edificios`.
+ *
  * Filtros soportados:
- *   q                — texto libre sobre nombre / nombre_edificio / numero_documento / telefono
- *   distrito         — match exacto
- *   tipo_ascensor    — clientes que tengan al menos un ascensor activo de ese tipo
- *   estado           — 0 | 1 (activo/inactivo en el sistema)
+ *   q                — texto libre sobre nombre / nº documento / teléfono / nombre de edificio
+ *   distrito         — clientes con algún edificio en ese distrito
+ *   tipo_ascensor    — clientes con algún edificio que tenga un ascensor de ese tipo
+ *   clasificacion    — match exacto
+ *   estado           — 0 | 1 (activo/inactivo)
  *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato
  *   con_contrato     — '1' | '0' filtra si tiene archivo de contrato adjunto
  */
@@ -163,14 +149,16 @@ async function construirWhereClientes(query) {
   if (q) {
     where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
-      { nombre_edificio: { contains: q, mode: 'insensitive' } },
       { numero_documento: { contains: q, mode: 'insensitive' } },
-      { telefono: { contains: q, mode: 'insensitive' } }
+      { telefono: { contains: q, mode: 'insensitive' } },
+      { edificios: { some: { estado: 1, nombre: { contains: q, mode: 'insensitive' } } } }
     ];
   }
-  if (distrito) where.distrito = distrito;
-  if (tipo_ascensor) {
-    where.ascensores = { some: { tipo: tipo_ascensor, estado: 1 } };
+  const edificioFilter = {};
+  if (distrito) edificioFilter.distrito = distrito;
+  if (tipo_ascensor) edificioFilter.ascensores = { some: { tipo: tipo_ascensor, estado: 1 } };
+  if (Object.keys(edificioFilter).length > 0) {
+    where.edificios = { some: { estado: 1, ...edificioFilter } };
   }
   if (clasificacion && CLASIFICACIONES_CODIGOS.includes(clasificacion)) {
     where.clasificacion = clasificacion;
@@ -199,48 +187,15 @@ async function construirWhereClientes(query) {
 }
 
 /**
- * Devuelve la lista de distritos distintos registrados en clientes activos,
- * ordenados alfabéticamente. Sirve para alimentar el dropdown del filtro y
- * el datalist (autocomplete) del formulario, evitando duplicados por typo
- * (ej. "Surco" vs "Santiago de Surco").
- */
-const listarDistritos = async (_req, res) => {
-  try {
-    const filas = await prisma.tbl_clientes.findMany({
-      where: { estado: 1 },
-      select: { distrito: true },
-      distinct: ['distrito'],
-      orderBy: { distrito: 'asc' }
-    });
-    res.json({ data: filas.map(f => f.distrito).filter(Boolean) });
-  } catch (err) {
-    console.error('[clientes.listarDistritos]', err);
-    res.status(500).json({ error: 'Error al listar distritos' });
-  }
-};
-
-/**
  * Catálogo de clasificaciones de cliente (Grande / Pequeño / Marca JY).
- * Sirve para alimentar el select del form y el filtro del listado, y como
- * fuente de verdad para los colores del badge en el frontend.
  */
 const listarClasificaciones = (_req, res) => {
   res.json({ data: CLASIFICACIONES });
 };
 
 /**
- * Catálogo de tipos de cliente (Edificio / Obra). Alimenta el select del form,
- * el badge del listado y las etiquetas dinámicas de nombre/dirección del
- * frontend, sirviendo como única fuente de verdad de esa terminología.
- */
-const listarTiposCliente = (_req, res) => {
-  res.json({ data: TIPOS_CLIENTE });
-};
-
-/**
  * Tipos de ascensor activos del catálogo (tbl_tipos_ascensor). Alimenta el
- * filtro "Tipo de ascensor" en el listado de clientes y se gestiona desde
- * la pantalla "Tipos de ascensor".
+ * filtro "Tipo de ascensor" en el listado de clientes.
  */
 const listarTiposAscensor = async (_req, res) => {
   try {
@@ -266,7 +221,7 @@ const listar = async (req, res) => {
         where,
         orderBy: { id: 'desc' },
         include: {
-          _count: { select: { ascensores: true, servicios: true, archivos: true } },
+          _count: { select: { edificios: true, servicios: true, archivos: true } },
           archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
         }
       },
@@ -295,8 +250,7 @@ const listar = async (req, res) => {
 
 /**
  * Devuelve el listado de clientes en XLSX o PDF según ?formato=excel|pdf.
- * Reusa exactamente el mismo `where` que listar() para que la exportación
- * corresponda a lo que el usuario tiene filtrado en pantalla.
+ * Reusa exactamente el mismo `where` que listar().
  */
 const exportar = async (req, res) => {
   try {
@@ -310,7 +264,8 @@ const exportar = async (req, res) => {
       where,
       orderBy: { nombre: 'asc' },
       include: {
-        _count: { select: { ascensores: true, servicios: true, archivos: true } },
+        _count: { select: { edificios: true, servicios: true, archivos: true } },
+        edificios: { where: { estado: 1 }, select: { nombre: true, distrito: true, tipo: true, _count: { select: { ascensores: true } } } },
         archivo_contrato: { select: { nombre_original: true } }
       }
     });
@@ -341,7 +296,7 @@ const obtener = async (req, res) => {
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
-        ascensores: { where: { estado: 1 } },
+        edificios: INCLUDE_EDIFICIOS,
         archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
         archivos: INCLUDE_ARCHIVOS,
         precios: INCLUDE_PRECIOS
@@ -361,7 +316,7 @@ const vista360 = async (req, res) => {
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
-        ascensores: { where: { estado: 1 } },
+        edificios: INCLUDE_EDIFICIOS,
         archivos: INCLUDE_ARCHIVOS,
         precios: INCLUDE_PRECIOS,
         archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
@@ -414,7 +369,7 @@ const vista360 = async (req, res) => {
         orderBy: { fecha_entrega: 'desc' },
         include: { archivo: true, servicio: { select: { codigo: true } } }
       }),
-      // Documentos: archivos asociados a guías/evidencias/facturas/entregas/pagos del cliente
+      // Documentos: archivos asociados a guías/evidencias/facturas/entregas del cliente
       idsServicios.length === 0 ? [] : prisma.tbl_archivos.findMany({
         where: {
           estado: 1,
@@ -443,18 +398,8 @@ const crear = async (req, res) => {
     if (!data.nombre) {
       return res.status(400).json({ error: 'La razón social / nombre es obligatorio' });
     }
-    if (!data.nombre_edificio || !String(data.nombre_edificio).trim()) {
-      return res.status(400).json({ error: 'El nombre del edificio / obra es obligatorio' });
-    }
-    if (!data.distrito || !String(data.distrito).trim()) {
-      return res.status(400).json({ error: 'Distrito obligatorio' });
-    }
     if (!data.contrato_inicio || !data.contrato_fin) {
       return res.status(400).json({ error: 'Inicio y fin del contrato de servicio son obligatorios' });
-    }
-    const coords = parseCoordenadas(data.latitud, data.longitud);
-    if (!coords) {
-      return res.status(400).json({ error: 'Ubicación obligatoria: seleccione un punto en el mapa' });
     }
     const contratoInicio = parseFechaContrato(data.contrato_inicio);
     const contratoFin = parseFechaContrato(data.contrato_fin);
@@ -480,18 +425,12 @@ const crear = async (req, res) => {
     const cliente = await prisma.$transaction(async (tx) => {
       const creado = await tx.tbl_clientes.create({
         data: {
-          tipo: normalizarTipo(data.tipo),
           tipo_documento: data.tipo_documento || 'RUC',
           numero_documento: data.numero_documento || null,
           nombre: data.nombre,
-          nombre_edificio: trimOrNull(data.nombre_edificio),
           telefono: trimOrNull(data.telefono),
           whatsapp: trimOrNull(data.whatsapp),
           correo: trimOrNull(data.correo),
-          direccion: data.direccion || null,
-          distrito: String(data.distrito).trim(),
-          latitud: coords.lat,
-          longitud: coords.lng,
           ...contactos,
           observaciones: data.observaciones || null,
           contrato_inicio: contratoInicio,
@@ -569,33 +508,6 @@ const actualizar = async (req, res) => {
       idArchivoContrato = (valor === null || valor === '' || valor === undefined) ? null : Number(valor);
     }
 
-    if (Object.prototype.hasOwnProperty.call(data, 'nombre_edificio')
-      && !String(data.nombre_edificio || '').trim()) {
-      return res.status(400).json({ error: 'El nombre del edificio / obra es obligatorio' });
-    }
-
-    let distrito = previo.distrito;
-    if (Object.prototype.hasOwnProperty.call(data, 'distrito')) {
-      const valor = String(data.distrito || '').trim();
-      if (!valor) return res.status(400).json({ error: 'Distrito obligatorio' });
-      distrito = valor;
-    }
-
-    // Las coordenadas se actualizan si el form envía explícitamente ambas;
-    // si no envía ninguna, conservamos las previas. Enviar el par vacío es
-    // inválido (no permitimos "borrar" la ubicación una vez registrada).
-    let latitud = previo.latitud;
-    let longitud = previo.longitud;
-    if (Object.prototype.hasOwnProperty.call(data, 'latitud')
-     || Object.prototype.hasOwnProperty.call(data, 'longitud')) {
-      const coords = parseCoordenadas(data.latitud, data.longitud);
-      if (!coords) {
-        return res.status(400).json({ error: 'Coordenadas inválidas: seleccione un punto en el mapa' });
-      }
-      latitud = coords.lat;
-      longitud = coords.lng;
-    }
-
     const dataContactos = {};
     for (const k of CAMPOS_CONTACTOS) {
       if (Object.prototype.hasOwnProperty.call(data, k)) dataContactos[k] = trimOrNull(data[k]);
@@ -604,22 +516,12 @@ const actualizar = async (req, res) => {
       await tx.tbl_clientes.update({
         where: { id },
         data: {
-          tipo: Object.prototype.hasOwnProperty.call(data, 'tipo')
-            ? normalizarTipo(data.tipo)
-            : previo.tipo,
           tipo_documento: data.tipo_documento ?? previo.tipo_documento,
           numero_documento: data.numero_documento ?? previo.numero_documento,
           nombre: data.nombre ?? previo.nombre,
-          nombre_edificio: Object.prototype.hasOwnProperty.call(data, 'nombre_edificio')
-            ? trimOrNull(data.nombre_edificio)
-            : previo.nombre_edificio,
           telefono: data.telefono ?? previo.telefono,
           whatsapp: data.whatsapp ?? previo.whatsapp,
           correo: data.correo ?? previo.correo,
-          direccion: data.direccion ?? previo.direccion,
-          distrito,
-          latitud,
-          longitud,
           ...dataContactos,
           observaciones: data.observaciones ?? previo.observaciones,
           contrato_inicio: contratoInicio,
@@ -673,4 +575,4 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, listarDistritos, listarTiposAscensor, listarClasificaciones, listarTiposCliente, exportar, obtener, vista360, crear, actualizar, cambiarEstado };
+module.exports = { listar, listarTiposAscensor, listarClasificaciones, exportar, obtener, vista360, crear, actualizar, cambiarEstado };

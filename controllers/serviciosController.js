@@ -141,8 +141,8 @@ const listar = async (req, res) => {
       {
         where, orderBy: { id: 'desc' },
         include: {
-          cliente: { select: { id: true, nombre: true, nombre_edificio: true, tipo: true, distrito: true, direccion: true, telefono: true, whatsapp: true, latitud: true, longitud: true } },
-          ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
+          cliente: { select: { id: true, nombre: true, telefono: true, whatsapp: true } },
+          ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true, distrito: true, direccion: true } } } } } },
           tipo_servicio: true,
           asignaciones: { where: { estado: 1 }, include: { tecnico: true } }
         }
@@ -163,7 +163,7 @@ const obtener = async (req, res) => {
       where: { id },
       include: {
         cliente: true,
-        ascensores: { where: { estado: 1 }, include: { ascensor: true }, orderBy: { id: 'asc' } },
+        ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } }, orderBy: { id: 'asc' } },
         tipo_servicio: true,
         cotizacion: {
           select: {
@@ -1104,6 +1104,7 @@ const cancelar = async (req, res) => {
 
 const realizados = async (req, res) => {
   try {
+    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1111,6 +1112,23 @@ const realizados = async (req, res) => {
         { id_responsable_documentacion: req.user.id_tecnico || -1 }
       ];
     }
+    if (estado_cobro) where.estado_cobro = estado_cobro;
+    if (estado_facturacion) where.estado_facturacion = estado_facturacion;
+    if (desde || hasta) {
+      where.fecha_realizacion = {};
+      if (desde) where.fecha_realizacion.gte = parseYMDLima(desde);
+      if (hasta) where.fecha_realizacion.lte = parseYMDFinDiaLima(hasta);
+    }
+    // Filtros sobre el servicio relacionado (cliente y búsqueda por código/cliente).
+    const servicioWhere = {};
+    if (id_cliente) servicioWhere.id_cliente = Number(id_cliente);
+    if (q) {
+      servicioWhere.OR = [
+        { codigo: { contains: q, mode: 'insensitive' } },
+        { cliente: { nombre: { contains: q, mode: 'insensitive' } } }
+      ];
+    }
+    if (Object.keys(servicioWhere).length) where.servicio = servicioWhere;
     const result = await paginar(
       prisma.tbl_servicios_realizados,
       {
@@ -1120,7 +1138,7 @@ const realizados = async (req, res) => {
           servicio: {
             include: {
               cliente: true,
-              ascensores: { where: { estado: 1 }, include: { ascensor: true } },
+              ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
               tipo_servicio: true,
               asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
               guias: { where: { estado: 1 }, include: { archivo: true } },

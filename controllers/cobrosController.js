@@ -540,7 +540,7 @@ const registrarPago = async (req, res) => {
         saldo_pendiente: nuevoSaldo,
         cuotas_pagadas: cuotasPagadas,
         cuotas_faltantes: Math.max(0, cobro.numero_cuotas - cuotasPagadas),
-        fecha_ultimo_abono: inicioDelDiaLima(),
+        fecha_ultimo_abono: d.fecha_pago ? parseYMDLima(d.fecha_pago) : inicioDelDiaLima(),
         fecha_proximo_abono: nuevaFechaProximo,
         estado_cobro: nuevoEstado,
         user_id_modification: req.user.id, date_time_modification: new Date()

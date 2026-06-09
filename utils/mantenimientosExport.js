@@ -227,7 +227,9 @@ function _dibujarHojaCliente(ws, empresa, hoy, grupo) {
   ws.getCell('A1').font = { bold: true, size: 14, color: { argb: BRAND.tealDark } };
 
   const docCliente = [grupo.cliente?.tipo_documento, grupo.cliente?.numero_documento].filter(Boolean).join(' ');
-  const subPartes = [docCliente, grupo.cliente?.nombre_edificio, grupo.cliente?.distrito].filter(Boolean);
+  // La ubicación (edificio/distrito) ahora vive a nivel de ascensor; el detalle
+  // por edificio se ve en cada fila de programación.
+  const subPartes = [docCliente].filter(Boolean);
   subPartes.push(`Exportado: ${hoy}`);
   ws.mergeCells('A2', String.fromCharCode(64 + COLUMNAS_PROG.length) + '2');
   ws.getCell('A2').value = subPartes.join('   •   ');

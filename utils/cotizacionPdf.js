@@ -94,16 +94,22 @@ async function generarPdfCotizacion(ctx) {
     doc.fillColor(PALETA.gris).text(`${ctx.cotizacion.cliente.tipo_documento || 'Doc'}: ${ctx.cotizacion.cliente.numero_documento}`, x0, y);
     y += 12;
   }
-  if (ctx.cotizacion.cliente?.direccion) {
-    doc.fillColor(PALETA.gris).text(ctx.cotizacion.cliente.direccion, x0, y);
+  // La ubicación física vive ahora en el edificio de los ascensores cotizados
+  // (todos del mismo edificio).
+  const ascensoresCotPdf = Array.isArray(ctx.cotizacion.ascensores) ? ctx.cotizacion.ascensores : [];
+  const edificioCot = ascensoresCotPdf.map(a => a.ascensor?.edificio).find(Boolean) || null;
+  if (edificioCot?.direccion) {
+    doc.fillColor(PALETA.gris).text(`${edificioCot.direccion}${edificioCot.distrito ? ' · ' + edificioCot.distrito : ''}`, x0, y);
     y += 12;
   }
 
   y += 6;
-  // Ascensor / objeto de la cotización
+  // Ascensor / objeto de la cotización: nombre del edificio u obra, luego tipo
+  // de servicio y la lista de ascensores.
   doc.font('Helvetica-Bold').fontSize(10).fillColor(PALETA.texto).text('OBJETO DE LA COTIZACIÓN', x0, y);
   y += 14;
-  doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto).text(ctx.cotizacion.titulo, x0, y);
+  const edificioUObra = edificioCot?.nombre || ctx.cotizacion.cliente?.nombre || '—';
+  doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto).text(edificioUObra, x0, y);
   y += 12;
   if (ctx.cotizacion.tipo_servicio?.nombre) {
     doc.fillColor(PALETA.gris).text(`Tipo de servicio: ${ctx.cotizacion.tipo_servicio.nombre}`, x0, y);

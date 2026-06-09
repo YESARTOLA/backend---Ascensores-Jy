@@ -83,6 +83,7 @@ model tbl_usuarios {
   tecnico                tbl_tecnicos? @relation(fields: [id_tecnico], references: [id])
   leads_registrados      tbl_leads[]   @relation("LeadRegistrador")
   leads_como_vendedor    tbl_leads[]   @relation("LeadVendedor")
+  leads_cotizaciones_subidas tbl_leads_cotizaciones[] @relation("LeadCotizacionRegistrador")
 }
 
 // ---------------------------------------------------------------------
@@ -91,18 +92,12 @@ model tbl_usuarios {
 
 model tbl_clientes {
   id                            Int                         @id @default(autoincrement())
-  tipo                          String                      @default("Edificio") @db.VarChar(20)
   tipo_documento                String                      @db.VarChar(20)
   numero_documento              String?                     @db.VarChar(30)
   nombre                        String                      @db.VarChar(200)
-  nombre_edificio               String?                     @db.VarChar(200)
   telefono                      String?                     @db.VarChar(30)
   whatsapp                      String?                     @db.VarChar(30)
   correo                        String?                     @db.VarChar(150)
-  direccion                     String?
-  distrito                      String                      @db.VarChar(100)
-  latitud                       Decimal?                    @db.Decimal(10, 7)
-  longitud                      Decimal?                    @db.Decimal(10, 7)
   contacto_principal_nombre     String?                     @db.VarChar(150)
   contacto_principal_correo     String?                     @db.VarChar(150)
   contacto_principal_telefono   String?                     @db.VarChar(30)
@@ -122,7 +117,7 @@ model tbl_clientes {
   date_time_registration        DateTime?                   @default(now()) @db.Timestamptz(6)
   user_id_modification          Int?
   date_time_modification        DateTime?                   @db.Timestamptz(6)
-  ascensores                    tbl_ascensores[]
+  edificios                     tbl_edificios[]
   servicios                     tbl_servicios_proyectos[]
   emergencias                   tbl_emergencias[]
   cobros                        tbl_cobros[]
@@ -136,6 +131,28 @@ model tbl_clientes {
   archivos                      tbl_clientes_archivos[]
   precios                       tbl_clientes_precios[]
   archivo_contrato              tbl_archivos?               @relation("ClienteContrato", fields: [id_archivo_contrato], references: [id])
+}
+
+// Edificio u obra de un cliente: la ubicación física que agrupa ascensores.
+// Un cliente (entidad comercial) puede tener varios edificios; cada ascensor
+// pertenece a un edificio. `tipo` distingue Edificio/Obra (catálogo TIPOS_CLIENTE).
+model tbl_edificios {
+  id                     Int              @id @default(autoincrement())
+  id_cliente             Int
+  tipo                   String           @default("Edificio") @db.VarChar(20)
+  nombre                 String           @db.VarChar(200)
+  direccion              String?
+  distrito               String           @db.VarChar(100)
+  latitud                Decimal?         @db.Decimal(10, 7)
+  longitud               Decimal?         @db.Decimal(10, 7)
+  observaciones          String?
+  estado                 Int              @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?        @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?        @db.Timestamptz(6)
+  cliente                tbl_clientes     @relation(fields: [id_cliente], references: [id])
+  ascensores             tbl_ascensores[]
 }
 
 // Precio configurado por (cliente, tipo de servicio). Se usa como default
@@ -186,7 +203,7 @@ model tbl_clientes_archivos {
 
 model tbl_ascensores {
   id                     Int                         @id @default(autoincrement())
-  id_cliente             Int
+  id_edificio            Int
   codigo                 String                      @unique @db.VarChar(50)
   ubicacion              String?
   tipo                   String?                     @db.VarChar(50)
@@ -204,7 +221,7 @@ model tbl_ascensores {
   date_time_registration DateTime?                   @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?                   @db.Timestamptz(6)
-  cliente                tbl_clientes                @relation(fields: [id_cliente], references: [id])
+  edificio               tbl_edificios               @relation(fields: [id_edificio], references: [id])
   servicios_ascensores   tbl_servicios_ascensores[]
   emergencias            tbl_emergencias[]
   mantenimientos         tbl_mantenimientos_planes[]
@@ -244,14 +261,28 @@ model tbl_tecnicos {
 // ---------------------------------------------------------------------
 
 model tbl_tipos_ascensor {
-  id                     Int       @id @default(autoincrement())
-  nombre                 String    @unique @db.VarChar(50)
+  id                     Int         @id @default(autoincrement())
+  nombre                 String      @unique @db.VarChar(50)
   descripcion            String?
-  estado                 Int       @default(1)
+  estado                 Int         @default(1)
   user_id_registration   Int?
-  date_time_registration DateTime? @default(now()) @db.Timestamptz(6)
+  date_time_registration DateTime?   @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
-  date_time_modification DateTime? @db.Timestamptz(6)
+  date_time_modification DateTime?   @db.Timestamptz(6)
+  leads                  tbl_leads[]
+}
+
+// ---------------------------------------------------------------------
+// UBIGEO PERÚ (catálogo oficial INEI: departamento / provincia / distrito)
+// ---------------------------------------------------------------------
+
+model tbl_ubigeo_peru {
+  id           Int         @id @default(autoincrement())
+  codigo       String      @unique @db.VarChar(6)
+  departamento String      @db.VarChar(80)
+  provincia    String      @db.VarChar(80)
+  distrito     String      @db.VarChar(80)
+  leads        tbl_leads[]
 }
 
 // ---------------------------------------------------------------------
@@ -664,15 +695,23 @@ model tbl_leads {
   id                          Int                 @id @default(autoincrement())
   nombre_contacto             String              @db.VarChar(150)
   telefono                    String              @db.VarChar(30)
+  correo                      String?             @db.VarChar(150)
   canal                       String?             @db.VarChar(50)
+  codigo_ubigeo               String?             @db.VarChar(6)
+  id_tipo_ascensor            Int?
+  razon_social                String?             @db.VarChar(200)
+  ruc                         String?             @db.VarChar(11)
+  nombre_proyecto             String?             @db.VarChar(200)
   id_tipo_servicio_solicitado Int?
   cliente_existente           Int                 @default(0)
   id_cliente                  Int?
   id_vendedor                 Int?
   estado_lead                 String              @default("Consulta") @db.VarChar(30)
+  motivo_descarte             String?
   observaciones               String?
   id_servicio_convertido      Int?
   rol_codigo_registrador      String?             @db.VarChar(50)
+  ediciones                   Int                 @default(0)
   estado                      Int                 @default(1)
   user_id_registration        Int?
   date_time_registration      DateTime?           @default(now()) @db.Timestamptz(6)
@@ -680,9 +719,30 @@ model tbl_leads {
   date_time_modification      DateTime?           @db.Timestamptz(6)
   cliente                     tbl_clientes?       @relation(fields: [id_cliente], references: [id])
   tipo_servicio               tbl_tipos_servicio? @relation(fields: [id_tipo_servicio_solicitado], references: [id])
+  ubigeo                      tbl_ubigeo_peru?    @relation(fields: [codigo_ubigeo], references: [codigo])
+  tipo_ascensor               tbl_tipos_ascensor? @relation(fields: [id_tipo_ascensor], references: [id])
   usuario_registrador         tbl_usuarios?       @relation("LeadRegistrador", fields: [user_id_registration], references: [id])
   vendedor                    tbl_usuarios?       @relation("LeadVendedor", fields: [id_vendedor], references: [id])
   cotizaciones                tbl_cotizaciones[]
+  cotizaciones_adjuntas       tbl_leads_cotizaciones[]
+}
+
+// PDFs de cotización adjuntos al lead, versionados de forma incremental.
+// Es independiente de tbl_cotizaciones (el módulo formal exige cliente);
+// aquí se registra el documento que respalda el estado "Cotizado" del lead.
+model tbl_leads_cotizaciones {
+  id                     Int           @id @default(autoincrement())
+  id_lead                Int
+  version                Int
+  id_archivo             Int
+  estado                 Int           @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?     @default(now()) @db.Timestamptz(6)
+  lead                   tbl_leads     @relation(fields: [id_lead], references: [id])
+  archivo                tbl_archivos  @relation(fields: [id_archivo], references: [id])
+  usuario_registrador    tbl_usuarios? @relation("LeadCotizacionRegistrador", fields: [user_id_registration], references: [id])
+
+  @@unique([id_lead, version])
 }
 
 // ---------------------------------------------------------------------
@@ -858,6 +918,7 @@ model tbl_archivos {
   clientes_archivos       tbl_clientes_archivos[]
   servicios_observaciones tbl_servicios_observaciones[]
   finalizacion_informes   tbl_servicios_finalizacion_checklist[]
+  leads_cotizaciones      tbl_leads_cotizaciones[]
 }
 
 // ---------------------------------------------------------------------
@@ -992,7 +1053,6 @@ model tbl_cotizaciones {
   id_cliente             Int
   id_lead                Int?
   id_tipo_servicio       Int
-  titulo                 String                       @db.VarChar(200)
   descripcion            String?
   estado_global          String                       @default("Cotizado") @db.VarChar(30)
   version_activa         Int                          @default(1)
