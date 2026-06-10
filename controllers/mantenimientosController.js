@@ -5,8 +5,11 @@ const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeF
 const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, COLORES } = require('../utils/recordatoriosAuto');
 const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
-const { CATEGORIA_PREVENTIVO, esCategoriaPreventiva } = require('../utils/categoriasMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
+
+// Un plan admite cupo de mantenimientos gratuitos solo si su subtipo pertenece
+// al módulo Mantenimientos (preventivo). SSoT: se deriva de modulo_asociado.
+const esModuloMantenimiento = (tipoServicio) => tipoServicio?.modulo_asociado === 'mantenimiento';
 const { idTecnicoFiltro, whereServicioGeneradoAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 
 const COLOR_MANTENIMIENTO = COLORES.mantenimiento;
@@ -67,7 +70,7 @@ const listar = async (req, res) => {
         mantenimientos_gratuitos_ejecutados: ejecutadosGratuitos,
         mantenimientos_ejecutados_total: ejecutadosTodos,
         tipo_servicio: plan.tipo_servicio
-          ? { ...plan.tipo_servicio, es_preventivo: esCategoriaPreventiva(plan.tipo_servicio.categoria) }
+          ? { ...plan.tipo_servicio, es_preventivo: esModuloMantenimiento(plan.tipo_servicio) }
           : null
       };
     });
@@ -113,12 +116,12 @@ async function _crearEventosFuturos(tx, plan, fechas, tituloBase) {
  * Para tipo_plan = eventual fuerza frecuencia/cantidad a null.
  * Para tipo_plan = continuo exige frecuencia válida y cantidad >= 1.
  *
- * `categoriaTipoServicio` se usa para validar el cupo gratuito (solo permitido
- * en planes cuyo tipo de servicio es de categoría preventiva).
+ * `tipoServicio` se usa para validar el cupo gratuito (solo permitido en planes
+ * cuyo subtipo pertenece al módulo Mantenimientos).
  */
-function _normalizarPlanInput(d, categoriaTipoServicio) {
+function _normalizarPlanInput(d, tipoServicio) {
   const tipo_plan = d.tipo_plan === 'eventual' ? 'eventual' : 'continuo';
-  const esPreventivo = esCategoriaPreventiva(categoriaTipoServicio);
+  const esPreventivo = esModuloMantenimiento(tipoServicio);
 
   const gratuitosRaw = d.cantidad_mantenimientos_gratuitos;
   let cantidad_mantenimientos_gratuitos = 0;
@@ -130,7 +133,7 @@ function _normalizarPlanInput(d, categoriaTipoServicio) {
     cantidad_mantenimientos_gratuitos = g;
   }
   if (cantidad_mantenimientos_gratuitos > 0 && !esPreventivo) {
-    throw new Error(`Solo planes de categoría "${CATEGORIA_PREVENTIVO}" pueden tener mantenimientos gratuitos`);
+    throw new Error('Solo los planes del módulo Mantenimientos pueden tener mantenimientos gratuitos');
   }
 
   if (tipo_plan === 'eventual') {
@@ -205,7 +208,7 @@ const crear = async (req, res) => {
 
     let normalizado;
     try {
-      normalizado = _normalizarPlanInput(d, tipoServicio?.categoria);
+      normalizado = _normalizarPlanInput(d, tipoServicio);
     } catch (e) {
       return res.status(400).json({ error: e.message });
     }
@@ -329,7 +332,7 @@ const actualizar = async (req, res) => {
     };
     let normalizado;
     try {
-      normalizado = _normalizarPlanInput(mergeInput, tipoServicioFinal?.categoria);
+      normalizado = _normalizarPlanInput(mergeInput, tipoServicioFinal);
     } catch (e) {
       return res.status(400).json({ error: e.message });
     }
@@ -482,7 +485,7 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
   }
 
   const cupoGratuito = Number(plan.cantidad_mantenimientos_gratuitos || 0);
-  const esPreventivo = esCategoriaPreventiva(plan.tipo_servicio?.categoria);
+  const esPreventivo = esModuloMantenimiento(plan.tipo_servicio);
 
   let esGratuito = false;
   if (esPreventivo && cupoGratuito > 0) {
@@ -874,7 +877,7 @@ async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
       mantenimientos_ejecutados_total: ejecutados,
       mantenimientos_gratuitos_ejecutados: gratuitosEjecutados,
       tipo_servicio: p.tipo_servicio
-        ? { ...p.tipo_servicio, es_preventivo: esCategoriaPreventiva(p.tipo_servicio.categoria) }
+        ? { ...p.tipo_servicio, es_preventivo: esModuloMantenimiento(p.tipo_servicio) }
         : null
     };
   });

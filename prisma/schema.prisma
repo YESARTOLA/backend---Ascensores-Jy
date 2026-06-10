@@ -289,30 +289,47 @@ model tbl_ubigeo_peru {
 // TIPOS DE SERVICIO
 // ---------------------------------------------------------------------
 
+// Catálogo de tipos de servicio con jerarquía padre → subtipo.
+//
+//   PADRE  : id_padre = null. Define la categoría funcional ('SERVICIOS' |
+//            'PROYECTOS') que clasifica a todos sus subtipos. modulo_asociado = null.
+//   SUBTIPO: id_padre apunta a un padre. Si el padre es 'SERVICIOS',
+//            modulo_asociado es obligatorio (emergencia | correctivo |
+//            mantenimiento | atencion_rapida) y determina el módulo operativo.
+//            Si el padre es 'PROYECTOS', modulo_asociado = null (solo descriptivo)
+//            y cualquier registro de ese subtipo es un Proyecto.
+//
+// La clasificación (Proyecto vs Servicio y a qué módulo pertenece) se deriva
+// SIEMPRE del subtipo + su padre mediante utils/clasificacionServicio.js (SSoT).
+// Cotizaciones y servicios referencian el SUBTIPO en id_tipo_servicio / id_subtipo_servicio.
 model tbl_tipos_servicio {
   id                     Int                           @id @default(autoincrement())
   nombre                 String                        @db.VarChar(150)
-  categoria              String                        @db.VarChar(50)
-  // Módulo operativo al que pertenece este tipo de servicio. Valores permitidos:
-  //   'emergencia' | 'correctivo' | 'mantenimiento' | 'atencion_rapida' | null
-  // null = tipo "estándar" (Reparación, Revisión, Inspección, Instalación, Proyecto, etc.):
-  // el servicio solo vive en tbl_servicios_proyectos.
-  // Si está set, al crear el servicio (manual o desde cotización aprobada) se
-  // genera además la fila correspondiente en tbl_emergencias / tbl_correctivos /
-  // tbl_mantenimientos_planes / tbl_atenciones_rapidas.
+  // Solo en filas PADRE: 'SERVICIOS' | 'PROYECTOS'. En subtipos = null (se hereda del padre).
+  categoria_funcional    String?                       @db.VarChar(20)
+  // null en filas PADRE. En subtipos de padre 'SERVICIOS': obligatorio, uno de
+  //   'emergencia' | 'correctivo' | 'mantenimiento' | 'atencion_rapida'.
   modulo_asociado        String?                       @db.VarChar(30)
+  // null = fila PADRE. Set = subtipo perteneciente a ese padre.
+  id_padre               Int?
   descripcion            String?
   estado                 Int                           @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?                     @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?                     @db.Timestamptz(6)
+  padre                  tbl_tipos_servicio?           @relation("TipoServicioJerarquia", fields: [id_padre], references: [id])
+  subtipos               tbl_tipos_servicio[]          @relation("TipoServicioJerarquia")
   servicios              tbl_servicios_proyectos[]
   tecnicos               tbl_tipos_servicio_tecnicos[]
   mantenimientos         tbl_mantenimientos_planes[]
   leads                  tbl_leads[]
-  cotizaciones           tbl_cotizaciones[]
+  cotizaciones           tbl_cotizaciones[]            @relation("CotizacionPadre")
+  cotizaciones_subtipo   tbl_cotizaciones[]            @relation("CotizacionSubtipo")
   precios_clientes       tbl_clientes_precios[]
+
+  @@index([id_padre])
+  @@index([categoria_funcional])
 }
 
 model tbl_tipos_servicio_tecnicos {
@@ -345,7 +362,7 @@ model tbl_servicios_proyectos {
   origen                    String                            @default("directo") @db.VarChar(50)
   titulo                    String                            @db.VarChar(200)
   descripcion               String?
-  fecha_programada          DateTime                          @db.Date
+  fecha_programada          DateTime?                         @db.Date
   hora_programada           String?                           @db.VarChar(10)
   fecha_estimada_entrega    DateTime?                         @db.Date
   prioridad                 String                            @default("media") @db.VarChar(20)
@@ -1052,7 +1069,11 @@ model tbl_cotizaciones {
   codigo                 String                       @unique @db.VarChar(50)
   id_cliente             Int
   id_lead                Int?
+  // Tipo de servicio PADRE (categoría funcional SERVICIOS/PROYECTOS).
   id_tipo_servicio       Int
+  // Subtipo seleccionado dentro del padre. Determina el módulo operativo destino
+  // (si el padre es SERVICIOS) o queda descriptivo (si el padre es PROYECTOS).
+  id_subtipo_servicio    Int
   descripcion            String?
   estado_global          String                       @default("Cotizado") @db.VarChar(30)
   version_activa         Int                          @default(1)
@@ -1063,7 +1084,8 @@ model tbl_cotizaciones {
   date_time_modification DateTime?                    @db.Timestamptz(6)
   cliente                tbl_clientes                 @relation(fields: [id_cliente], references: [id])
   lead                   tbl_leads?                   @relation(fields: [id_lead], references: [id])
-  tipo_servicio          tbl_tipos_servicio           @relation(fields: [id_tipo_servicio], references: [id])
+  tipo_servicio          tbl_tipos_servicio           @relation("CotizacionPadre", fields: [id_tipo_servicio], references: [id])
+  subtipo_servicio       tbl_tipos_servicio           @relation("CotizacionSubtipo", fields: [id_subtipo_servicio], references: [id])
   ascensores             tbl_cotizaciones_ascensores[]
   servicios              tbl_servicios_proyectos[]
   versiones              tbl_cotizaciones_versiones[]
@@ -1115,6 +1137,8 @@ model tbl_cotizaciones_versiones {
   tiene_cuotas           Boolean                  @default(false)
   plan_cuotas            Json?
   saldo_variable         Boolean                  @default(false)
+  sin_igv                Boolean                  @default(false)
+  cuentas_pdf            Json?
   estado                 Int                      @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?                @default(now()) @db.Timestamptz(6)

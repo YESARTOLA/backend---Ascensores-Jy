@@ -1,14 +1,14 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, combinarFechaHoraLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { generarCodigoCotizacion } = require('../utils/codigoCotizacion');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { calcularTotalesVersion, normalizarPlanCuotas } = require('../utils/cotizacionCalculos');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
-const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
+const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
@@ -182,6 +182,8 @@ const listar = async (req, res) => {
       // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
       // los ascensores existentes vinculados a la cotización
       { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+      // Nombre del edificio / obra donde están los ascensores de la cotización
+      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
       // Código de servicio generado por la cotización (cuando ya fue aprobada)
       { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
     ];
@@ -204,9 +206,10 @@ const listar = async (req, res) => {
           ascensores: {
             where: { estado: 1 },
             orderBy: { orden: 'asc' },
-            include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } }
+            include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
           },
-          tipo_servicio: { select: { id: true, nombre: true } },
+          tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+          subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
           versiones: {
             where: { estado: 1 },
             orderBy: { numero_version: 'desc' },
@@ -243,7 +246,8 @@ const obtener = async (req, res) => {
         cliente: true,
         ascensores: INCLUDE_ASCENSORES,
         lead: true,
-        tipo_servicio: true,
+        tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+        subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
         versiones: {
           where: { estado: 1 },
           orderBy: { numero_version: 'asc' },
@@ -273,14 +277,42 @@ const obtener = async (req, res) => {
   }
 };
 
+// Valida la selección de cuentas bancarias para el PDF: devuelve el array de
+// ids ACTIVOS recibido (preservando el orden, sin duplicados). Si el payload no
+// es un array, devuelve null = "sin selección explícita" (el PDF mostrará todas
+// las cuentas activas, como antes de esta feature).
+async function normalizarCuentasPdf(payload) {
+  if (!Array.isArray(payload)) return null;
+  const ids = [...new Set(payload.map(Number).filter(n => Number.isInteger(n) && n > 0))];
+  if (ids.length === 0) return [];
+  const activas = await prisma.tbl_cuentas_bancarias.findMany({
+    where: { id: { in: ids }, estado: 1 }, select: { id: true }
+  });
+  const validos = new Set(activas.map(c => c.id));
+  return ids.filter(id => validos.has(id));
+}
+
 const crear = async (req, res) => {
   try {
     if (!puedeEditar(req)) return res.status(403).json({ error: 'No autorizado' });
     const d = req.body || {};
 
     if (!d.id_cliente) return res.status(400).json({ error: 'Cliente obligatorio' });
-    if (!d.id_tipo_servicio) return res.status(400).json({ error: 'Tipo de servicio obligatorio' });
+    if (!d.id_subtipo_servicio) return res.status(400).json({ error: 'Subtipo de servicio obligatorio' });
     if (!d.fecha_validez) return res.status(400).json({ error: 'Fecha de validez obligatoria' });
+
+    // Resolver y validar la coherencia padre ↔ subtipo. El subtipo determina la
+    // clasificación; el padre se deriva de él (o se valida si vino en el body).
+    const subtipoCot = await prisma.tbl_tipos_servicio.findUnique({
+      where: { id: Number(d.id_subtipo_servicio) }, include: { padre: true }
+    });
+    if (!subtipoCot || subtipoCot.estado !== 1 || subtipoCot.id_padre == null) {
+      return res.status(400).json({ error: 'Subtipo de servicio inválido' });
+    }
+    if (d.id_tipo_servicio && Number(d.id_tipo_servicio) !== subtipoCot.id_padre) {
+      return res.status(400).json({ error: 'El subtipo no pertenece al tipo de servicio padre seleccionado' });
+    }
+    const idPadreCot = subtipoCot.id_padre;
 
     let ascensoresLimpios;
     try {
@@ -301,7 +333,9 @@ const crear = async (req, res) => {
     }
 
     const igvTasa = await configuracion.obtener('IGV_RATE');
-    const totales = calcularTotalesVersion(items, igvTasa);
+    const sinIgv = Boolean(d.sin_igv);
+    const totales = calcularTotalesVersion(items, igvTasa, sinIgv);
+    const cuentasPdf = await normalizarCuentasPdf(d.cuentas_pdf);
 
     const tieneCuotas = Boolean(d.tiene_cuotas);
     let planCuotas = null;
@@ -336,7 +370,8 @@ const crear = async (req, res) => {
           codigo,
           id_cliente: Number(d.id_cliente),
           id_lead: d.id_lead ? Number(d.id_lead) : null,
-          id_tipo_servicio: Number(d.id_tipo_servicio),
+          id_tipo_servicio: idPadreCot,
+          id_subtipo_servicio: subtipoCot.id,
           descripcion: d.descripcion || null,
           estado_global: ESTADO_GLOBAL.COTIZADO,
           version_activa: 1,
@@ -369,6 +404,8 @@ const crear = async (req, res) => {
           tiene_cuotas: tieneCuotas,
           plan_cuotas: planCuotas,
           saldo_variable: saldoVariable,
+          sin_igv: sinIgv,
+          cuentas_pdf: cuentasPdf,
           user_id_registration: req.user.id
         }
       });
@@ -449,12 +486,30 @@ const actualizarCabecera = async (req, res) => {
       }
     }
 
+    // Si se cambia el subtipo, revalidar coherencia padre ↔ subtipo y derivar el padre.
+    let idPadreUpd = prev.cotizacion.id_tipo_servicio;
+    let idSubtipoUpd = prev.cotizacion.id_subtipo_servicio;
+    if (d.id_subtipo_servicio) {
+      const subtipoUpd = await prisma.tbl_tipos_servicio.findUnique({
+        where: { id: Number(d.id_subtipo_servicio) }, include: { padre: true }
+      });
+      if (!subtipoUpd || subtipoUpd.estado !== 1 || subtipoUpd.id_padre == null) {
+        return res.status(400).json({ error: 'Subtipo de servicio inválido' });
+      }
+      if (d.id_tipo_servicio && Number(d.id_tipo_servicio) !== subtipoUpd.id_padre) {
+        return res.status(400).json({ error: 'El subtipo no pertenece al tipo de servicio padre seleccionado' });
+      }
+      idPadreUpd = subtipoUpd.id_padre;
+      idSubtipoUpd = subtipoUpd.id;
+    }
+
     const cot = await prisma.$transaction(async (tx) => {
       const actualizado = await tx.tbl_cotizaciones.update({
         where: { id },
         data: {
           id_cliente: d.id_cliente ? Number(d.id_cliente) : prev.cotizacion.id_cliente,
-          id_tipo_servicio: d.id_tipo_servicio ? Number(d.id_tipo_servicio) : prev.cotizacion.id_tipo_servicio,
+          id_tipo_servicio: idPadreUpd,
+          id_subtipo_servicio: idSubtipoUpd,
           descripcion: d.descripcion ?? prev.cotizacion.descripcion,
           user_id_modification: req.user.id,
           date_time_modification: new Date()
@@ -507,10 +562,25 @@ const actualizarVersion = async (req, res) => {
     const igvTasa = await configuracion.obtener('IGV_RATE');
     const { calcularImporteLinea } = require('../utils/cotizacionCalculos');
 
-    // Total efectivo después de la actualización (puede venir de items nuevos o quedarse igual)
-    const totalNuevo = items
-      ? calcularTotalesVersion(items, igvTasa).monto_total
-      : Number(version.monto_total);
+    const nuevoSinIgv = Object.prototype.hasOwnProperty.call(d, 'sin_igv')
+      ? Boolean(d.sin_igv) : version.sin_igv;
+    // Los totales se recalculan si cambian los items o si cambia la condición de
+    // IGV (afecto/sin IGV). Si solo cambia el IGV, se recomputan sobre los items
+    // vigentes en la BD.
+    const recalcTotales = !!items || (nuevoSinIgv !== version.sin_igv);
+    let totalesNuevos = null;
+    if (recalcTotales) {
+      const itemsParaCalc = items || (await prisma.tbl_cotizaciones_items.findMany({
+        where: { id_version: version.id, estado: 1 }
+      }));
+      totalesNuevos = calcularTotalesVersion(itemsParaCalc, igvTasa, nuevoSinIgv);
+    }
+    // Total efectivo después de la actualización (recalculado o el vigente).
+    const totalNuevo = totalesNuevos ? totalesNuevos.monto_total : Number(version.monto_total);
+
+    let nuevasCuentasPdf;
+    const enviaCuentas = Object.prototype.hasOwnProperty.call(d, 'cuentas_pdf');
+    if (enviaCuentas) nuevasCuentasPdf = await normalizarCuentasPdf(d.cuentas_pdf);
 
     // Manejo del plan de cuotas: opcional. Solo se toca si el cliente envía el campo.
     let nuevoTieneCuotas = version.tiene_cuotas;
@@ -552,6 +622,8 @@ const actualizarVersion = async (req, res) => {
         tiene_cuotas: nuevoTieneCuotas,
         plan_cuotas: nuevoPlanCuotas,
         saldo_variable: nuevoSaldoVariable,
+        sin_igv: nuevoSinIgv,
+        ...(enviaCuentas ? { cuentas_pdf: nuevasCuentasPdf } : {}),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       };
@@ -574,11 +646,13 @@ const actualizarVersion = async (req, res) => {
             }
           });
         }
-        const totales = calcularTotalesVersion(items, igvTasa);
-        dataUpdate.subtotal = totales.subtotal;
-        dataUpdate.igv = totales.igv;
-        dataUpdate.igv_tasa = totales.igv_tasa;
-        dataUpdate.monto_total = totales.monto_total;
+      }
+      // Los totales se aplican si se recalcularon (por items o por cambio de IGV).
+      if (totalesNuevos) {
+        dataUpdate.subtotal = totalesNuevos.subtotal;
+        dataUpdate.igv = totalesNuevos.igv;
+        dataUpdate.igv_tasa = totalesNuevos.igv_tasa;
+        dataUpdate.monto_total = totalesNuevos.monto_total;
       }
 
       return tx.tbl_cotizaciones_versiones.update({
@@ -881,7 +955,8 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
         monto: Number(c.monto)
       }));
     } else if (restante > 0.01) {
-      // Sin plan declarado, una cuota única con el restante a la fecha programada
+      // Sin plan declarado, una cuota única con el restante con vencimiento a la
+      // fecha de re-aprobación (hoy); contabilidad puede reprogramarla luego.
       cuotasNuevas = [{ fecha_vencimiento: fechaProgramada, monto: restante }];
     }
 
@@ -1016,11 +1091,12 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
  * reapertura), delega en `_reAprobarTx` — no crea servicio/cobro nuevos.
  */
 // Título del servicio creado al aprobar una cotización. La cotización ya no
-// tiene campo `titulo`: se deriva del tipo de servicio + el nombre del edificio
+// tiene campo `titulo`: se deriva del SUBTIPO de servicio + el nombre del edificio
 // u obra (tomado de los ascensores de la cotización). El servicio exige título
 // (NOT NULL); como último recurso usa el código.
 function tituloServicioDesdeCotizacion(cot, edificioNombre, codigoServicio) {
-  return [cot.tipo_servicio?.nombre, edificioNombre || ''].filter(Boolean).join(' – ') || codigoServicio;
+  const nombreTipo = cot.subtipo_servicio?.nombre || cot.tipo_servicio?.nombre;
+  return [nombreTipo, edificioNombre || ''].filter(Boolean).join(' – ') || codigoServicio;
 }
 
 const aprobar = async (req, res) => {
@@ -1035,6 +1111,7 @@ const aprobar = async (req, res) => {
       include: {
         cliente: true,
         tipo_servicio: true,
+        subtipo_servicio: { include: { padre: true } },
         ascensores: INCLUDE_ASCENSORES
       }
     });
@@ -1042,6 +1119,9 @@ const aprobar = async (req, res) => {
     if (cot.estado_global === ESTADO_GLOBAL.TERMINADO) {
       return res.status(400).json({ error: 'La cotización ya está Terminada' });
     }
+    // Clasificación (SSoT): el subtipo + su padre determinan si la conversión
+    // produce un Proyecto o un Servicio y, en este último caso, el módulo destino.
+    const clasificacionCot = clasificarTipoServicio(cot.subtipo_servicio);
 
     const version = await prisma.tbl_cotizaciones_versiones.findUnique({
       where: { id_cotizacion_numero_version: { id_cotizacion: id, numero_version: numero } }
@@ -1055,8 +1135,12 @@ const aprobar = async (req, res) => {
       return res.status(400).json({ error: 'Cotización sin ascensores asociados' });
     }
 
-    const fechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : new Date();
-    const horaProgramada = d.hora_programada || '09:00';
+    // La fecha de programación ya NO se registra al aprobar: el servicio nace
+    // sin fecha/hora y el área correspondiente la define después (detalle del
+    // servicio → "Programar fecha"). `fechaAprobacion` (hoy) se usa solo como
+    // vencimiento de la cuota inicial del cobro y como fecha de inicio por
+    // defecto del plan de mantenimiento.
+    const fechaAprobacion = new Date();
 
     // ─── Detección de re-aprobación ─────────────────────────────────────────
     // Si ya existe un servicio activo vinculado a esta cotización, estamos
@@ -1074,7 +1158,7 @@ const aprobar = async (req, res) => {
           cot,
           version,
           servicioExistente,
-          fechaProgramada,
+          fechaProgramada: fechaAprobacion,
           userId: req.user.id,
           idArchivoRespaldo: d.id_archivo_respaldo ? Number(d.id_archivo_respaldo) : null
         });
@@ -1165,16 +1249,19 @@ const aprobar = async (req, res) => {
       const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo: codigoSrv,
-          tipo_registro: d.tipo_registro || 'servicio',
-          id_tipo_servicio: cot.id_tipo_servicio,
+          // tipo_registro derivado del subtipo (SSoT): Proyecto si el padre es
+          // PROYECTOS, Servicio si es SERVICIOS. El servicio referencia el SUBTIPO.
+          tipo_registro: clasificacionCot.tipo_registro,
+          id_tipo_servicio: cot.id_subtipo_servicio,
           id_cliente: cot.id_cliente,
           id_cotizacion: cot.id,
           origen: 'cotizacion',
           titulo: tituloServicioDesdeCotizacion(cot, edificioServicio?.nombre, codigoSrv),
           descripcion: cot.descripcion,
-          fecha_programada: fechaProgramada,
-          hora_programada: horaProgramada,
-          prioridad: d.prioridad || 'media',
+          // Nace SIN fecha/hora de programación: las registra luego el área desde
+          // el detalle del servicio. `prioridad` usa el default del esquema.
+          fecha_programada: null,
+          hora_programada: null,
           estado_servicio: 'Pendiente',
           precio_interno: version.monto_total,
           moneda: version.moneda,
@@ -1196,22 +1283,10 @@ const aprobar = async (req, res) => {
         }
       });
 
-      // 2.b Evento en el calendario operativo. Sin esta fila el servicio NO
-      // aparece en /calendario (incluyendo la vista del técnico filtrada por
-      // asignación), aunque exista la fila en tbl_servicios_proyectos. Espeja
-      // lo que hace serviciosController.crear para el alta directa.
-      const fechaInicioEvento = combinarFechaHoraLima(d.fecha_programada, horaProgramada);
-      const tipoEventoCotizacion = servicio.tipo_registro === 'proyecto' ? 'proyecto' : 'servicio';
-      await tx.tbl_calendario_eventos.create({
-        data: {
-          id_servicio: servicio.id,
-          titulo: `${servicio.codigo} – ${servicio.titulo}`,
-          tipo_evento: tipoEventoCotizacion,
-          fecha_inicio: fechaInicioEvento,
-          estado_evento: 'programado',
-          color: colorPorTipo(tipoEventoCotizacion)
-        }
-      });
+      // 2.b NO se crea evento de calendario aquí: el servicio nace sin fecha de
+      // programación. El evento se crea cuando el área registra la fecha desde el
+      // detalle del servicio (serviciosController.actualizar), evitando que
+      // aparezcan servicios "sin fecha" en /calendario.
 
       // 3. Cobro + plan de cuotas (si la versión lo declara). El cobro nace
       // aquí (no al finalizar el servicio) para que aparezca en gestión de
@@ -1221,7 +1296,7 @@ const aprobar = async (req, res) => {
         idCliente: cot.id_cliente,
         monto: version.monto_total,
         moneda: version.moneda,
-        fechaCuotaUnica: fechaProgramada,
+        fechaCuotaUnica: fechaAprobacion,
         planCuotas: Array.isArray(version.plan_cuotas) ? version.plan_cuotas : null,
         saldoVariable: Boolean(version.saldo_variable),
         idUsuario: req.user.id
@@ -1257,11 +1332,14 @@ const aprobar = async (req, res) => {
       //   - atencion_rapida: no aplica al aprobar cotización (es captura inicial).
       await replicarEnModulo(tx, {
         servicio,
-        tipoServicio: cot.tipo_servicio,
+        tipoServicio: cot.subtipo_servicio,
         idsAscensores: idsResueltos,
         idCliente: cot.id_cliente,
-        horaProgramada,
-        fechaProgramada,
+        // Sin hora de programación al aprobar; el inicio de plan de mantenimiento
+        // cae por defecto a la fecha de aprobación (hoy) salvo que el form indique
+        // una "Fecha de inicio del plan".
+        horaProgramada: null,
+        fechaProgramada: fechaAprobacion,
         usuarioId: req.user.id,
         datosModulo: d,
         origenEtiqueta: `aprobación de ${cot.codigo} v${version.numero_version}`
@@ -1390,7 +1468,7 @@ const generarPdf = async (req, res) => {
 
     const cot = await prisma.tbl_cotizaciones.findUnique({
       where: { id },
-      include: { cliente: true, tipo_servicio: true, ascensores: INCLUDE_ASCENSORES }
+      include: { cliente: true, tipo_servicio: true, subtipo_servicio: true, ascensores: INCLUDE_ASCENSORES }
     });
     if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
 

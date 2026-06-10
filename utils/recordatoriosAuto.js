@@ -90,6 +90,12 @@ async function sincronizarRecordatorioServicio(servicioId) {
   if (ESTADOS_TERMINALES_SERVICIO.includes(s.estado_servicio)) {
     return descartarAuto({ tipo: 'servicio', id_servicio: servicioId });
   }
+  // Un servicio aprobado por cotización nace sin fecha de programación: el área
+  // la registra después. Sin fecha no hay recordatorio que generar todavía; se
+  // creará/sincronizará cuando se programe (actualizar dispara este sync).
+  if (!s.fecha_programada) {
+    return descartarAuto({ tipo: 'servicio', id_servicio: servicioId });
+  }
   const fechaRecordatorio = combinarFechaHoraLima(s.fecha_programada, s.hora_programada);
   const titulo = `${s.codigo} · ${s.tipo_servicio?.nombre || 'Servicio'}`;
   const codigosAscensores = (s.ascensores || []).map(a => a.ascensor?.codigo).filter(Boolean).join(', ');

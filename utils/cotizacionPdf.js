@@ -20,8 +20,20 @@ const PALETA = {
   fondoCabecera: '#fff7ed'
 };
 
-async function obtenerCuentasBancariasActivas() {
+// Cuentas bancarias a imprimir. `seleccion` es el array de ids elegidos en la
+// versión (`cuentas_pdf`): si es un array se imprimen solo esas (activas,
+// respetando el orden elegido); si es null/undefined (versiones previas a la
+// feature) se imprimen todas las activas.
+async function obtenerCuentasBancariasPdf(seleccion) {
   try {
+    if (Array.isArray(seleccion)) {
+      if (seleccion.length === 0) return [];
+      const activas = await prisma.tbl_cuentas_bancarias.findMany({
+        where: { id: { in: seleccion.map(Number) }, estado: 1 }
+      });
+      const porId = new Map(activas.map(c => [c.id, c]));
+      return seleccion.map(id => porId.get(Number(id))).filter(Boolean);
+    }
     return await prisma.tbl_cuentas_bancarias.findMany({
       where: { estado: 1 },
       orderBy: [{ orden: 'asc' }, { id: 'asc' }]
@@ -57,7 +69,7 @@ async function generarPdfCotizacion(ctx) {
     'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
   ]);
   const terminos = ctx.version.terminos || (await configuracion.obtener('COTIZACION_TERMINOS'));
-  const cuentasBancarias = await obtenerCuentasBancariasActivas();
+  const cuentasBancarias = await obtenerCuentasBancariasPdf(ctx.version.cuentas_pdf);
 
   const doc = new PDFDocument({ size: 'A4', margin: 40 });
   const chunks = [];
@@ -111,8 +123,9 @@ async function generarPdfCotizacion(ctx) {
   const edificioUObra = edificioCot?.nombre || ctx.cotizacion.cliente?.nombre || '—';
   doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto).text(edificioUObra, x0, y);
   y += 12;
-  if (ctx.cotizacion.tipo_servicio?.nombre) {
-    doc.fillColor(PALETA.gris).text(`Tipo de servicio: ${ctx.cotizacion.tipo_servicio.nombre}`, x0, y);
+  const nombreTipoPdf = ctx.cotizacion.subtipo_servicio?.nombre || ctx.cotizacion.tipo_servicio?.nombre;
+  if (nombreTipoPdf) {
+    doc.fillColor(PALETA.gris).text(`Tipo de servicio: ${nombreTipoPdf}`, x0, y);
     y += 12;
   }
   const ascensoresCot = Array.isArray(ctx.cotizacion.ascensores) ? ctx.cotizacion.ascensores : [];
@@ -203,13 +216,19 @@ async function generarPdfCotizacion(ctx) {
   y += 10;
   const labelX = x0 + ancho - 200;
   const valueX = x0 + ancho - 90;
-  const tasaPct = (Number(ctx.version.igv_tasa || 0) * 100).toFixed(0);
   doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto);
   doc.text('Subtotal', labelX, y, { width: 100, align: 'right' });
   doc.text(formatearMonto(ctx.version.subtotal, ctx.version.moneda), valueX, y, { width: 80, align: 'right' });
   y += 14;
-  doc.text(`IGV (${tasaPct}%)`, labelX, y, { width: 100, align: 'right' });
-  doc.text(formatearMonto(ctx.version.igv, ctx.version.moneda), valueX, y, { width: 80, align: 'right' });
+  if (ctx.version.sin_igv) {
+    // Cotización sin IGV: no se imprime la línea de IGV; el total es el subtotal.
+    doc.fillColor(PALETA.gris).text('Precios sin IGV', labelX, y, { width: 190, align: 'right' });
+    doc.fillColor(PALETA.texto);
+  } else {
+    const tasaPct = (Number(ctx.version.igv_tasa || 0) * 100).toFixed(0);
+    doc.text(`IGV (${tasaPct}%)`, labelX, y, { width: 100, align: 'right' });
+    doc.text(formatearMonto(ctx.version.igv, ctx.version.moneda), valueX, y, { width: 80, align: 'right' });
+  }
   y += 18;
   doc.font('Helvetica-Bold').fontSize(11).fillColor(PALETA.acento);
   doc.text('TOTAL', labelX, y, { width: 100, align: 'right' });

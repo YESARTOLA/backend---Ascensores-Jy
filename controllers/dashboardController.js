@@ -13,29 +13,39 @@ const resumen = async (req, res) => {
     const inicioMes = inicioMesLima();
     const finMes = finMesLima();
 
+    // Las métricas operativas cuentan solo SERVICIOS (tipo_registro='servicio'):
+    // los Proyectos se cuentan aparte para no inflar los KPIs de servicios.
+    const SOLO_SERVICIO = { tipo_registro: 'servicio' };
+    const SOLO_PROYECTO = { tipo_registro: 'proyecto' };
+    const ESTADOS_FINALIZADO = { estado_servicio: { startsWith: 'Finalizado' }, estado: 1 };
+
     const [
       pendientes, asignados, enCurso, finalizados,
       emergenciasActivas, tecnicosDisponibles,
       mantenimientosProximos, leadsMes,
-      cobrosVencidos, cobrosMora, cobrosPendientes
+      cobrosVencidos, cobrosMora, cobrosPendientes,
+      proyectosActivos, proyectosFinalizados
     ] = await Promise.all([
-      prisma.tbl_servicios_proyectos.count({ where: { estado_servicio: 'Pendiente', estado: 1 } }),
-      prisma.tbl_servicios_proyectos.count({ where: { estado_servicio: { in: ['Asignado', 'Checklist de salida pendiente', 'Listo para salida'] }, estado: 1 } }),
-      prisma.tbl_servicios_proyectos.count({ where: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 } }),
-      prisma.tbl_servicios_proyectos.count({ where: { estado_servicio: { startsWith: 'Finalizado' }, estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'Pendiente', estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: { in: ['Asignado', 'Checklist de salida pendiente', 'Listo para salida'] }, estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, ...ESTADOS_FINALIZADO } }),
       prisma.tbl_emergencias.count({ where: { estado_emergencia: { in: ['Reportada', 'En atención'] }, estado: 1 } }),
       prisma.tbl_tecnicos.count({ where: { estado_operativo: 'Disponible', estado: 1 } }),
       prisma.tbl_mantenimientos_planes.count({ where: { estado_plan: 'activo', estado: 1 } }),
       prisma.tbl_leads.count({ where: { date_time_registration: { gte: inicioMes, lte: finMes }, estado: 1 } }),
       prisma.tbl_cobros.count({ where: { fecha_proximo_abono: { lt: hoy }, saldo_pendiente: { gt: 0 }, estado: 1 } }),
       prisma.tbl_cobros.count({ where: { fecha_proximo_abono: { lt: hoy }, saldo_pendiente: { gt: 0 }, estado: 1 } }),
-      prisma.tbl_cobros.count({ where: { saldo_pendiente: { gt: 0 }, estado: 1 } })
+      prisma.tbl_cobros.count({ where: { saldo_pendiente: { gt: 0 }, estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_PROYECTO, estado: 1, estado_servicio: { notIn: ['Cancelado'], not: { startsWith: 'Finalizado' } } } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_PROYECTO, ...ESTADOS_FINALIZADO } })
     ]);
 
     const data = {
       pendientes, asignados, enCurso, finalizados,
       emergenciasActivas, tecnicosDisponibles, mantenimientosProximos, leadsMes,
-      cobrosVencidos, cobrosMora, cobrosPendientes
+      cobrosVencidos, cobrosMora, cobrosPendientes,
+      proyectosActivos, proyectosFinalizados
     };
 
     // Tarjetas específicas para técnico

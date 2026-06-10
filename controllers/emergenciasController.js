@@ -8,6 +8,7 @@ const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { esServicioEditable, esEmergenciaCerrada } = require('../utils/estadoServicio');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
+const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 
 const ROLES_PRECIO_EM = ['super_admin', 'admin', 'contabilidad'];
 
@@ -66,13 +67,18 @@ const crear = async (req, res) => {
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
 
     const codigo = await generarCodigoServicio();
-    const tipoEmergencia = await prisma.tbl_tipos_servicio.findFirst({ where: { categoria: 'Emergencia', estado: 1 } });
+    // Subtipo vinculado al módulo Emergencias (SSoT). Sin él no se puede clasificar.
+    const tipoEmergencia = await subtipoPorDefectoDeModulo(prisma, 'emergencia');
+    if (!tipoEmergencia) {
+      return res.status(400).json({ error: 'No hay un subtipo de servicio vinculado al módulo Emergencias. Créelo en Tipos de servicio.' });
+    }
+    const { tipo_registro: tipoRegistroEm } = clasificarTipoServicio(tipoEmergencia);
 
     const servicio = await prisma.tbl_servicios_proyectos.create({
       data: {
         codigo,
-        tipo_registro: 'servicio',
-        id_tipo_servicio: tipoEmergencia?.id || 1,
+        tipo_registro: tipoRegistroEm,
+        id_tipo_servicio: tipoEmergencia.id,
         id_cliente: Number(d.id_cliente),
         origen: 'emergencia',
         titulo: `Emergencia – ${d.motivo.substring(0, 80)}`,
@@ -227,11 +233,11 @@ const actualizar = async (req, res) => {
 
     // Validar que el ascensor pertenezca al cliente seleccionado
     if (cambiaServicio) {
-      const ascBD = await prisma.tbl_ascensores.findUnique({ where: { id: nuevoIdAscensor } });
+      const ascBD = await prisma.tbl_ascensores.findUnique({ where: { id: nuevoIdAscensor }, include: { edificio: { select: { id_cliente: true } } } });
       if (!ascBD || ascBD.estado !== 1) {
         return res.status(400).json({ error: 'Ascensor inválido o inactivo' });
       }
-      if (ascBD.id_cliente !== nuevoIdCliente) {
+      if (ascBD.edificio?.id_cliente !== nuevoIdCliente) {
         return res.status(400).json({ error: `El ascensor ${ascBD.codigo} no pertenece al cliente seleccionado` });
       }
     }

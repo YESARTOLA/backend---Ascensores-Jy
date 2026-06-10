@@ -4,7 +4,7 @@
  * Reglas:
  *   importe_linea = cantidad * precio_unitario * (1 - descuento_porcentaje/100)
  *   subtotal      = Σ importes
- *   igv           = subtotal * igv_tasa
+ *   igv           = subtotal * igv_tasa   (0 si la cotización es sin IGV)
  *   total         = subtotal + igv
  *
  * Todos los cálculos usan Number (suficiente para montos < 10^9 con 2 decimales).
@@ -23,8 +23,9 @@ function calcularImporteLinea(item) {
   return round2(importe);
 }
 
-function calcularTotalesVersion(items, igvTasa) {
-  const tasa = Number(igvTasa) || 0;
+function calcularTotalesVersion(items, igvTasa, sinIgv = false) {
+  // Sin IGV: la tasa efectiva es 0 (no se afecta el subtotal).
+  const tasa = sinIgv ? 0 : (Number(igvTasa) || 0);
   let subtotal = 0;
   for (const it of items) subtotal += calcularImporteLinea(it);
   subtotal = round2(subtotal);

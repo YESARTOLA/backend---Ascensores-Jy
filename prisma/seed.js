@@ -138,7 +138,7 @@ async function main() {
   ]);
 
   await asignarPermisos(rolTec.id, permisos, [
-    'clientes.ver', 'ascensores.ver',
+    'ascensores.ver',
     'servicios.ver', 'servicios.editar',
     'calendario.ver'
   ]);

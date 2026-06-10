@@ -21,27 +21,7 @@
  */
 
 const { parseYMDLima } = require('./tiempo');
-
-const MODULOS_VALIDOS = ['emergencia', 'correctivo', 'mantenimiento', 'atencion_rapida'];
-
-/**
- * Mapea valores legacy de `tbl_tipos_servicio.categoria` al nuevo
- * `modulo_asociado`. Se usa como fallback hasta que la migración haya
- * poblado modulo_asociado en todos los registros.
- */
-function mapearCategoriaLegacy(categoria) {
-  const c = String(categoria || '').trim().toLowerCase();
-  if (c === 'emergencia') return 'emergencia';
-  if (c === 'mantenimiento correctivo' || c === 'correctivo') return 'correctivo';
-  if (c === 'mantenimiento preventivo') return 'mantenimiento';
-  return null;
-}
-
-function resolverModulo(tipoServicio) {
-  const moduloDirecto = String(tipoServicio?.modulo_asociado || '').trim().toLowerCase();
-  if (MODULOS_VALIDOS.includes(moduloDirecto)) return moduloDirecto;
-  return mapearCategoriaLegacy(tipoServicio?.categoria);
-}
+const { clasificarTipoServicio, MODULOS_VALIDOS } = require('./clasificacionServicio');
 
 function nivelUrgencia(valor, defaultValor) {
   return ['alta', 'media', 'baja'].includes(valor) ? valor : defaultValor;
@@ -51,7 +31,8 @@ function nivelUrgencia(valor, defaultValor) {
  * @param {object} tx                 cliente Prisma o transaccional
  * @param {object} args
  * @param {object} args.servicio      servicio recién creado (necesita id, codigo)
- * @param {object} args.tipoServicio  tipo_servicio con { modulo_asociado, categoria, id }
+ * @param {object} args.tipoServicio  SUBTIPO de servicio con su relación `padre`
+ *                                    incluida (se clasifica vía clasificarTipoServicio).
  * @param {number[]} args.idsAscensores  ascensores vinculados (≥1)
  * @param {number} args.idCliente
  * @param {string} args.horaProgramada
@@ -77,7 +58,7 @@ async function replicarEnModulo(tx, args) {
     throw new Error('replicarEnModulo: debe haber al menos un ascensor');
   }
 
-  const modulo = resolverModulo(tipoServicio);
+  const { modulo_asociado: modulo } = clasificarTipoServicio(tipoServicio);
   if (!modulo) return null;
 
   const primerAscensor = idsAscensores[0];
@@ -177,7 +158,5 @@ async function replicarEnModulo(tx, args) {
 
 module.exports = {
   replicarEnModulo,
-  resolverModulo,
-  mapearCategoriaLegacy,
   MODULOS_VALIDOS
 };

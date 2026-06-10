@@ -4,6 +4,8 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { esAtencionRapidaConvertida } = require('../utils/estadoServicio');
+const { replicarEnModulo } = require('../utils/replicarEnModulo');
+const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 
 const listar = async (req, res) => {
   try {
@@ -93,67 +95,90 @@ const convertir = async (req, res) => {
     const d = req.body;
     const at = await prisma.tbl_atenciones_rapidas.findUnique({ where: { id } });
     if (!at) return res.status(404).json({ error: 'Atención no encontrada' });
-    if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || d.precio_interno === undefined) {
-      return res.status(400).json({ error: 'Faltan datos para conversión' });
+    if (!d.id_cliente || !d.id_ascensor || !d.id_subtipo_servicio || d.precio_interno === undefined) {
+      return res.status(400).json({ error: 'Faltan datos para conversión (cliente, ascensor, subtipo y precio)' });
     }
+
+    // El subtipo elegido determina el módulo destino (SSoT). El campo legacy
+    // `tipo_conversion` queda obsoleto: el routing lo decide la clasificación.
+    const subtipo = await prisma.tbl_tipos_servicio.findUnique({
+      where: { id: Number(d.id_subtipo_servicio) }, include: { padre: true }
+    });
+    if (!subtipo || subtipo.estado !== 1 || subtipo.id_padre == null) {
+      return res.status(400).json({ error: 'Subtipo de servicio inválido' });
+    }
+    let clasif;
+    try { clasif = clasificarTipoServicio(subtipo); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
     const codigo = await generarCodigoServicio();
-    const tipoConv = d.tipo_conversion || 'servicio';
     // Anclar fecha a Lima TZ con parseYMDLima — `new Date("YYYY-MM-DD")` daría
     // midnight UTC, que en local Perú (UTC-5) se desplaza al día anterior al
     // serializarse a @db.Date.
     const fecha = d.fecha_programada ? parseYMDLima(d.fecha_programada) : new Date();
-    const servicio = await prisma.tbl_servicios_proyectos.create({
-      data: {
-        codigo,
-        tipo_registro: 'servicio',
-        id_tipo_servicio: Number(d.id_tipo_servicio),
-        id_cliente: Number(d.id_cliente),
-        origen: tipoConv === 'emergencia' ? 'emergencia' : 'atencion_rapida',
-        titulo: at.tipo_solicitud || at.mensaje_rapido?.substring(0, 80) || 'Atención rápida',
-        descripcion: at.mensaje_rapido || null,
-        fecha_programada: fecha,
-        hora_programada: d.hora_programada || null,
-        prioridad: at.nivel_urgencia,
-        precio_interno: d.precio_interno,
-        moneda: d.moneda || 'PEN',
-        observaciones: d.observaciones || null,
-        user_id_registration: req.user.id,
-        ascensores: {
-          create: [{
-            id_ascensor: Number(d.id_ascensor),
-            monto: d.precio_interno || 0,
-            moneda: d.moneda || 'PEN',
-            user_id_registration: req.user.id
-          }]
-        }
-      }
-    });
 
-    if (tipoConv === 'emergencia') {
-      await prisma.tbl_emergencias.create({
+    const resultado = await prisma.$transaction(async (tx) => {
+      const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
-          id_servicio: servicio.id,
+          codigo,
+          tipo_registro: clasif.tipo_registro,
+          id_tipo_servicio: subtipo.id,
           id_cliente: Number(d.id_cliente),
-          id_ascensor: Number(d.id_ascensor),
-          motivo: at.mensaje_rapido || at.tipo_solicitud || 'Emergencia',
-          nivel_urgencia: at.nivel_urgencia || 'alta',
-          estado_emergencia: 'Reportada',
-          user_id_registration: req.user.id
+          origen: clasif.modulo_asociado || 'directo',
+          titulo: at.tipo_solicitud || at.mensaje_rapido?.substring(0, 80) || 'Atención rápida',
+          descripcion: at.mensaje_rapido || null,
+          fecha_programada: fecha,
+          hora_programada: d.hora_programada || null,
+          prioridad: at.nivel_urgencia,
+          precio_interno: d.precio_interno,
+          moneda: d.moneda || 'PEN',
+          observaciones: d.observaciones || null,
+          user_id_registration: req.user.id,
+          ascensores: {
+            create: [{
+              id_ascensor: Number(d.id_ascensor),
+              monto: d.precio_interno || 0,
+              moneda: d.moneda || 'PEN',
+              user_id_registration: req.user.id
+            }]
+          }
         }
       });
-    }
 
-    await prisma.tbl_atenciones_rapidas.update({
-      where: { id },
-      data: {
-        estado_atencion: 'convertida',
-        id_servicio_convertido: servicio.id,
-        id_cliente: Number(d.id_cliente),
-        id_ascensor: Number(d.id_ascensor),
-        user_id_modification: req.user.id, date_time_modification: new Date()
+      // Replicar en el módulo operativo destino (emergencia/correctivo/mantenimiento).
+      // Si el subtipo es del propio módulo Atención Rápida, no se duplica: la atención
+      // que estamos convirtiendo es el registro y se marca como convertida abajo.
+      if (clasif.modulo_asociado && clasif.modulo_asociado !== 'atencion_rapida') {
+        await replicarEnModulo(tx, {
+          servicio,
+          tipoServicio: subtipo,
+          idsAscensores: [Number(d.id_ascensor)],
+          idCliente: Number(d.id_cliente),
+          horaProgramada: d.hora_programada || null,
+          fechaProgramada: fecha,
+          usuarioId: req.user.id,
+          datosModulo: {
+            motivo: at.mensaje_rapido || at.tipo_solicitud,
+            falla: at.mensaje_rapido || at.tipo_solicitud,
+            nivel_urgencia: at.nivel_urgencia,
+          },
+          origenEtiqueta: `conversión de atención rápida #${id}`
+        });
       }
+
+      await tx.tbl_atenciones_rapidas.update({
+        where: { id },
+        data: {
+          estado_atencion: 'convertida',
+          id_servicio_convertido: servicio.id,
+          id_cliente: Number(d.id_cliente),
+          id_ascensor: Number(d.id_ascensor),
+          user_id_modification: req.user.id, date_time_modification: new Date()
+        }
+      });
+      return servicio;
     });
-    res.json({ data: { servicio, atencion_id: id } });
+    res.json({ data: { servicio: resultado, atencion_id: id } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al convertir: ' + err.message });

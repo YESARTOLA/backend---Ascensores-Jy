@@ -4,6 +4,8 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, combinarFechaHoraLima } = require('../utils/tiempo');
 const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+const { replicarEnModulo } = require('../utils/replicarEnModulo');
+const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const {
   ESTADO_LEAD_CONSULTA,
   ESTADO_LEAD_COTIZADO,
@@ -119,7 +121,7 @@ async function resolverCamposComerciales(d, { requeridos }) {
 //   provincia     — provincia del proyecto (vía relación ubigeo)
 //   codigo_ubigeo — distrito del proyecto (preciso; implica su provincia)
 function construirWhereLeads(query) {
-  const { q, id_vendedor, provincia, codigo_ubigeo } = query;
+  const { q, id_vendedor, provincia, codigo_ubigeo, id_padre } = query;
   const where = { estado: 1 };
   const qLimpio = (q || '').trim();
   if (qLimpio) {
@@ -136,6 +138,10 @@ function construirWhereLeads(query) {
   if (id_vendedor) where.id_vendedor = Number(id_vendedor);
   if (codigo_ubigeo) where.codigo_ubigeo = String(codigo_ubigeo);
   else if (provincia) where.ubigeo = { is: { provincia: String(provincia) } };
+  // Tabs por Tipo padre: 'sin' = leads sin subtipo solicitado; un id = subtipos
+  // cuyo padre es ese id; ausente/'todos' = sin filtro.
+  if (id_padre === 'sin') where.id_tipo_servicio_solicitado = null;
+  else if (id_padre) where.tipo_servicio = { is: { id_padre: Number(id_padre) } };
   return where;
 }
 
@@ -188,6 +194,15 @@ const crear = async (req, res) => {
     const d = req.body;
     if (!d.nombre_contacto || !d.telefono) {
       return res.status(400).json({ error: 'Nombre y teléfono son obligatorios' });
+    }
+    // El tipo (padre) + subtipo de servicio es obligatorio al crear el lead.
+    // Se persiste el subtipo; el padre se deriva de él (tipo_servicio.id_padre).
+    if (!d.id_tipo_servicio_solicitado) {
+      return res.status(400).json({ error: 'Debe seleccionar el tipo y subtipo de servicio solicitado' });
+    }
+    const subtipo = await prisma.tbl_tipos_servicio.findUnique({ where: { id: Number(d.id_tipo_servicio_solicitado) } });
+    if (!subtipo || subtipo.estado !== 1 || subtipo.id_padre == null) {
+      return res.status(400).json({ error: 'El subtipo de servicio solicitado no es válido' });
     }
     const comerciales = await resolverCamposComerciales(d, { requeridos: true });
     if (comerciales.error) return res.status(400).json({ error: comerciales.error });
@@ -331,8 +346,20 @@ const convertir = async (req, res) => {
       return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de convertirlo' });
     }
     if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || !d.fecha_programada || d.precio_interno === undefined) {
-      return res.status(400).json({ error: 'Faltan datos para convertir (cliente, ascensor, tipo, fecha, precio)' });
+      return res.status(400).json({ error: 'Faltan datos para convertir (cliente, ascensor, subtipo, fecha, precio)' });
     }
+
+    // El tipo recibido es un SUBTIPO; se clasifica (SSoT) para derivar
+    // tipo_registro y el módulo operativo destino.
+    const subtipoLead = await prisma.tbl_tipos_servicio.findUnique({
+      where: { id: Number(d.id_tipo_servicio) }, include: { padre: true }
+    });
+    if (!subtipoLead || subtipoLead.estado !== 1 || subtipoLead.id_padre == null) {
+      return res.status(400).json({ error: 'Debe seleccionar un subtipo de servicio válido.' });
+    }
+    let clasifLead;
+    try { clasifLead = clasificarTipoServicio(subtipoLead); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     const codigo = await generarCodigoServicio();
     const moneda = d.moneda || 'PEN';
@@ -346,43 +373,63 @@ const convertir = async (req, res) => {
     const descripcion = [d.descripcion || lead.observaciones, ...detallesLead].filter(Boolean).join('\n') || null;
     // El ascensor se vincula por la tabla puente tbl_servicios_ascensores (el
     // servicio no tiene columna id_ascensor). El monto de la línea es el precio.
-    const servicio = await prisma.tbl_servicios_proyectos.create({
-      data: {
-        codigo,
-        tipo_registro: d.tipo_registro || 'servicio',
-        id_tipo_servicio: Number(d.id_tipo_servicio),
-        id_cliente: Number(d.id_cliente),
-        origen: 'lead',
-        titulo: d.titulo || lead.nombre_proyecto || `Servicio desde lead ${lead.nombre_contacto}`,
-        descripcion,
-        fecha_programada: parseYMDLima(d.fecha_programada),
-        hora_programada: d.hora_programada || null,
-        prioridad: d.prioridad || 'media',
-        precio_interno: d.precio_interno,
-        moneda,
-        observaciones: d.observaciones || null,
-        user_id_registration: req.user.id,
-        ascensores: {
-          create: [{
-            id_ascensor: Number(d.id_ascensor),
-            monto: d.precio_interno,
-            moneda,
-            user_id_registration: req.user.id
-          }]
+    const servicio = await prisma.$transaction(async (tx) => {
+      const s = await tx.tbl_servicios_proyectos.create({
+        data: {
+          codigo,
+          // tipo_registro derivado del subtipo (SSoT), no del body.
+          tipo_registro: clasifLead.tipo_registro,
+          id_tipo_servicio: Number(d.id_tipo_servicio),
+          id_cliente: Number(d.id_cliente),
+          origen: 'lead',
+          titulo: d.titulo || lead.nombre_proyecto || `Servicio desde lead ${lead.nombre_contacto}`,
+          descripcion,
+          fecha_programada: parseYMDLima(d.fecha_programada),
+          hora_programada: d.hora_programada || null,
+          prioridad: d.prioridad || 'media',
+          precio_interno: d.precio_interno,
+          moneda,
+          observaciones: d.observaciones || null,
+          user_id_registration: req.user.id,
+          ascensores: {
+            create: [{
+              id_ascensor: Number(d.id_ascensor),
+              monto: d.precio_interno,
+              moneda,
+              user_id_registration: req.user.id
+            }]
+          }
         }
+      });
+      // Si el subtipo pertenece a un módulo operativo, crear su fila/plan para que
+      // el servicio sea visible en Emergencias/Correctivos/Mantenimientos.
+      if (clasifLead.modulo_asociado) {
+        await replicarEnModulo(tx, {
+          servicio: s,
+          tipoServicio: subtipoLead,
+          idsAscensores: [Number(d.id_ascensor)],
+          idCliente: Number(d.id_cliente),
+          horaProgramada: d.hora_programada || null,
+          fechaProgramada: parseYMDLima(d.fecha_programada),
+          usuarioId: req.user.id,
+          datosModulo: { motivo: descripcion, falla: descripcion, nivel_urgencia: d.prioridad },
+          origenEtiqueta: `conversión de lead #${id}`
+        });
       }
+      return s;
     });
 
     // Registrar el evento en el calendario, igual que el alta normal de servicios,
     // para que el servicio convertido figure en el calendario operativo.
+    const tipoEventoLead = clasifLead.tipo_registro === 'proyecto' ? 'proyecto' : 'servicio';
     await prisma.tbl_calendario_eventos.create({
       data: {
         id_servicio: servicio.id,
         titulo: `${servicio.codigo} – ${servicio.titulo}`,
-        tipo_evento: 'servicio',
+        tipo_evento: tipoEventoLead,
         fecha_inicio: combinarFechaHoraLima(d.fecha_programada, d.hora_programada),
         estado_evento: 'programado',
-        color: colorPorTipo('servicio')
+        color: colorPorTipo(tipoEventoLead)
       }
     });
     sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));

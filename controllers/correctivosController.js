@@ -23,28 +23,9 @@ const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { esServicioEditable, esCorrectivoCerrado } = require('../utils/estadoServicio');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
+const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 
 const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
-
-/**
- * Asegura que exista un tipo de servicio para correctivos y devuelve su id.
- * Reutiliza el tipo cargado por el seed con categoría "Mantenimiento correctivo".
- * Si no existe (entorno fresco), lo crea — idempotente.
- */
-async function asegurarTipoCorrectivo() {
-  const existente = await prisma.tbl_tipos_servicio.findFirst({
-    where: { categoria: { in: ['Mantenimiento correctivo', 'Correctivo'] }, estado: 1 }
-  });
-  if (existente) return existente.id;
-  const creado = await prisma.tbl_tipos_servicio.create({
-    data: {
-      nombre: 'Mantenimiento correctivo',
-      categoria: 'Mantenimiento correctivo',
-      descripcion: 'Corrección de fallas detectadas'
-    }
-  });
-  return creado.id;
-}
 
 const listar = async (req, res) => {
   try {
@@ -95,14 +76,19 @@ const crear = async (req, res) => {
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
 
     const codigo = await generarCodigoServicio();
-    const idTipo = await asegurarTipoCorrectivo();
+    // Subtipo vinculado al módulo Correctivos (SSoT).
+    const tipoCorrectivo = await subtipoPorDefectoDeModulo(prisma, 'correctivo');
+    if (!tipoCorrectivo) {
+      return res.status(400).json({ error: 'No hay un subtipo de servicio vinculado al módulo Correctivos. Créelo en Tipos de servicio.' });
+    }
+    const { tipo_registro: tipoRegistroCor } = clasificarTipoServicio(tipoCorrectivo);
     const nivelUrgencia = d.nivel_urgencia || 'media';
 
     const servicio = await prisma.tbl_servicios_proyectos.create({
       data: {
         codigo,
-        tipo_registro: 'servicio',
-        id_tipo_servicio: idTipo,
+        tipo_registro: tipoRegistroCor,
+        id_tipo_servicio: tipoCorrectivo.id,
         id_cliente: Number(d.id_cliente),
         origen: 'correctivo',
         titulo: `Correctivo – ${d.falla.substring(0, 80)}`,
@@ -252,11 +238,11 @@ const actualizar = async (req, res) => {
     const nuevoIdAscensor = d.id_ascensor ? Number(d.id_ascensor) : (servicioPrevio?.id_ascensor ?? previo.id_ascensor);
 
     if (cambiaServicio) {
-      const ascBD = await prisma.tbl_ascensores.findUnique({ where: { id: nuevoIdAscensor } });
+      const ascBD = await prisma.tbl_ascensores.findUnique({ where: { id: nuevoIdAscensor }, include: { edificio: { select: { id_cliente: true } } } });
       if (!ascBD || ascBD.estado !== 1) {
         return res.status(400).json({ error: 'Ascensor inválido o inactivo' });
       }
-      if (ascBD.id_cliente !== nuevoIdCliente) {
+      if (ascBD.edificio?.id_cliente !== nuevoIdCliente) {
         return res.status(400).json({ error: `El ascensor ${ascBD.codigo} no pertenece al cliente seleccionado` });
       }
     }

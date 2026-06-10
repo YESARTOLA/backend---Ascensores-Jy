@@ -28,7 +28,8 @@ const tipoEventoDesdeRegistro = (tipoRegistro) =>
   tipoRegistro === 'proyecto' ? 'proyecto' : 'servicio';
 const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
-const { replicarEnModulo, resolverModulo } = require('../utils/replicarEnModulo');
+const { replicarEnModulo } = require('../utils/replicarEnModulo');
+const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
 
@@ -74,15 +75,17 @@ async function validarAscensores(input, idCliente, precioInterno, monedaServicio
     suma += monto;
     items.push({ id_ascensor: idAsc, monto });
   }
-  // Validar que todos los ascensores pertenezcan al cliente
+  // Validar que todos los ascensores pertenezcan al cliente. El ascensor se
+  // asocia al cliente a través de su edificio (tbl_edificios.id_cliente).
   const ascBD = await prisma.tbl_ascensores.findMany({
-    where: { id: { in: items.map(i => i.id_ascensor) }, estado: 1 }
+    where: { id: { in: items.map(i => i.id_ascensor) }, estado: 1 },
+    include: { edificio: { select: { id_cliente: true } } }
   });
   if (ascBD.length !== items.length) {
     return { ok: false, error: 'Uno o más ascensores no existen o están inactivos' };
   }
   for (const a of ascBD) {
-    if (a.id_cliente !== Number(idCliente)) {
+    if (a.edificio?.id_cliente !== Number(idCliente)) {
       return { ok: false, error: `El ascensor ${a.codigo} no pertenece al cliente seleccionado` };
     }
   }
@@ -170,8 +173,7 @@ const obtener = async (req, res) => {
             id: true,
             codigo: true,
             estado_global: true,
-            version_activa: true,
-            titulo: true
+            version_activa: true
           }
         },
         mantenimiento_plan: {
@@ -184,7 +186,7 @@ const obtener = async (req, res) => {
             cantidad_mantenimientos_gratuitos: true,
             fecha_inicio: true,
             estado_plan: true,
-            tipo_servicio: { select: { id: true, nombre: true, categoria: true } }
+            tipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } }
           }
         },
         emergencia: { select: { id: true, id_ascensor: true, motivo: true, nivel_urgencia: true, estado_emergencia: true, fecha_reporte: true } },
@@ -227,28 +229,34 @@ const crear = async (req, res) => {
     const esBorrador = d.es_borrador === true || d.es_borrador === 1 || d.estado_servicio === 'Borrador';
     const estadoInicial = esBorrador ? 'Borrador' : 'Pendiente';
 
-    // Cargar tipo de servicio para saber si tiene módulo asociado (Emergencias /
-    // Correctivos / Mantenimientos / Atención Rápida). Si lo tiene, se crea
-    // también la fila correspondiente atómicamente con el servicio.
+    // El tipo recibido es un SUBTIPO. Se carga con su padre para clasificarlo
+    // (SSoT): el padre define si es Proyecto o Servicio (tipo_registro) y, si es
+    // Servicio, el módulo operativo donde se replica (Emergencias / Correctivos /
+    // Mantenimientos / Atención Rápida).
     const tipoServicio = await prisma.tbl_tipos_servicio.findUnique({
       where: { id: Number(d.id_tipo_servicio) },
-      select: { id: true, modulo_asociado: true, categoria: true }
+      include: { padre: true }
     });
     if (!tipoServicio) return res.status(400).json({ error: 'Tipo de servicio inválido' });
+    if (tipoServicio.id_padre == null) {
+      return res.status(400).json({ error: 'Debe seleccionar un subtipo de servicio, no un tipo padre.' });
+    }
 
-    // `origen` se deriva del módulo del tipo de servicio (no se acepta del
-    // body para evitar inconsistencias). Si el tipo no tiene módulo asociado,
-    // el servicio queda como 'directo'. Los demás controllers (emergencias,
-    // correctivos, mantenimientos, etc.) siguen seteando su propio origen
-    // cuando crean servicios desde sus respectivos flujos.
-    const origenDerivado = tipoServicio.modulo_asociado || 'directo';
+    let clasificacion;
+    try { clasificacion = clasificarTipoServicio(tipoServicio); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    // tipo_registro (servicio/proyecto) y origen se DERIVAN del subtipo, nunca del
+    // body, para garantizar una sola fuente de verdad.
+    const tipoRegistro = clasificacion.tipo_registro;
+    const origenDerivado = clasificacion.modulo_asociado || 'directo';
 
     const codigo = await generarCodigoServicio();
     const servicio = await prisma.$transaction(async (tx) => {
       const s = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo,
-          tipo_registro: d.tipo_registro || 'servicio',
+          tipo_registro: tipoRegistro,
           id_tipo_servicio: Number(d.id_tipo_servicio),
           id_cliente: Number(d.id_cliente),
           origen: origenDerivado,
@@ -473,16 +481,31 @@ const actualizar = async (req, res) => {
 
     const nuevaFechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : previo.fecha_programada;
     const nuevaHoraProgramada = d.hora_programada ?? previo.hora_programada;
+    // `fecha_programada` puede ser null (servicio aprobado sin programar): la
+    // comparación debe ser null-safe para no romper al registrar la fecha.
+    const msFecha = (f) => (f instanceof Date ? f.getTime() : null);
     const cambiaFechaHora =
-      (d.fecha_programada !== undefined && nuevaFechaProgramada.getTime() !== previo.fecha_programada.getTime()) ||
+      (d.fecha_programada !== undefined && msFecha(nuevaFechaProgramada) !== msFecha(previo.fecha_programada)) ||
       (d.hora_programada !== undefined && d.hora_programada !== previo.hora_programada);
+
+    // tipo_registro se DERIVA del subtipo (SSoT), nunca del body. Si cambia el
+    // subtipo, se reclasifica; si no, se conserva el valor previo.
+    const nuevoIdTipo = d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio;
+    let nuevoTipoRegistro = previo.tipo_registro;
+    if (nuevoIdTipo !== previo.id_tipo_servicio) {
+      const subNuevo = await prisma.tbl_tipos_servicio.findUnique({ where: { id: nuevoIdTipo }, include: { padre: true } });
+      if (!subNuevo || subNuevo.id_padre == null) {
+        return res.status(400).json({ error: 'Debe seleccionar un subtipo de servicio válido.' });
+      }
+      nuevoTipoRegistro = clasificarTipoServicio(subNuevo).tipo_registro;
+    }
 
     const servicio = await prisma.tbl_servicios_proyectos.update({
       where: { id },
       data: {
-        id_tipo_servicio: d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio,
+        id_tipo_servicio: nuevoIdTipo,
         id_cliente: nuevoIdCliente,
-        tipo_registro: d.tipo_registro ?? previo.tipo_registro,
+        tipo_registro: nuevoTipoRegistro,
         // `origen` no se actualiza desde el form: representa el canal de
         // creación original (trazabilidad), no algo editable.
         origen: previo.origen,
@@ -525,13 +548,16 @@ const actualizar = async (req, res) => {
       }
     }
 
-    // Sincronizar evento de calendario y título si cambió fecha/hora/título.
-    // Solo aplica a servicios fuera de borrador (los borradores no tienen evento creado).
+    // Sincronizar evento de calendario y título.
+    // Un servicio aprobado por cotización nace SIN fecha y, por tanto, SIN evento.
+    // Al registrar la fecha por primera vez se CREA el evento; si ya existía, se
+    // actualiza. Sin fecha programada no hay nada que llevar al calendario.
+    // Solo aplica a servicios fuera de borrador (los borradores no tienen evento).
     if (previo.estado_servicio !== 'Borrador') {
       const cambiaTitulo = d.titulo !== undefined && d.titulo !== previo.titulo;
-      if (cambiaFechaHora || cambiaTitulo) {
+      if ((cambiaFechaHora || cambiaTitulo) && nuevaFechaProgramada) {
         const nuevaFechaInicio = combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada);
-        await prisma.tbl_calendario_eventos.updateMany({
+        const actualizados = await prisma.tbl_calendario_eventos.updateMany({
           where: { id_servicio: id, estado: 1 },
           data: {
             ...(cambiaFechaHora ? { fecha_inicio: nuevaFechaInicio } : {}),
@@ -540,6 +566,20 @@ const actualizar = async (req, res) => {
             date_time_modification: new Date()
           }
         });
+        // No existía evento (servicio aprobado sin fecha): se crea al programar.
+        if (actualizados.count === 0) {
+          const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
+          await prisma.tbl_calendario_eventos.create({
+            data: {
+              id_servicio: id,
+              titulo: `${servicio.codigo} – ${servicio.titulo}`,
+              tipo_evento: tipoEvento,
+              fecha_inicio: nuevaFechaInicio,
+              estado_evento: 'programado',
+              color: colorPorTipo(tipoEvento)
+            }
+          });
+        }
       }
     }
 

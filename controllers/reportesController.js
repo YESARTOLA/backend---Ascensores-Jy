@@ -11,7 +11,7 @@ const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
 
 const operativos = async (req, res) => {
   try {
-    const { desde, hasta, id_cliente, id_tecnico, estado_servicio, id_ascensor, id_tipo_servicio } = req.query;
+    const { desde, hasta, id_cliente, id_tecnico, estado_servicio, id_ascensor, id_tipo_servicio, tipo_registro } = req.query;
     const where = { estado: 1 };
     if (desde || hasta) {
       where.fecha_programada = {};
@@ -21,6 +21,8 @@ const operativos = async (req, res) => {
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_ascensor) where.ascensores = { some: { id_ascensor: Number(id_ascensor), estado: 1 } };
     if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
+    // Separa Proyectos de Servicios operativos (no se mezclan en el reporte).
+    if (tipo_registro) where.tipo_registro = tipo_registro;
     if (estado_servicio) where.estado_servicio = estado_servicio;
     if (id_tecnico) where.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
 
