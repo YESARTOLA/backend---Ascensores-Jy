@@ -2,9 +2,12 @@ const express = require('express');
 const router = express.Router();
 const verificarToken = require('../middleware/authMiddleware');
 const { permitirRoles } = require('../middleware/rbacMiddleware');
+const { requiereAlcance } = require('../utils/alcanceUsuario');
 const c = require('../controllers/atencionesRapidasController');
 
 router.use(verificarToken);
+// Módulo de dominio Servicios: bloqueado para usuarios cuyo ámbito sea solo Proyectos.
+router.use(requiereAlcance('servicio'));
 
 router.get('/', c.listar);
 router.post('/', permitirRoles('super_admin', 'admin', 'coordinador'), c.crear);

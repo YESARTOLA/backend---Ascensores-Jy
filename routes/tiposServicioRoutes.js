@@ -11,6 +11,7 @@ router.get('/', c.listar);
 router.post('/', permitirRoles('super_admin'), c.crear);
 router.put('/:id', permitirRoles('super_admin'), c.actualizar);
 router.patch('/:id/estado', permitirRoles('super_admin'), c.cambiarEstado);
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 router.get('/:id/tecnicos', c.listarTecnicos);
 router.post('/:id/tecnicos', permitirRoles('super_admin'), c.vincularTecnico);

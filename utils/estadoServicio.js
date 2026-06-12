@@ -106,7 +106,7 @@ function esServicioPostRevision(estadoServicio) {
 }
 
 // Catálogos de estados de los registros asociados a un servicio.
-const ESTADOS_EMERGENCIA = ['Reportada', 'En atención', 'Resuelto', 'Cerrada'];
+const ESTADOS_EMERGENCIA = ['Reportada', 'En atención', 'Atendida', 'Cerrada'];
 const ESTADOS_CORRECTIVO = ['Reportado', 'En atención', 'Resuelto', 'Cerrado'];
 const ESTADOS_ATENCION_RAPIDA = ['nueva', 'convertida', 'descartada'];
 

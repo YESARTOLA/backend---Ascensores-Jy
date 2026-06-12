@@ -2,6 +2,12 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
+const {
+  aplicaAlcance,
+  tiposRegistroPermitidos,
+  servicioAlcanceWhere,
+  ascensorAlcanceWhere,
+} = require('../utils/alcanceUsuario');
 
 // Datos del edificio (y su cliente) que la UI muestra junto al ascensor.
 const INCLUDE_EDIFICIO = {
@@ -32,6 +38,11 @@ const listar = async (req, res) => {
     else if (id_cliente) where.edificio = { is: { id_cliente: Number(id_cliente) } };
     if (estado_operativo) where.estado_operativo = estado_operativo;
 
+    // Ámbito del usuario: solo ascensores de clientes dentro del ámbito. Se aplica
+    // vía AND para no pisar el filtro por edificio/cliente de arriba.
+    const alcance = ascensorAlcanceWhere(req.user);
+    if (Object.keys(alcance).length) where.AND = [...(where.AND || []), alcance];
+
     const result = await paginar(
       prisma.tbl_ascensores,
       { where, orderBy: { id: 'desc' }, include: INCLUDE_EDIFICIO },
@@ -47,6 +58,12 @@ const listar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
+    if (aplicaAlcance(req.user)) {
+      const enAmbito = await prisma.tbl_ascensores.findFirst({
+        where: { id, ...ascensorAlcanceWhere(req.user) }, select: { id: true }
+      });
+      if (!enAmbito) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    }
     const ascensor = await prisma.tbl_ascensores.findUnique({
       where: { id },
       include: { edificio: { include: { cliente: true } } }
@@ -62,10 +79,17 @@ const obtener = async (req, res) => {
 const historial = async (req, res) => {
   try {
     const id = Number(req.params.id);
+    if (aplicaAlcance(req.user)) {
+      const enAmbito = await prisma.tbl_ascensores.findFirst({
+        where: { id, ...ascensorAlcanceWhere(req.user) }, select: { id: true }
+      });
+      if (!enAmbito) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    }
+    const tipos = tiposRegistroPermitidos(req.user);
     const [ascensor, servicios, emergencias, mantenimientos, eventosHist] = await Promise.all([
       prisma.tbl_ascensores.findUnique({ where: { id }, include: { edificio: { include: { cliente: true } } } }),
       prisma.tbl_servicios_proyectos.findMany({
-        where: { ascensores: { some: { id_ascensor: id, estado: 1 } }, estado: 1 },
+        where: { ascensores: { some: { id_ascensor: id, estado: 1 } }, estado: 1, ...servicioAlcanceWhere(req.user) },
         orderBy: { id: 'desc' },
         include: {
           tipo_servicio: true,
@@ -114,12 +138,15 @@ const historial = async (req, res) => {
         })
       ]);
 
+    // Emergencias y mantenimientos son dominio de Servicios: se ocultan a un
+    // usuario cuyo ámbito sea solo Proyectos.
+    const soloProyectos = tipos && !tipos.includes('servicio');
     res.json({
       data: {
         ascensor,
         servicios,
-        emergencias,
-        mantenimientos,
+        emergencias: soloProyectos ? [] : emergencias,
+        mantenimientos: soloProyectos ? [] : mantenimientos,
         entregas,
         facturas,
         guias,

@@ -10,7 +10,7 @@ router.get('/tipos', c.listarTipos);
 router.get('/distritos', c.listarDistritos);
 router.get('/', c.listar);
 router.get('/:id', c.obtener);
-router.post('/', permitirRoles('super_admin', 'admin', 'coordinador'), c.crear);
+router.post('/', permitirRoles('super_admin', 'admin', 'coordinador', 'vendedora'), c.crear);
 router.put('/:id', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.actualizar);
 router.patch('/:id/estado', permitirRoles('super_admin', 'admin'), c.cambiarEstado);
 

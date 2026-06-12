@@ -14,9 +14,19 @@ const ROLES_PRECIO_EM = ['super_admin', 'admin', 'contabilidad'];
 
 const listar = async (req, res) => {
   try {
-    const { estado_emergencia } = req.query;
+    const { estado_emergencia, nivel_urgencia, q } = req.query;
     const where = { estado: 1 };
     if (estado_emergencia) where.estado_emergencia = estado_emergencia;
+    if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
+    // Buscador libre: edificio/obra, cliente, ascensor, distrito, motivo y código del servicio.
+    if (q) where.OR = [
+      { motivo: { contains: q, mode: 'insensitive' } },
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { codigo: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } },
+      { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } },
+      { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
+    ];
     const filtroServicio = whereServicioAsignadoSiTecnico(req.user);
     if (filtroServicio) where.servicio = filtroServicio;
     const result = await paginar(
@@ -310,4 +320,80 @@ const actualizar = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar };
+/**
+ * Soft-delete de una emergencia: estado = 0. Como cada emergencia crea y posee
+ * un servicio vinculado (1:1), la baja arrastra ese servicio y sus artefactos
+ * visibles en otros módulos (evento de calendario, folder contable,
+ * recordatorios) y libera a los técnicos asignados sin otros servicios activos.
+ * No borra físicamente: queda auditado y recuperable.
+ */
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = await prisma.tbl_emergencias.findUnique({
+      where: { id },
+      include: { servicio: { include: { asignaciones: { where: { estado: 1 } } } } }
+    });
+    if (!previo) return res.status(404).json({ error: 'Emergencia no encontrada' });
+
+    const idServicio = previo.id_servicio;
+    await prisma.$transaction(async (tx) => {
+      const emergencia = await tx.tbl_emergencias.update({
+        where: { id },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+
+      if (idServicio) {
+        await tx.tbl_servicios_proyectos.updateMany({
+          where: { id: idServicio, estado: 1 },
+          data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+        await tx.tbl_servicios_realizados.updateMany({
+          where: { id_servicio: idServicio, estado: 1 },
+          data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+      }
+      // Evento(s) de calendario de la emergencia y/o su servicio: baja lógica.
+      await tx.tbl_calendario_eventos.updateMany({
+        where: {
+          estado: 1,
+          OR: [{ id_emergencia: id }, ...(idServicio ? [{ id_servicio: idServicio }] : [])]
+        },
+        data: { estado: 0, estado_evento: 'cancelado', user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      // Recordatorios vinculados a la emergencia y/o su servicio: baja lógica.
+      await tx.tbl_recordatorios.updateMany({
+        where: {
+          estado: 1,
+          OR: [{ id_emergencia: id }, ...(idServicio ? [{ id_servicio: idServicio }] : [])]
+        },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_emergencias', id_entidad: id,
+        accion: 'DELETE', valor_anterior: previo, valor_nuevo: emergencia, ip: req.ip
+      });
+    });
+
+    // Liberar técnicos: volver a Disponible si no quedan otros servicios activos.
+    for (const a of (previo.servicio?.asignaciones || [])) {
+      const otrasActivas = await prisma.tbl_servicios_asignaciones.count({
+        where: {
+          id_tecnico: a.id_tecnico, estado: 1, id_servicio: { not: idServicio },
+          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+        }
+      });
+      if (otrasActivas === 0) {
+        await prisma.tbl_tecnicos.update({ where: { id: a.id_tecnico }, data: { estado_operativo: 'Disponible' } });
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar emergencia: ' + err.message });
+  }
+};
+
+module.exports = { listar, crear, actualizar, eliminar };

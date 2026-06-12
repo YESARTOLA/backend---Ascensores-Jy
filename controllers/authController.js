@@ -27,7 +27,9 @@ const login = async (req, res) => {
         correo: usuario.correo,
         id_rol: usuario.id_rol,
         rol_codigo: usuario.rol_codigo,
-        id_tecnico: usuario.id_tecnico
+        id_tecnico: usuario.id_tecnico,
+        acceso_servicios: usuario.acceso_servicios,
+        acceso_proyectos: usuario.acceso_proyectos
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
@@ -44,6 +46,8 @@ const login = async (req, res) => {
         correo: usuario.correo,
         id_rol: usuario.id_rol,
         id_tecnico: usuario.id_tecnico,
+        acceso_servicios: usuario.acceso_servicios,
+        acceso_proyectos: usuario.acceso_proyectos,
         rol: usuario.rol,
         rol_codigo: usuario.rol_codigo,
         permisos: usuario.permisos

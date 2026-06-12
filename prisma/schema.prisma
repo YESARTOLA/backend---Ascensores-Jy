@@ -73,6 +73,10 @@ model tbl_usuarios {
   id_rol                 Int
   id_tecnico             Int?          @unique
   telefono               String?       @db.VarChar(30)
+  // Ámbito de acceso para roles Administrador y Coordinador (ver utils/alcanceUsuario.js).
+  // 1 = el usuario accede a ese ámbito. Para el resto de roles se ignoran (siempre 1).
+  acceso_servicios       Int           @default(1)
+  acceso_proyectos       Int           @default(1)
   ultimo_login           DateTime?     @db.Timestamptz(6)
   estado                 Int           @default(1)
   user_id_registration   Int?
@@ -688,6 +692,7 @@ model tbl_atenciones_rapidas {
   telefono               String          @db.VarChar(30)
   mensaje_rapido         String?
   tipo_solicitud         String?         @db.VarChar(100)
+  responsable            String?         @db.VarChar(150)
   nivel_urgencia         String          @default("media") @db.VarChar(20)
   estado_atencion        String          @default("nueva") @db.VarChar(30)
   id_cliente             Int?

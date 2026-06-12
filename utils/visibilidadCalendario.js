@@ -17,7 +17,10 @@ const VISIBILIDAD_POR_ROL = {
   admin:        { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'servicio_finalizado_aviso'] },
   coordinador:  { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
   tecnico:      { operativos: 'asignados', tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia'] },
-  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] }
+  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] },
+  // La Vendedora ve TODA la agenda operativa (solo lectura) para validar la
+  // disponibilidad de los técnicos al programar; sin recordatorios.
+  vendedora:    { operativos: 'todos',     tipos_recordatorio: [] }
 };
 
 function incluyeOperativos(rol) {

@@ -4,10 +4,16 @@ const {
   ESTADO_FACTURACION_SIN,
   ESTADOS_FACTURACION_COMPLETA
 } = require('../utils/estadoFactura');
+const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 
 const resumen = async (req, res) => {
   try {
     const rol = req.user.rol_codigo;
+    // Ámbito del usuario (Servicios/Proyectos): null = sin restricción.
+    const tiposAmbito = tiposRegistroPermitidos(req.user);
+    const filtroAmbito = tiposAmbito
+      ? { tipo_registro: { in: tiposAmbito.length ? tiposAmbito : ['__sin_ambito__'] } }
+      : {};
     const hoy = inicioDelDiaLima();
     const finDia = finDelDiaLima();
     const inicioMes = inicioMesLima();
@@ -47,6 +53,19 @@ const resumen = async (req, res) => {
       cobrosVencidos, cobrosMora, cobrosPendientes,
       proyectosActivos, proyectosFinalizados
     };
+
+    // Ámbito: anular los KPIs fuera del ámbito del usuario (admin/coordinador
+    // acotado). Los de Servicios cuando no tiene Servicios; los de Proyectos
+    // cuando no tiene Proyectos. Los financieros se gobiernan por rol más abajo.
+    if (tiposAmbito) {
+      if (!tiposAmbito.includes('servicio')) {
+        data.pendientes = 0; data.asignados = 0; data.enCurso = 0; data.finalizados = 0;
+        data.emergenciasActivas = 0; data.mantenimientosProximos = 0;
+      }
+      if (!tiposAmbito.includes('proyecto')) {
+        data.proyectosActivos = 0; data.proyectosFinalizados = 0;
+      }
+    }
 
     // Tarjetas específicas para técnico
     if (rol === 'tecnico') {
@@ -101,7 +120,8 @@ const resumen = async (req, res) => {
         where: {
           estado: 1,
           fecha_programada: { gte: hoy, lte: finDia },
-          estado_servicio: { notIn: ['Cancelado', 'Borrador', 'Cerrado'] }
+          estado_servicio: { notIn: ['Cancelado', 'Borrador', 'Cerrado'] },
+          ...filtroAmbito
         },
         orderBy: { hora_programada: 'asc' },
         include: {

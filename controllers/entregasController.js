@@ -3,6 +3,7 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const { parseYMDLima } = require('../utils/tiempo');
+const { porServicioRelacionWhere } = require('../utils/alcanceUsuario');
 
 const _estadoServicio = async (idServicio) => {
   const srv = await prisma.tbl_servicios_proyectos.findUnique({
@@ -18,6 +19,8 @@ const listar = async (req, res) => {
     if (id_servicio) where.id_servicio = Number(id_servicio);
     if (tipo_entrega) where.tipo_entrega = tipo_entrega;
     if (estado_entrega) where.estado_entrega = estado_entrega;
+    // Ámbito del usuario: solo entregas de servicios/proyectos del ámbito.
+    Object.assign(where, porServicioRelacionWhere(req.user));
     const result = await paginar(
       prisma.tbl_entregas,
       { where, orderBy: { id: 'desc' }, include: { servicio: { include: { cliente: true } }, archivo: true } },

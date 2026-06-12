@@ -29,11 +29,20 @@ const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
 
 const listar = async (req, res) => {
   try {
-    const { estado_correctivo, nivel_urgencia, id_cliente } = req.query;
+    const { estado_correctivo, nivel_urgencia, id_cliente, q } = req.query;
     const where = { estado: 1 };
     if (estado_correctivo) where.estado_correctivo = estado_correctivo;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
     if (id_cliente) where.id_cliente = Number(id_cliente);
+    // Buscador libre: edificio/obra, cliente, ascensor, distrito, falla y código del servicio.
+    if (q) where.OR = [
+      { falla: { contains: q, mode: 'insensitive' } },
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { codigo: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } },
+      { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } },
+      { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
+    ];
     const filtroServicio = whereServicioAsignadoSiTecnico(req.user);
     if (filtroServicio) where.servicio = filtroServicio;
 

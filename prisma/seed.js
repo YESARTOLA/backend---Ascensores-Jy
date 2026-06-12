@@ -7,7 +7,7 @@
  * desde la UI.
  *
  * Contenido sembrado:
- *   1. tbl_roles                — 5 roles del sistema (códigos usados por el backend).
+ *   1. tbl_roles                — 6 roles del sistema (códigos usados por el backend).
  *   2. tbl_permisos             — Matriz de permisos del sistema.
  *   3. tbl_roles_permisos       — Asignación por defecto de permisos por rol.
  *   4. tbl_usuarios             — 1 super_admin para el primer login.
@@ -82,6 +82,7 @@ async function main() {
   const rolCoord = await upsertRol('coordinador', 'Coordinador', 'Coordinación diaria de servicios');
   const rolTec = await upsertRol('tecnico', 'Técnico', 'Ejecución técnica en campo');
   const rolCont = await upsertRol('contabilidad', 'Contabilidad', 'Cobros y facturación');
+  const rolVend = await upsertRol('vendedora', 'Vendedora', 'Captación comercial: registro y conversión de leads');
 
   // ═════════════════════════════════════════════════════════════════
   // 2. PERMISOS DEL SISTEMA (recurso.accion)
@@ -150,6 +151,17 @@ async function main() {
     'facturas.ver', 'facturas.crear', 'facturas.editar',
     'reportes.ver', 'precios.ver',
     'emergencias.ver', 'mantenimientos.ver', 'entregas.ver'
+  ]);
+
+  // Vendedora: solo trabaja leads y su conversión a cliente. Para el wizard de
+  // conversión necesita además crear cliente/ascensor y ver técnicos. No ve
+  // precios ni accede a ningún otro módulo (enforcement por rol_codigo en las
+  // rutas).
+  await asignarPermisos(rolVend.id, permisos, [
+    'leads.ver', 'leads.crear',
+    'clientes.ver', 'clientes.crear',
+    'ascensores.ver', 'ascensores.crear',
+    'tecnicos.ver', 'tipos_servicio.ver'
   ]);
 
   // ═════════════════════════════════════════════════════════════════

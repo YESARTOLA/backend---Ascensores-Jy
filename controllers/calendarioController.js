@@ -6,6 +6,7 @@ const {
   tiposRecordatorioPermitidos,
   colorPorTipo
 } = require('../utils/visibilidadCalendario');
+const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 
 const listar = async (req, res) => {
   try {
@@ -145,7 +146,18 @@ const listar = async (req, res) => {
       };
     });
 
+    // Ámbito del usuario (Servicios/Proyectos): un ítem es de Proyectos si su
+    // servicio vinculado es tipo_registro='proyecto'; el resto (servicios,
+    // mantenimientos, emergencias, cobros) es dominio de Servicios.
+    const tiposAmbito = tiposRegistroPermitidos(req.user);
+    const visiblePorAmbito = (it) => {
+      if (!tiposAmbito) return true;
+      const esProyecto = it.tipo_evento === 'proyecto' || it.servicio?.tipo_registro === 'proyecto';
+      return esProyecto ? tiposAmbito.includes('proyecto') : tiposAmbito.includes('servicio');
+    };
+
     const combinado = [...eventosNormalizados, ...recordatorios]
+      .filter(visiblePorAmbito)
       .sort((a, b) => new Date(a.fecha_inicio) - new Date(b.fecha_inicio));
 
     res.json({ data: combinado });

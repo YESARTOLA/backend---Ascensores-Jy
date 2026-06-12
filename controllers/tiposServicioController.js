@@ -247,4 +247,30 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, catalogos, crear, actualizar, cambiarEstado, listarTecnicos, vincularTecnico, desvincularTecnico };
+// Soft-delete: estado = 0. El tipo desaparece de listados y selectores, pero
+// los servicios históricos que lo referencian conservan su FK intacta.
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = await prisma.tbl_tipos_servicio.findUnique({ where: { id } });
+    if (!previo) return res.status(404).json({ error: 'Tipo no encontrado' });
+    // Eliminar un padre con subtipos activos dejaría subtipos huérfanos visibles.
+    if (previo.id_padre == null) {
+      const nSub = await prisma.tbl_tipos_servicio.count({ where: { id_padre: id, estado: 1 } });
+      if (nSub > 0) return res.status(409).json({ error: 'Elimine o reasigne primero los subtipos de este padre.' });
+    }
+    const tipo = await prisma.tbl_tipos_servicio.update({
+      where: { id }, data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() },
+    });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_tipos_servicio', id_entidad: id,
+      accion: 'DELETE', valor_anterior: previo, valor_nuevo: tipo, ip: req.ip,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar tipo' });
+  }
+};
+
+module.exports = { listar, catalogos, crear, actualizar, cambiarEstado, eliminar, listarTecnicos, vincularTecnico, desvincularTecnico };

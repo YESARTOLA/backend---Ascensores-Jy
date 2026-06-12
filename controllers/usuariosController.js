@@ -2,6 +2,32 @@ const prisma = require('../config/prisma');
 const bcrypt = require('bcrypt');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
+const { ROLES_CON_ALCANCE } = require('../utils/alcanceUsuario');
+
+/**
+ * Resuelve los flags de ámbito (acceso_servicios / acceso_proyectos) a guardar.
+ * Solo aplican a roles con alcance (Administrador / Coordinador); para el resto
+ * se fuerzan a 1 (se ignoran en runtime). En roles con alcance se exige marcar
+ * al menos uno. `previo` permite conservar el valor actual en una edición parcial.
+ * @returns {{acceso_servicios:number, acceso_proyectos:number}|{error:string}}
+ */
+async function resolverAccesoAmbito(idRol, body, previo = null) {
+  const rol = await prisma.tbl_roles.findUnique({ where: { id: Number(idRol) }, select: { codigo: true } });
+  if (!rol || !ROLES_CON_ALCANCE.includes(rol.codigo)) {
+    return { acceso_servicios: 1, acceso_proyectos: 1 };
+  }
+  const resolver = (campo) => {
+    if (body[campo] !== undefined) return body[campo] ? 1 : 0;
+    if (previo && previo[campo] !== undefined && previo[campo] !== null) return previo[campo];
+    return 1;
+  };
+  const acceso_servicios = resolver('acceso_servicios');
+  const acceso_proyectos = resolver('acceso_proyectos');
+  if (acceso_servicios === 0 && acceso_proyectos === 0) {
+    return { error: 'Debe marcar al menos un ámbito (Servicios o Proyectos)' };
+  }
+  return { acceso_servicios, acceso_proyectos };
+}
 
 const listar = async (req, res) => {
   try {
@@ -35,6 +61,8 @@ const crear = async (req, res) => {
     }
     const exists = await prisma.tbl_usuarios.findUnique({ where: { correo: d.correo } });
     if (exists) return res.status(400).json({ error: 'Correo ya registrado' });
+    const acceso = await resolverAccesoAmbito(d.id_rol, d);
+    if (acceso.error) return res.status(400).json({ error: acceso.error });
     const hash = await bcrypt.hash(d.contrasena, 10);
     const u = await prisma.tbl_usuarios.create({
       data: {
@@ -44,6 +72,8 @@ const crear = async (req, res) => {
         id_rol: Number(d.id_rol),
         id_tecnico: d.id_tecnico ? Number(d.id_tecnico) : null,
         telefono: d.telefono || null,
+        acceso_servicios: acceso.acceso_servicios,
+        acceso_proyectos: acceso.acceso_proyectos,
         user_id_registration: req.user.id
       }
     });
@@ -61,12 +91,17 @@ const actualizar = async (req, res) => {
     const d = req.body;
     const previo = await prisma.tbl_usuarios.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'No encontrado' });
+    const idRolFinal = d.id_rol ? Number(d.id_rol) : previo.id_rol;
+    const acceso = await resolverAccesoAmbito(idRolFinal, d, previo);
+    if (acceso.error) return res.status(400).json({ error: acceso.error });
     const data = {
       nombres: d.nombres ?? previo.nombres,
       correo: d.correo ?? previo.correo,
-      id_rol: d.id_rol ? Number(d.id_rol) : previo.id_rol,
+      id_rol: idRolFinal,
       id_tecnico: d.id_tecnico !== undefined ? (d.id_tecnico ? Number(d.id_tecnico) : null) : previo.id_tecnico,
       telefono: d.telefono ?? previo.telefono,
+      acceso_servicios: acceso.acceso_servicios,
+      acceso_proyectos: acceso.acceso_proyectos,
       user_id_modification: req.user.id,
       date_time_modification: new Date()
     };

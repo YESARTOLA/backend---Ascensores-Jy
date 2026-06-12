@@ -4,6 +4,11 @@ const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
+const {
+  aplicaAlcance,
+  tiposRegistroPermitidos,
+  clienteAlcanceWhere,
+} = require('../utils/alcanceUsuario');
 
 const normalizarClasificacion = (v) => {
   if (v === undefined || v === null || v === '') return null;
@@ -142,8 +147,11 @@ async function reemplazarPreciosCliente(tx, idCliente, payload, idUsuario) {
  *   estado           — 0 | 1 (activo/inactivo)
  *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato
  *   con_contrato     — '1' | '0' filtra si tiene archivo de contrato adjunto
+ *
+ * `user` aplica el ámbito (Servicios/Proyectos): si el rol está acotado, solo
+ * devuelve clientes con al menos un registro del ámbito permitido.
  */
-async function construirWhereClientes(query) {
+async function construirWhereClientes(query, user) {
   const { q, distrito, tipo_ascensor, clasificacion, estado, estado_contrato, con_contrato } = query;
   const where = { estado: 1 };
   if (q) {
@@ -183,6 +191,9 @@ async function construirWhereClientes(query) {
   if (con_contrato === '1') where.id_archivo_contrato = { not: null };
   else if (con_contrato === '0') where.id_archivo_contrato = null;
 
+  // Ámbito del usuario: limita a clientes con registros del/los tipo(s) permitido(s).
+  Object.assign(where, clienteAlcanceWhere(user));
+
   return where;
 }
 
@@ -191,6 +202,27 @@ async function construirWhereClientes(query) {
  */
 const listarClasificaciones = (_req, res) => {
   res.json({ data: CLASIFICACIONES });
+};
+
+/**
+ * Busca un cliente ACTIVO por su número de documento (RUC/DNI). Lo usa el
+ * wizard de conversión de leads para detectar si el documento ingresado ya
+ * pertenece a un cliente y vincularlo en vez de crear un duplicado. Devuelve
+ * el cliente o null; en ambos casos responde 200.
+ */
+const buscarPorDocumento = async (req, res) => {
+  try {
+    const numero = String(req.params.numero || '').trim();
+    if (!numero) return res.json({ data: null });
+    const cliente = await prisma.tbl_clientes.findFirst({
+      where: { numero_documento: numero, estado: 1 },
+      select: { id: true, nombre: true, numero_documento: true, tipo_documento: true }
+    });
+    res.json({ data: cliente || null });
+  } catch (err) {
+    console.error('[clientes.buscarPorDocumento]', err);
+    res.status(500).json({ error: 'Error al buscar cliente por documento' });
+  }
 };
 
 /**
@@ -213,7 +245,7 @@ const listarTiposAscensor = async (_req, res) => {
 
 const listar = async (req, res) => {
   try {
-    const where = await construirWhereClientes(req.query);
+    const where = await construirWhereClientes(req.query, req.user);
 
     const result = await paginar(
       prisma.tbl_clientes,
@@ -259,7 +291,7 @@ const exportar = async (req, res) => {
       return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
     }
 
-    const where = await construirWhereClientes(req.query);
+    const where = await construirWhereClientes(req.query, req.user);
     const clientes = await prisma.tbl_clientes.findMany({
       where,
       orderBy: { nombre: 'asc' },
@@ -293,6 +325,12 @@ const exportar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
+    if (aplicaAlcance(req.user)) {
+      const enAmbito = await prisma.tbl_clientes.findFirst({
+        where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
+      });
+      if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
@@ -313,6 +351,22 @@ const obtener = async (req, res) => {
 const vista360 = async (req, res) => {
   try {
     const id = Number(req.params.id);
+
+    // Ámbito del usuario: un cliente fuera del ámbito no es accesible ni por URL,
+    // y dentro de un cliente mixto solo se muestran los registros del ámbito.
+    const tipos = tiposRegistroPermitidos(req.user); // null (sin restricción) | ['servicio'|'proyecto']
+    const filtroServicio = tipos ? { tipo_registro: { in: tipos.length ? tipos : ['__sin_ambito__'] } } : {};
+    const filtroServicioRel = tipos ? { servicio: filtroServicio } : {};
+    const filtroCategoria = tipos
+      ? { categoria_funcional: { in: tipos.length ? tipos.map(t => (t === 'proyecto' ? 'PROYECTOS' : 'SERVICIOS')) : ['__sin_ambito__'] } }
+      : {};
+    if (aplicaAlcance(req.user)) {
+      const enAmbito = await prisma.tbl_clientes.findFirst({
+        where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
+      });
+      if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
@@ -321,7 +375,7 @@ const vista360 = async (req, res) => {
         precios: INCLUDE_PRECIOS,
         archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
         servicios: {
-          where: { estado: 1 },
+          where: { estado: 1, ...filtroServicio },
           orderBy: { id: 'desc' },
           take: 100,
           include: {
@@ -340,13 +394,13 @@ const vista360 = async (req, res) => {
           where: { estado: 1 },
           include: { ascensor: { select: { codigo: true } }, tipo_servicio: true }
         },
-        cobros: { where: { estado: 1 }, orderBy: { id: 'desc' } },
+        cobros: { where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' } },
         facturas: {
-          where: { estado: 1 }, orderBy: { id: 'desc' }, take: 50,
+          where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' }, take: 50,
           include: { archivo: true, servicio: { select: { codigo: true } } }
         },
         cotizaciones: {
-          where: { estado: 1 }, orderBy: { id: 'desc' }, take: 50,
+          where: { estado: 1, ...(tipos ? { tipo_servicio: filtroCategoria } : {}) }, orderBy: { id: 'desc' }, take: 50,
           include: {
             tipo_servicio: { select: { nombre: true } },
             versiones: {
@@ -361,6 +415,13 @@ const vista360 = async (req, res) => {
       }
     });
     if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    // Emergencias y mantenimientos son dominio de Servicios: se ocultan a un
+    // usuario cuyo ámbito sea solo Proyectos.
+    if (tipos && !tipos.includes('servicio')) {
+      cliente.emergencias = [];
+      cliente.mantenimientos = [];
+    }
 
     const idsServicios = cliente.servicios.map(s => s.id);
     const [entregas, documentosCliente] = await Promise.all([
@@ -575,4 +636,4 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, listarTiposAscensor, listarClasificaciones, exportar, obtener, vista360, crear, actualizar, cambiarEstado };
+module.exports = { listar, listarTiposAscensor, listarClasificaciones, buscarPorDocumento, exportar, obtener, vista360, crear, actualizar, cambiarEstado };

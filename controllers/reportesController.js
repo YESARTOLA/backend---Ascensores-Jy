@@ -6,8 +6,21 @@ const {
   ESTADOS_FACTURACION_COMPLETA
 } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
+const {
+  tiposRegistroPermitidos,
+  ascensorAlcanceWhere,
+  servicioAlcanceWhere,
+  porServicioRelacionWhere,
+} = require('../utils/alcanceUsuario');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
+
+// El usuario acotado solo a Proyectos no ve reportes de dominio Servicios
+// (emergencias, correctivos, mantenimientos, atención rápida).
+const sinAmbitoServicio = (req) => {
+  const t = tiposRegistroPermitidos(req.user);
+  return !!t && !t.includes('servicio');
+};
 
 const operativos = async (req, res) => {
   try {
@@ -21,8 +34,14 @@ const operativos = async (req, res) => {
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_ascensor) where.ascensores = { some: { id_ascensor: Number(id_ascensor), estado: 1 } };
     if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
-    // Separa Proyectos de Servicios operativos (no se mezclan en el reporte).
-    if (tipo_registro) where.tipo_registro = tipo_registro;
+    // Separa Proyectos de Servicios operativos (no se mezclan en el reporte) y
+    // acota al ámbito del usuario (Servicios/Proyectos).
+    const tiposAmbito = tiposRegistroPermitidos(req.user);
+    if (tipo_registro) {
+      where.tipo_registro = (tiposAmbito && !tiposAmbito.includes(tipo_registro)) ? '__sin_ambito__' : tipo_registro;
+    } else if (tiposAmbito) {
+      where.tipo_registro = { in: tiposAmbito.length ? tiposAmbito : ['__sin_ambito__'] };
+    }
     if (estado_servicio) where.estado_servicio = estado_servicio;
     if (id_tecnico) where.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
 
@@ -52,6 +71,7 @@ const operativos = async (req, res) => {
 
 const emergenciasAtendidas = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { desde, hasta, estado_emergencia, nivel_urgencia, id_cliente } = req.query;
     const where = { estado: 1 };
     if (desde || hasta) {
@@ -85,6 +105,7 @@ const emergenciasAtendidas = async (req, res) => {
 
 const mantenimientosCumplidos = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { desde, hasta, id_cliente, id_ascensor } = req.query;
     const where = {
       estado: 1,
@@ -133,6 +154,8 @@ const serviciosFinalizados = async (req, res) => {
     }
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_tecnico) where.OR = [{ id_tecnico_principal: Number(id_tecnico) }, { id_responsable_documentacion: Number(id_tecnico) }];
+    // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
+    Object.assign(where, porServicioRelacionWhere(req.user));
 
     const realizados = await prisma.tbl_servicios_realizados.findMany({
       where, orderBy: { fecha_realizacion: 'desc' },
@@ -173,6 +196,7 @@ const pendientesDeCobro = async (req, res) => {
       estado_cobro: { in: ['Pendiente de iniciar', 'En gestión'] }
     };
     if (id_cliente) where.id_cliente = Number(id_cliente);
+    Object.assign(where, porServicioRelacionWhere(req.user));
     const list = await prisma.tbl_cobros.findMany({
       where, orderBy: { id: 'desc' },
       include: { cliente: true, servicio: { include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } } } } }
@@ -195,6 +219,7 @@ const cobrosVencidos = async (req, res) => {
       fecha_proximo_abono: { lt: hoy }
     };
     if (id_cliente) where.id_cliente = Number(id_cliente);
+    Object.assign(where, porServicioRelacionWhere(req.user));
     const list = await prisma.tbl_cobros.findMany({
       where, orderBy: { fecha_proximo_abono: 'asc' },
       include: { cliente: true, servicio: { include: { ascensores: { where: { estado: 1 }, include: { ascensor: true } }, tipo_servicio: true } } }
@@ -215,15 +240,16 @@ const historialTecnicoAscensor = async (req, res) => {
     const { id_ascensor } = req.query;
     if (!id_ascensor) return res.status(400).json({ error: 'id_ascensor obligatorio' });
 
-    const ascensor = await prisma.tbl_ascensores.findUnique({
-      where: { id: Number(id_ascensor) },
+    const alcanceAsc = ascensorAlcanceWhere(req.user);
+    const ascensor = await prisma.tbl_ascensores.findFirst({
+      where: { id: Number(id_ascensor), ...alcanceAsc },
       include: { cliente: true }
     });
     if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
 
     const [servicios, emergencias, mantenimientos, eventos] = await Promise.all([
       prisma.tbl_servicios_proyectos.findMany({
-        where: { ascensores: { some: { id_ascensor: Number(id_ascensor), estado: 1 } }, estado: 1 },
+        where: { ascensores: { some: { id_ascensor: Number(id_ascensor), estado: 1 } }, estado: 1, ...servicioAlcanceWhere(req.user) },
         orderBy: { fecha_programada: 'desc' },
         include: {
           tipo_servicio: true,
@@ -250,7 +276,17 @@ const historialTecnicoAscensor = async (req, res) => {
     const sanit = ROLES_PRECIO.includes(req.user.rol_codigo)
       ? servicios
       : servicios.map(s => ({ ...s, precio_interno: null }));
-    res.json({ data: { ascensor, servicios: sanit, emergencias, mantenimientos, eventos } });
+    // Emergencias y mantenimientos son dominio Servicios: ocultos a ámbito solo Proyectos.
+    const soloProyectos = sinAmbitoServicio(req);
+    res.json({
+      data: {
+        ascensor,
+        servicios: sanit,
+        emergencias: soloProyectos ? [] : emergencias,
+        mantenimientos: soloProyectos ? [] : mantenimientos,
+        eventos
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error en historial técnico' });
@@ -261,7 +297,7 @@ const cobros = async (req, res) => {
   try {
     if (!ROLES_PRECIO.includes(req.user.rol_codigo)) return res.status(403).json({ error: 'No autorizado' });
     const list = await prisma.tbl_cobros.findMany({
-      where: { estado: 1 }, orderBy: { id: 'desc' },
+      where: { estado: 1, ...porServicioRelacionWhere(req.user) }, orderBy: { id: 'desc' },
       include: { cliente: true, servicio: true }
     });
     res.json({ data: list });
@@ -297,6 +333,7 @@ const tecnicos = async (_req, res) => {
 
 const correctivos = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { desde, hasta, id_cliente, estado_correctivo, nivel_urgencia } = req.query;
     const where = { estado: 1 };
     if (desde || hasta) {
@@ -329,6 +366,7 @@ const correctivos = async (req, res) => {
 
 const atencionesRapidas = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { desde, hasta, id_cliente, estado_atencion, nivel_urgencia, tipo_solicitud } = req.query;
     const where = { estado: 1 };
     if (desde || hasta) {
@@ -374,10 +412,10 @@ const leads = async (_req, res) => {
   }
 };
 
-const ascensores = async (_req, res) => {
+const ascensores = async (req, res) => {
   try {
     const list = await prisma.tbl_ascensores.findMany({
-      where: { estado: 1 },
+      where: { estado: 1, ...ascensorAlcanceWhere(req.user) },
       include: { cliente: true, _count: { select: { servicios_ascensores: true, emergencias: true } } }
     });
     res.json({ data: list });
@@ -387,8 +425,9 @@ const ascensores = async (_req, res) => {
   }
 };
 
-const mantenimientosVencidos = async (_req, res) => {
+const mantenimientosVencidos = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const hoy = inicioDelDiaLima();
     const list = await prisma.tbl_servicios_proyectos.findMany({
       where: {
@@ -415,7 +454,8 @@ const moraPorCliente = async (req, res) => {
       where: {
         estado: 1,
         saldo_pendiente: { gt: 0 },
-        fecha_proximo_abono: { lt: hoy }
+        fecha_proximo_abono: { lt: hoy },
+        ...porServicioRelacionWhere(req.user)
       },
       include: { cliente: true, servicio: true }
     });
@@ -443,7 +483,8 @@ const facturados = async (req, res) => {
         estado: 1,
         estado_facturacion: facturados
           ? { in: ESTADOS_FACTURACION_COMPLETA }
-          : { in: [ESTADO_FACTURACION_SIN, ESTADO_FACTURACION_PENDIENTE] }
+          : { in: [ESTADO_FACTURACION_SIN, ESTADO_FACTURACION_PENDIENTE] },
+        ...porServicioRelacionWhere(req.user)
       },
       include: {
         servicio: {
@@ -469,6 +510,9 @@ const abonosRegistrados = async (req, res) => {
       if (desde) where.fecha_pago.gte = parseYMDLima(desde);
       if (hasta) where.fecha_pago.lte = parseYMDFinDiaLima(hasta);
     }
+    // Ámbito del usuario: pago → cobro → servicio/proyecto.
+    const tAbonos = tiposRegistroPermitidos(req.user);
+    if (tAbonos) where.cobro = { is: { servicio: { is: { tipo_registro: { in: tAbonos.length ? tAbonos : ['__sin_ambito__'] } } } } };
     const pagos = await prisma.tbl_pagos.findMany({
       where, orderBy: { fecha_pago: 'desc' },
       include: { cobro: { include: { cliente: true, servicio: true } } }
@@ -508,6 +552,9 @@ const ingresosPorBanco = async (req, res) => {
       if (moneda) cuentaWhere.moneda = moneda;
       where.cuenta_bancaria = { is: cuentaWhere };
     }
+    // Ámbito del usuario: pago → cobro → servicio/proyecto.
+    const tIngresos = tiposRegistroPermitidos(req.user);
+    if (tIngresos) where.cobro = { is: { servicio: { is: { tipo_registro: { in: tIngresos.length ? tIngresos : ['__sin_ambito__'] } } } } };
 
     const pagos = await prisma.tbl_pagos.findMany({
       where,
@@ -608,6 +655,7 @@ const EJEC_CANCELADO = 'Cancelado';
  */
 const mantenimientosPorCliente = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { id_cliente, desde, hasta } = req.query;
     const { construirDatasetReporteMantenimientos } = require('./mantenimientosController');
     const idsCliente = id_cliente ? [Number(id_cliente)] : null;
@@ -685,6 +733,7 @@ const mantenimientosPorCliente = async (req, res) => {
  */
 const mantenimientosProgramadosSinServicio = async (req, res) => {
   try {
+    if (sinAmbitoServicio(req)) return res.json({ data: [] });
     const { desde, hasta } = req.query;
     const where = {
       estado: 1,

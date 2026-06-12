@@ -9,9 +9,25 @@ const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 
 const listar = async (req, res) => {
   try {
+    const { estado_atencion, nivel_urgencia, tipo_solicitud, q } = req.query;
+    const where = { estado: 1 };
+    if (estado_atencion) where.estado_atencion = estado_atencion;
+    if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
+    if (tipo_solicitud) where.tipo_solicitud = { contains: tipo_solicitud, mode: 'insensitive' };
+    // Buscador libre: contacto, teléfono, mensaje, tipo, y cliente/ascensor/edificio si están vinculados.
+    if (q) where.OR = [
+      { nombre_contacto: { contains: q, mode: 'insensitive' } },
+      { telefono: { contains: q, mode: 'insensitive' } },
+      { mensaje_rapido: { contains: q, mode: 'insensitive' } },
+      { tipo_solicitud: { contains: q, mode: 'insensitive' } },
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { codigo: { contains: q, mode: 'insensitive' } } },
+      { ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } },
+      { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } }
+    ];
     const result = await paginar(
       prisma.tbl_atenciones_rapidas,
-      { where: { estado: 1 }, orderBy: { id: 'desc' }, include: { cliente: true, ascensor: true } },
+      { where, orderBy: { id: 'desc' }, include: { cliente: true, ascensor: true } },
       req.query
     );
     res.json(result);
@@ -33,6 +49,7 @@ const crear = async (req, res) => {
         telefono: d.telefono,
         mensaje_rapido: d.mensaje_rapido || null,
         tipo_solicitud: d.tipo_solicitud || null,
+        responsable: d.responsable || null,
         nivel_urgencia: d.nivel_urgencia || 'media',
         estado_atencion: 'nueva',
         id_cliente: d.id_cliente ? Number(d.id_cliente) : null,
@@ -69,6 +86,7 @@ const actualizar = async (req, res) => {
         telefono: d.telefono ?? previo.telefono,
         mensaje_rapido: d.mensaje_rapido ?? previo.mensaje_rapido,
         tipo_solicitud: d.tipo_solicitud ?? previo.tipo_solicitud,
+        responsable: d.responsable ?? previo.responsable,
         nivel_urgencia: d.nivel_urgencia ?? previo.nivel_urgencia,
         estado_atencion: d.estado_atencion ?? previo.estado_atencion,
         id_cliente: d.id_cliente !== undefined ? (d.id_cliente ? Number(d.id_cliente) : null) : previo.id_cliente,

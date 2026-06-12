@@ -14,6 +14,8 @@ const findUserByEmail = async (correo) => {
       u.contrasena,
       u.id_rol,
       u.id_tecnico,
+      u.acceso_servicios,
+      u.acceso_proyectos,
       r.nombre AS rol,
       r.codigo AS rol_codigo,
       COALESCE(
@@ -33,7 +35,7 @@ const findUserByEmail = async (correo) => {
     LEFT JOIN tbl_permisos p ON rp.id_permiso = p.id AND p.estado = 1
     WHERE u.correo = $1
       AND u.estado = 1
-    GROUP BY u.id, u.nombres, u.correo, u.contrasena, u.id_rol, u.id_tecnico, r.nombre, r.codigo
+    GROUP BY u.id, u.nombres, u.correo, u.contrasena, u.id_rol, u.id_tecnico, u.acceso_servicios, u.acceso_proyectos, r.nombre, r.codigo
   `;
 
   const result = await pool.query(query, [correo]);
@@ -51,6 +53,7 @@ const findUserById = async (id) => {
   const query = `
     SELECT
       u.id, u.nombres, u.correo, u.id_rol, u.id_tecnico, u.telefono,
+      u.acceso_servicios, u.acceso_proyectos,
       r.nombre AS rol, r.codigo AS rol_codigo,
       COALESCE(
         json_agg(
@@ -68,7 +71,7 @@ const findUserById = async (id) => {
     LEFT JOIN tbl_roles_permisos rp ON r.id = rp.id_rol AND rp.estado = 1
     LEFT JOIN tbl_permisos p ON rp.id_permiso = p.id AND p.estado = 1
     WHERE u.id = $1 AND u.estado = 1
-    GROUP BY u.id, u.nombres, u.correo, u.id_rol, u.id_tecnico, u.telefono, r.nombre, r.codigo
+    GROUP BY u.id, u.nombres, u.correo, u.id_rol, u.id_tecnico, u.telefono, u.acceso_servicios, u.acceso_proyectos, r.nombre, r.codigo
   `;
   const result = await pool.query(query, [id]);
   return result.rows.length > 0 ? result.rows[0] : null;

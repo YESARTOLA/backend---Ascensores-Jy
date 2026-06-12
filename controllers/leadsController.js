@@ -345,9 +345,15 @@ const convertir = async (req, res) => {
     if (lead.estado_lead === ESTADO_LEAD_DESCARTADO) {
       return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de convertirlo' });
     }
-    if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || !d.fecha_programada || d.precio_interno === undefined) {
-      return res.status(400).json({ error: 'Faltan datos para convertir (cliente, ascensor, subtipo, fecha, precio)' });
+    if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || !d.fecha_programada) {
+      return res.status(400).json({ error: 'Faltan datos para convertir (cliente, ascensor, subtipo, fecha)' });
     }
+    // El precio es opcional: roles comerciales (Vendedora) no manejan precios.
+    // Si no llega, el servicio se crea con 0 (default de la columna) y el precio
+    // lo completa luego un rol con visibilidad de precios.
+    const precioInterno = (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')
+      ? 0
+      : d.precio_interno;
 
     // El tipo recibido es un SUBTIPO; se clasifica (SSoT) para derivar
     // tipo_registro y el módulo operativo destino.
@@ -387,20 +393,34 @@ const convertir = async (req, res) => {
           fecha_programada: parseYMDLima(d.fecha_programada),
           hora_programada: d.hora_programada || null,
           prioridad: d.prioridad || 'media',
-          precio_interno: d.precio_interno,
+          precio_interno: precioInterno,
           moneda,
           observaciones: d.observaciones || null,
           user_id_registration: req.user.id,
           ascensores: {
             create: [{
               id_ascensor: Number(d.id_ascensor),
-              monto: d.precio_interno,
+              monto: precioInterno,
               moneda,
               user_id_registration: req.user.id
             }]
           }
         }
       });
+      // Asignación opcional del técnico responsable hecha en la conversión: se
+      // registra como responsable principal del servicio recién creado.
+      if (d.id_tecnico) {
+        await tx.tbl_servicios_asignaciones.create({
+          data: {
+            id_servicio: s.id,
+            id_tecnico: Number(d.id_tecnico),
+            rol_asignacion: 'Responsable',
+            responsable_principal: 1,
+            asignado_por: req.user.id,
+            user_id_registration: req.user.id
+          }
+        });
+      }
       // Si el subtipo pertenece a un módulo operativo, crear su fila/plan para que
       // el servicio sea visible en Emergencias/Correctivos/Mantenimientos.
       if (clasifLead.modulo_asociado) {

@@ -30,6 +30,7 @@ const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { aplicaAlcance, tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
 
@@ -123,7 +124,16 @@ const listar = async (req, res) => {
     if (prioridad) where.prioridad = prioridad;
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_ascensor) where.ascensores = { some: { id_ascensor: Number(id_ascensor), estado: 1 } };
-    if (tipo_registro) where.tipo_registro = tipo_registro;
+    // Ámbito del usuario: acota el tipo_registro visible. Si pide uno fuera de su
+    // ámbito, no devuelve nada; si no pide ninguno, se limita a los permitidos.
+    const tiposPermitidos = tiposRegistroPermitidos(req.user);
+    if (tipo_registro) {
+      where.tipo_registro = (tiposPermitidos && !tiposPermitidos.includes(tipo_registro))
+        ? '__sin_ambito__'
+        : tipo_registro;
+    } else if (tiposPermitidos) {
+      where.tipo_registro = { in: tiposPermitidos.length ? tiposPermitidos : ['__sin_ambito__'] };
+    }
     if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
     if (origen) where.origen = origen;
     if (desde || hasta) {
@@ -204,6 +214,13 @@ const obtener = async (req, res) => {
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    // Ámbito: un servicio/proyecto fuera del ámbito no es accesible ni por URL.
+    if (aplicaAlcance(req.user)) {
+      const permitidos = tiposRegistroPermitidos(req.user);
+      if (!permitidos.includes(servicio.tipo_registro)) {
+        return res.status(404).json({ error: 'Servicio no encontrado' });
+      }
+    }
     res.json({ data: sanitizarPrecio(servicio, req.user.rol_codigo) });
   } catch (err) {
     console.error(err);
@@ -250,6 +267,12 @@ const crear = async (req, res) => {
     // body, para garantizar una sola fuente de verdad.
     const tipoRegistro = clasificacion.tipo_registro;
     const origenDerivado = clasificacion.modulo_asociado || 'directo';
+
+    // Ámbito: un usuario acotado no puede crear registros fuera de su ámbito.
+    const permitidosCrear = tiposRegistroPermitidos(req.user);
+    if (permitidosCrear && !permitidosCrear.includes(tipoRegistro)) {
+      return res.status(403).json({ error: 'No tiene acceso para crear registros de este ámbito' });
+    }
 
     const codigo = await generarCodigoServicio();
     const servicio = await prisma.$transaction(async (tx) => {
@@ -1168,6 +1191,9 @@ const realizados = async (req, res) => {
         { cliente: { nombre: { contains: q, mode: 'insensitive' } } }
       ];
     }
+    // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
+    const tiposRealizados = tiposRegistroPermitidos(req.user);
+    if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };
     if (Object.keys(servicioWhere).length) where.servicio = servicioWhere;
     const result = await paginar(
       prisma.tbl_servicios_realizados,
@@ -1391,9 +1417,68 @@ const eliminarGuia = async (req, res) => {
   }
 };
 
+/**
+ * Soft-delete de un servicio/proyecto: estado = 0. Da de baja también los
+ * artefactos visibles en otros módulos (evento de calendario, folder contable
+ * de servicios realizados, recordatorios) y libera a los técnicos asignados que
+ * no tengan otros servicios activos. No borra físicamente: el historial queda
+ * auditado y las relaciones se preservan.
+ */
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: { asignaciones: { where: { estado: 1 } } }
+    });
+    if (!previo) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+    const servicio = await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    // Evento de calendario: baja lógica para que deje de listarse (filtra estado=1).
+    await prisma.tbl_calendario_eventos.updateMany({
+      where: { id_servicio: id, estado: 1 },
+      data: { estado: 0, estado_evento: 'cancelado', user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    // Folder contable (servicios realizados): baja lógica si existía.
+    await prisma.tbl_servicios_realizados.updateMany({
+      where: { id_servicio: id, estado: 1 },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    // Recordatorios automáticos vinculados al servicio: baja lógica.
+    await prisma.tbl_recordatorios.updateMany({
+      where: { id_servicio: id, estado: 1 },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    // Liberar técnicos: volver a Disponible si no quedan otros servicios activos.
+    for (const a of previo.asignaciones) {
+      const otrasActivas = await prisma.tbl_servicios_asignaciones.count({
+        where: {
+          id_tecnico: a.id_tecnico, estado: 1, id_servicio: { not: id },
+          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+        }
+      });
+      if (otrasActivas === 0) {
+        await prisma.tbl_tecnicos.update({ where: { id: a.id_tecnico }, data: { estado_operativo: 'Disponible' } });
+      }
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'DELETE', valor_anterior: previo, valor_nuevo: servicio, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar servicio' });
+  }
+};
+
 module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
-  asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, realizados,
+  asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
   promoverBorrador, revisarServicio,
   crearGuia, actualizarGuia, eliminarGuia
 };

@@ -17,6 +17,7 @@ router.post('/:id/asignar', permitirRoles('super_admin', 'admin', 'coordinador')
 router.post('/:id/iniciar', c.iniciarServicio);
 router.post('/:id/finalizar', c.finalizarServicio);
 router.post('/:id/cancelar', permitirRoles('super_admin', 'admin'), c.cancelar);
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 router.post('/:id/promover', permitirRoles('super_admin', 'admin', 'coordinador'), c.promoverBorrador);
 router.post('/:id/revisar', permitirRoles('super_admin', 'admin', 'contabilidad'), c.revisarServicio);
 
