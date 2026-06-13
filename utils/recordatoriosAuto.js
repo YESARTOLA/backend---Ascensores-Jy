@@ -28,18 +28,21 @@ const ESTADOS_SERVICIO_POST_FINALIZACION = [
   'Cerrado'
 ];
 
+// Espejo de frontend/src/utils/visibilidadCalendario.js (CATALOGO_TIPOS_EVENTO).
+// Mantener ambos en sincronía: el calendario pinta por tipo desde el catálogo del
+// frontend, este mapa fija el color persistido en los recordatorios/eventos nuevos.
 const COLORES = {
-  servicio: '#0ea5e9',
-  mantenimiento: '#22c55e',
-  emergencia: '#ef4444',
-  cobro: '#f59e0b',
-  manual: '#8b5cf6',
-  observacion: '#f97316',
-  observacion_alerta: '#dc2626',
-  cotizacion_urgente: '#dc2626',
-  servicio_finalizado_revisar:  '#f59e0b', // coordinador → revisar trabajo/informe
-  servicio_finalizado_facturar: '#8b5cf6', // contabilidad → emitir factura
-  servicio_finalizado_aviso:    '#0ea5e9'  // admin → solo aviso informativo
+  servicio: '#0ea5e9',                       // celeste
+  mantenimiento: '#16a34a',                  // verde
+  emergencia: '#dc2626',                     // rojo
+  cobro: '#9333ea',                          // púrpura
+  manual: '#475569',                         // gris pizarra
+  observacion: '#0d9488',                    // turquesa
+  observacion_alerta: '#e11d48',             // rosa-rojo
+  cotizacion_urgente: '#c026d3',             // fucsia
+  servicio_finalizado_revisar:  '#65a30d',   // coordinador → revisar trabajo/informe (lima)
+  servicio_finalizado_facturar: '#4f46e5',   // contabilidad → emitir factura (índigo)
+  servicio_finalizado_aviso:    '#475569'    // admin → solo aviso informativo (gris)
 };
 
 const ESTADOS_TERMINALES_SERVICIO = ['Cerrado', 'Cancelado', 'Cobrado total', 'Facturado'];
@@ -116,7 +119,11 @@ async function sincronizarRecordatorioMantenimientoPlan(planId) {
   if (!planId) return;
   const p = await prisma.tbl_mantenimientos_planes.findUnique({
     where: { id: planId },
-    include: { cliente: true, ascensor: true, tipo_servicio: true }
+    include: {
+      cliente: true,
+      tipo_servicio: true,
+      ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } }
+    }
   });
   if (!p || p.estado !== 1 || ESTADOS_TERMINALES_PLAN.includes(p.estado_plan)) {
     return descartarAuto({ tipo: 'mantenimiento', id_mantenimiento_plan: planId });
@@ -127,7 +134,8 @@ async function sincronizarRecordatorioMantenimientoPlan(planId) {
     ? 'eventual'
     : (fr ? fr.etiqueta.toLowerCase() : (p.frecuencia || ''));
   const titulo = `Mantenimiento ${detalleFrecuencia}${p.tipo_servicio?.nombre ? ' · ' + p.tipo_servicio.nombre : ''}`.trim();
-  const descripcion = `${p.cliente?.nombre || ''}${p.ascensor?.codigo ? ` · ${p.ascensor.codigo}` : ''}`;
+  const codigosAsc = (p.ascensores || []).map(a => a.ascensor?.codigo).filter(Boolean).join(', ');
+  const descripcion = `${p.cliente?.nombre || ''}${codigosAsc ? ` · ${codigosAsc}` : ''}`;
   return upsertAuto({
     filtro: { tipo: 'mantenimiento', id_mantenimiento_plan: planId },
     datos: {

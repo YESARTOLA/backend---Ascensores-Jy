@@ -6,6 +6,9 @@ const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServici
 const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
+const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
+const { estaServicioFinalizado } = require('../utils/estadoServicio');
+const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 
 // Un plan admite cupo de mantenimientos gratuitos solo si su subtipo pertenece
 // al módulo Mantenimientos (preventivo). SSoT: se deriva de modulo_asociado.
@@ -25,9 +28,11 @@ const listar = async (req, res) => {
     if (q) where.OR = [
       // Nombre del cliente
       { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
-      // Ascensor del plan: código y tipo
-      { ascensor: { codigo: { contains: q, mode: 'insensitive' } } },
-      { ascensor: { tipo: { contains: q, mode: 'insensitive' } } },
+      // Edificio / obra, código y tipo de alguno de los ascensores del plan
+      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
+      { ascensores: { some: { estado: 1, ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } } } },
+      { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } },
+      { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
       // Tipo de servicio
       { tipo_servicio: { nombre: { contains: q, mode: 'insensitive' } } },
       // Algún servicio generado por este plan
@@ -44,7 +49,7 @@ const listar = async (req, res) => {
         orderBy: { id: 'desc' },
         include: {
           cliente: true,
-          ascensor: true,
+          ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
           tipo_servicio: true,
           servicios_generados: {
             where: { estado: 1 },
@@ -176,19 +181,28 @@ function _normalizarPlanInput(d, tipoServicio) {
   };
 }
 
-function _tituloBase(plan, tipoServicioNombre) {
-  if (plan.tipo_plan === 'eventual') {
-    return `Mantenimiento eventual${tipoServicioNombre ? ' · ' + tipoServicioNombre : ''}`;
-  }
-  const fr = obtenerFrecuencia(plan.frecuencia);
-  const etiqueta = fr ? fr.etiqueta.toLowerCase() : plan.frecuencia;
-  return `Mantenimiento ${etiqueta}${tipoServicioNombre ? ' · ' + tipoServicioNombre : ''}`;
+/**
+ * Nombre del edificio/obra de un plan, tomado del primer ascensor (de la junction)
+ * que tenga edificio con nombre. Requiere que `ascensores` venga incluido con
+ * `ascensor.edificio`.
+ */
+function _edificioNombrePlan(ascensoresJunction) {
+  return (ascensoresJunction || []).map(a => a.ascensor?.edificio?.nombre).find(Boolean) || null;
+}
+
+/**
+ * Nomenclatura corta del mantenimiento generado por un plan: "Mant. <Edificio/Obra>".
+ * El tipo de servicio y la frecuencia se muestran en sus propias columnas/campos,
+ * así que no se repiten en el título. Sin edificio, cae a "Mantenimiento".
+ */
+function _tituloBase(edificioNombre) {
+  return edificioNombre ? `Mant. ${edificioNombre}` : 'Mantenimiento';
 }
 
 const crear = async (req, res) => {
   try {
     const d = req.body;
-    if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || !d.fecha_inicio) {
+    if (!d.id_cliente || !d.id_tipo_servicio || !d.fecha_inicio) {
       return res.status(400).json({ error: 'Faltan campos obligatorios' });
     }
 
@@ -196,7 +210,8 @@ const crear = async (req, res) => {
 
     // El precio se hereda del cliente (tbl_clientes_precios por tipo de servicio).
     // Si no hay precio configurado para ese par, no se permite crear el plan:
-    // primero hay que registrarlo en el módulo de Clientes.
+    // primero hay que registrarlo en el módulo de Clientes. Ese precio es el total
+    // por mantenimiento y se reparte entre los ascensores del plan.
     const precioCliente = await prisma.tbl_clientes_precios.findUnique({
       where: { id_cliente_id_tipo_servicio: { id_cliente: Number(d.id_cliente), id_tipo_servicio: Number(d.id_tipo_servicio) } }
     });
@@ -205,6 +220,11 @@ const crear = async (req, res) => {
         error: `Configure primero el precio del cliente para el tipo de servicio "${tipoServicio?.nombre || ''}" en el módulo de Clientes.`
       });
     }
+
+    // Ascensores del plan con su monto (el precio del catálogo repartido). Valida
+    // pertenencia al cliente y que la suma de montos cuadre con el precio total.
+    const validacion = await validarAscensores(d.ascensores, d.id_cliente, precioCliente.precio, precioCliente.moneda);
+    if (!validacion.ok) return res.status(400).json({ error: validacion.error });
 
     let normalizado;
     try {
@@ -218,24 +238,39 @@ const crear = async (req, res) => {
     const primerServicioGratuito = normalizado.cantidad_mantenimientos_gratuitos >= 1;
 
     const resultado = await prisma.$transaction(async (tx) => {
+      const monedaServicio = precioCliente.moneda || 'PEN';
       const plan = await tx.tbl_mantenimientos_planes.create({
         data: {
           id_cliente: Number(d.id_cliente),
-          id_ascensor: Number(d.id_ascensor),
           id_tipo_servicio: Number(d.id_tipo_servicio),
           ...normalizado,
           fecha_inicio: parseYMDLima(d.fecha_inicio),
           hora_programada: d.hora_programada || null,
           estado_plan: 'activo',
           observaciones: d.observaciones || null,
-          user_id_registration: req.user.id
+          user_id_registration: req.user.id,
+          ascensores: {
+            create: validacion.items.map(it => ({
+              id_ascensor: it.id_ascensor,
+              monto: it.monto,
+              moneda: monedaServicio,
+              user_id_registration: req.user.id
+            }))
+          }
         }
       });
 
-      const tituloBase = _tituloBase(plan, tipoServicio?.nombre);
+      // Nombre del edificio/obra (del primer ascensor) para el título corto.
+      const primerAsc = await tx.tbl_ascensores.findUnique({
+        where: { id: validacion.items[0].id_ascensor },
+        include: { edificio: { select: { nombre: true } } }
+      });
+      const tituloBase = _tituloBase(primerAsc?.edificio?.nombre || null);
       const codigo = await generarCodigoServicio();
-      const precioServicio = Number(precioCliente.precio);
-      const monedaServicio = precioCliente.moneda || 'PEN';
+      // El precio total por mantenimiento = suma de montos por ascensor (= precio
+      // del catálogo, ya validado). Cada ascensor del plan se materializa en el
+      // servicio con su parte.
+      const precioServicio = validacion.suma;
       const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo,
@@ -256,12 +291,12 @@ const crear = async (req, res) => {
           es_mantenimiento_gratuito: primerServicioGratuito ? 1 : 0,
           user_id_registration: req.user.id,
           ascensores: {
-            create: [{
-              id_ascensor: Number(d.id_ascensor),
-              monto: precioServicio,
+            create: validacion.items.map(it => ({
+              id_ascensor: it.id_ascensor,
+              monto: it.monto,
               moneda: monedaServicio,
               user_id_registration: req.user.id
-            }]
+            }))
           }
         }
       });
@@ -307,14 +342,15 @@ const actualizar = async (req, res) => {
     });
     if (!previo) return res.status(404).json({ error: 'No encontrado' });
 
-    // Cliente y ascensor son inmutables: el plan es 1-a-1 con un ascensor y
-    // ya existen servicios materializados apuntando al cliente/ascensor
-    // originales. Cambiarlos rompería historial y reportes.
+    // Cliente y ascensores son inmutables: ya existen servicios materializados
+    // apuntando al cliente y a los ascensores originales. Cambiarlos rompería
+    // historial y reportes; para otro cliente o conjunto de ascensores se crea
+    // un plan nuevo.
     if (d.id_cliente !== undefined && Number(d.id_cliente) !== previo.id_cliente) {
       return res.status(409).json({ error: 'El cliente del plan no se puede cambiar. Cree un plan nuevo para otro cliente.' });
     }
-    if (d.id_ascensor !== undefined && Number(d.id_ascensor) !== previo.id_ascensor) {
-      return res.status(409).json({ error: 'El ascensor del plan no se puede cambiar. Cree un plan nuevo para otro ascensor.' });
+    if (d.ascensores !== undefined) {
+      return res.status(409).json({ error: 'Los ascensores del plan no se pueden cambiar. Cree un plan nuevo para otro conjunto de ascensores.' });
     }
 
     const idTipoFinal = d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio;
@@ -374,10 +410,11 @@ const actualizar = async (req, res) => {
       }
 
       if (requiereRegenerar && plan.cantidad_mantenimientos > 1) {
-        const tipoServicio = plan.id_tipo_servicio === previo.id_tipo_servicio
-          ? previo.tipo_servicio
-          : await tx.tbl_tipos_servicio.findUnique({ where: { id: plan.id_tipo_servicio } });
-        const tituloBase = _tituloBase(plan, tipoServicio?.nombre);
+        const primerAsc = await tx.tbl_mantenimientos_planes_ascensores.findFirst({
+          where: { id_plan: plan.id, estado: 1 },
+          include: { ascensor: { include: { edificio: { select: { nombre: true } } } } }
+        });
+        const tituloBase = _tituloBase(primerAsc?.ascensor?.edificio?.nombre || null);
         const fechasTeoricas = calcularFechasProgramacion(
           plan.fecha_inicio,
           plan.frecuencia,
@@ -434,20 +471,6 @@ const actualizar = async (req, res) => {
  *     un servicio del plan)
  */
 /**
- * Devuelve el precio configurado para (cliente, tipo de servicio) o null si
- * no existe. Lanza si el cliente no tiene precio registrado y `obligatorio` es true.
- */
-async function obtenerPrecioCliente(tx, idCliente, idTipoServicio, { obligatorio = false } = {}) {
-  const fila = await tx.tbl_clientes_precios.findUnique({
-    where: { id_cliente_id_tipo_servicio: { id_cliente: idCliente, id_tipo_servicio: idTipoServicio } }
-  });
-  if (!fila && obligatorio) {
-    throw new Error('Configure primero el precio del cliente para este tipo de servicio (módulo Clientes → Precios).');
-  }
-  return fila || null;
-}
-
-/**
  * Materializa un evento del calendario como servicio real.
  *
  * `overrides`:
@@ -459,7 +482,7 @@ async function obtenerPrecioCliente(tx, idCliente, idTipoServicio, { obligatorio
  */
 async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {}) {
   const codigo = await generarCodigoServicio();
-  const tituloBase = _tituloBase(plan, plan.tipo_servicio?.nombre);
+  const tituloBase = _tituloBase(_edificioNombrePlan(plan.ascensores));
 
   const horaProgramada = overrides.hora_programada || plan.hora_programada || null;
   const ymdEvento = ymdLima(evento.fecha_inicio);
@@ -470,18 +493,28 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
   const fechaEventoNueva = combinarFechaHoraLima(ymdFinal, horaProgramada);
   const cambioFecha = ymdEvento !== ymdFinal || evento.fecha_inicio.getTime() !== fechaEventoNueva.getTime();
 
+  // Ascensores que cubre el plan (junction). El precio total del mantenimiento se
+  // reparte entre ellos: por defecto se respetan los montos pactados en el plan;
+  // si llega un override de precio, se reparte parejo entre esos mismos ascensores.
+  const ascensoresPlan = (plan.ascensores || []).filter(a => a.estado === 1);
+  if (ascensoresPlan.length === 0) {
+    throw new Error('El plan no tiene ascensores asociados');
+  }
+
   let precio;
   let moneda;
+  let montosPorAscensor;
   if (overrides.precio !== undefined && overrides.precio !== null && overrides.precio !== '') {
     precio = Number(overrides.precio);
     if (!Number.isFinite(precio) || precio < 0) {
       throw new Error('Precio inválido');
     }
-    moneda = overrides.moneda || 'PEN';
+    moneda = overrides.moneda || ascensoresPlan[0].moneda || 'PEN';
+    montosPorAscensor = repartirParejo(precio, ascensoresPlan.length);
   } else {
-    const fila = await obtenerPrecioCliente(tx, plan.id_cliente, plan.id_tipo_servicio, { obligatorio: true });
-    precio = Number(fila.precio);
-    moneda = fila.moneda || 'PEN';
+    montosPorAscensor = ascensoresPlan.map(a => Number(a.monto));
+    precio = montosPorAscensor.reduce((acc, m) => acc + m, 0);
+    moneda = ascensoresPlan[0].moneda || 'PEN';
   }
 
   const cupoGratuito = Number(plan.cantidad_mantenimientos_gratuitos || 0);
@@ -519,12 +552,12 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
       es_mantenimiento_gratuito: esGratuito ? 1 : 0,
       user_id_registration: userId,
       ascensores: {
-        create: [{
-          id_ascensor: plan.id_ascensor,
-          monto: precio,
+        create: ascensoresPlan.map((a, i) => ({
+          id_ascensor: a.id_ascensor,
+          monto: montosPorAscensor[i],
           moneda,
           user_id_registration: userId
-        }]
+        }))
       }
     }
   });
@@ -552,7 +585,7 @@ const materializarEvento = async (req, res) => {
     const idEvento = Number(req.params.id);
     const evento = await prisma.tbl_calendario_eventos.findUnique({
       where: { id: idEvento },
-      include: { mantenimiento_plan: { include: { tipo_servicio: true } } }
+      include: { mantenimiento_plan: { include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { nombre: true } } } } } } } } }
     });
     if (!evento) return res.status(404).json({ error: 'Evento no encontrado' });
     if (!evento.id_mantenimiento_plan) {
@@ -600,7 +633,7 @@ const materializarEvento = async (req, res) => {
 async function materializarSiguienteEventoDelPlan({ idPlan, fechaServicioFinalizado, userId }) {
   const plan = await prisma.tbl_mantenimientos_planes.findUnique({
     where: { id: idPlan },
-    include: { tipo_servicio: true }
+    include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { nombre: true } } } } } } }
   });
   if (!plan || plan.estado !== 1 || plan.estado_plan !== 'activo' || plan.tipo_plan !== 'continuo') {
     return null;
@@ -687,6 +720,24 @@ function _proyectarFechasPlanContinuo(plan, { desde, hasta }) {
 }
 
 /**
+ * Resume una lista de filas de junction (con `ascensor` + `edificio`) en los
+ * campos de display que consumen la pestaña de instancias y los reportes:
+ * arreglo de ascensores, edificio (del primero con dato), y códigos/ubicaciones/
+ * tipos unidos por coma. Fuente única para no repetir el mapeo por todos lados.
+ */
+function _resumenAscensores(filas) {
+  const ascs = (filas || []).map(f => f.ascensor).filter(Boolean);
+  return {
+    ascensores: ascs.map(a => ({ id: a.id, codigo: a.codigo, ubicacion: a.ubicacion, tipo: a.tipo })),
+    edificio_nombre: ascs.map(a => a.edificio?.nombre).find(Boolean) || null,
+    ascensor_codigo: ascs.map(a => a.codigo).filter(Boolean).join(', ') || null,
+    ascensor_ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', ') || null,
+    ascensor_tipo: ascs.map(a => a.tipo).filter(Boolean).join(', ') || null,
+    ids_ascensor: ascs.map(a => a.id)
+  };
+}
+
+/**
  * Obtiene las instancias de mantenimiento (materializadas + futuras) aplicando
  * filtros multi (cliente, ascensor) y rango de fechas. Helper puro usado tanto
  * por listarInstancias (pestaña) como por exportar.
@@ -707,30 +758,28 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
     if (hasta) wherePlanFecha.fecha_programada.lte = parseYMDFinDiaLima(hasta);
   }
 
-  // 1. Servicios ya materializados de planes
+  // 1. Servicios ya materializados de planes. Los ascensores se leen de la propia
+  //    junction del servicio (lo que realmente se ejecutó), no del plan.
   const servicios = await prisma.tbl_servicios_proyectos.findMany({
     where: wherePlanFecha,
     orderBy: { fecha_programada: 'desc' },
     include: {
       cliente: { select: { id: true, nombre: true } },
       tipo_servicio: { select: { id: true, nombre: true } },
-      mantenimiento_plan: {
-        select: {
-          id: true,
-          tipo_plan: true,
-          frecuencia: true,
-          id_ascensor: true,
-          ascensor: { select: { id: true, codigo: true, ubicacion: true, tipo: true, edificio: { select: { id: true, nombre: true } } } }
-        }
+      ascensores: {
+        where: { estado: 1 },
+        include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, tipo: true, edificio: { select: { id: true, nombre: true } } } } }
       },
+      mantenimiento_plan: { select: { id: true, tipo_plan: true, frecuencia: true } },
       historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } },
       servicio_realizado: { select: { fecha_realizacion: true } }
     }
   });
 
   const instanciasServicios = servicios
-    .filter(s => !ids_ascensor || ids_ascensor.includes(s.mantenimiento_plan?.id_ascensor))
-    .map(s => {
+    .map(s => ({ s, resumen: _resumenAscensores(s.ascensores) }))
+    .filter(({ resumen }) => !ids_ascensor || resumen.ids_ascensor.some(id => ids_ascensor.includes(id)))
+    .map(({ s, resumen }) => {
       const ej = derivarEjecucion(s);
       return {
         tipo_instancia: 'servicio',
@@ -738,11 +787,11 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         codigo_servicio: s.codigo,
         id_plan: s.id_mantenimiento_plan,
         id_cliente: s.id_cliente,
-        cliente_nombre: s.mantenimiento_plan?.ascensor?.edificio?.nombre || s.cliente?.nombre || null,
-        id_ascensor: s.mantenimiento_plan?.id_ascensor || null,
-        ascensor_codigo: s.mantenimiento_plan?.ascensor?.codigo || null,
-        ascensor_ubicacion: s.mantenimiento_plan?.ascensor?.ubicacion || null,
-        ascensor_tipo: s.mantenimiento_plan?.ascensor?.tipo || null,
+        cliente_nombre: resumen.edificio_nombre || s.cliente?.nombre || null,
+        ascensores: resumen.ascensores,
+        ascensor_codigo: resumen.ascensor_codigo,
+        ascensor_ubicacion: resumen.ascensor_ubicacion,
+        ascensor_tipo: resumen.ascensor_tipo,
         tipo_servicio: s.tipo_servicio?.nombre || null,
         es_mantenimiento_gratuito: s.es_mantenimiento_gratuito === 1,
         fecha_programada: s.fecha_programada,
@@ -766,7 +815,9 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
   if ((ids_cliente && ids_cliente.length > 0) || (ids_ascensor && ids_ascensor.length > 0)) {
     whereEventos.mantenimiento_plan = { is: {} };
     if (ids_cliente && ids_cliente.length > 0) whereEventos.mantenimiento_plan.is.id_cliente = { in: ids_cliente };
-    if (ids_ascensor && ids_ascensor.length > 0) whereEventos.mantenimiento_plan.is.id_ascensor = { in: ids_ascensor };
+    if (ids_ascensor && ids_ascensor.length > 0) {
+      whereEventos.mantenimiento_plan.is.ascensores = { some: { estado: 1, id_ascensor: { in: ids_ascensor } } };
+    }
   }
   if (desde || hasta) {
     whereEventos.fecha_inicio = {};
@@ -783,9 +834,11 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
             select: {
               id: true,
               id_cliente: true,
-              id_ascensor: true,
               cliente: { select: { id: true, nombre: true } },
-              ascensor: { select: { id: true, codigo: true, ubicacion: true, tipo: true, edificio: { select: { id: true, nombre: true } } } },
+              ascensores: {
+                where: { estado: 1 },
+                include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, tipo: true, edificio: { select: { id: true, nombre: true } } } } }
+              },
               tipo_servicio: { select: { id: true, nombre: true } }
             }
           }
@@ -794,26 +847,29 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
 
   const instanciasFuturas = eventos
     .filter(e => e.mantenimiento_plan)
-    .map(e => ({
-      tipo_instancia: 'evento_futuro',
-      id_servicio: null,
-      codigo_servicio: null,
-      id_evento: e.id,
-      id_plan: e.id_mantenimiento_plan,
-      id_cliente: e.mantenimiento_plan.id_cliente,
-      cliente_nombre: e.mantenimiento_plan.ascensor?.edificio?.nombre || e.mantenimiento_plan.cliente?.nombre || null,
-      id_ascensor: e.mantenimiento_plan.id_ascensor,
-      ascensor_codigo: e.mantenimiento_plan.ascensor?.codigo || null,
-      ascensor_ubicacion: e.mantenimiento_plan.ascensor?.ubicacion || null,
-      ascensor_tipo: e.mantenimiento_plan.ascensor?.tipo || null,
-      tipo_servicio: e.mantenimiento_plan.tipo_servicio?.nombre || null,
-      es_mantenimiento_gratuito: false,
-      fecha_programada: e.fecha_inicio,
-      estado_ejecucion: 'Pendiente',
-      fecha_inicio_real: null,
-      fecha_fin_real: null,
-      dias_ejecucion: null
-    }));
+    .map(e => {
+      const resumen = _resumenAscensores(e.mantenimiento_plan.ascensores);
+      return {
+        tipo_instancia: 'evento_futuro',
+        id_servicio: null,
+        codigo_servicio: null,
+        id_evento: e.id,
+        id_plan: e.id_mantenimiento_plan,
+        id_cliente: e.mantenimiento_plan.id_cliente,
+        cliente_nombre: resumen.edificio_nombre || e.mantenimiento_plan.cliente?.nombre || null,
+        ascensores: resumen.ascensores,
+        ascensor_codigo: resumen.ascensor_codigo,
+        ascensor_ubicacion: resumen.ascensor_ubicacion,
+        ascensor_tipo: resumen.ascensor_tipo,
+        tipo_servicio: e.mantenimiento_plan.tipo_servicio?.nombre || null,
+        es_mantenimiento_gratuito: false,
+        fecha_programada: e.fecha_inicio,
+        estado_ejecucion: 'Pendiente',
+        fecha_inicio_real: null,
+        fecha_fin_real: null,
+        dias_ejecucion: null
+      };
+    });
 
   let todas = [...instanciasServicios, ...instanciasFuturas];
   if (estado_ejecucion) {
@@ -846,14 +902,14 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
 async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
   const where = { estado: 1, estado_plan: 'activo' };
   if (ids_cliente && ids_cliente.length > 0) where.id_cliente = { in: ids_cliente };
-  if (ids_ascensor && ids_ascensor.length > 0) where.id_ascensor = { in: ids_ascensor };
+  if (ids_ascensor && ids_ascensor.length > 0) where.ascensores = { some: { estado: 1, id_ascensor: { in: ids_ascensor } } };
 
   const planes = await prisma.tbl_mantenimientos_planes.findMany({
     where,
-    orderBy: [{ id_cliente: 'asc' }, { id_ascensor: 'asc' }],
+    orderBy: [{ id_cliente: 'asc' }, { id: 'asc' }],
     include: {
       cliente: true,
-      ascensor: { include: { edificio: { select: { id: true, nombre: true, distrito: true } } } },
+      ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true, distrito: true } } } } } },
       tipo_servicio: true,
       servicios_generados: {
         where: { estado: 1 },
@@ -932,6 +988,7 @@ async function _construirDatasetReporte({ idsCliente, idsAscensor, estadoEjecuci
   const proyecciones = [];
   for (const plan of planes) {
     if (plan.tipo_plan !== 'continuo') continue;
+    const resumen = _resumenAscensores(plan.ascensores);
     const fechas = _proyectarFechasPlanContinuo(plan, { desde, hasta });
     for (const f of fechas) {
       const clave = `${plan.id}|${_ymd(f)}`;
@@ -942,10 +999,10 @@ async function _construirDatasetReporte({ idsCliente, idsAscensor, estadoEjecuci
         codigo_servicio: null,
         id_plan: plan.id,
         id_cliente: plan.id_cliente,
-        cliente_nombre: plan.ascensor?.edificio?.nombre || plan.cliente?.nombre || null,
-        id_ascensor: plan.id_ascensor,
-        ascensor_codigo: plan.ascensor?.codigo || null,
-        ascensor_ubicacion: plan.ascensor?.ubicacion || null,
+        cliente_nombre: resumen.edificio_nombre || plan.cliente?.nombre || null,
+        ascensores: resumen.ascensores,
+        ascensor_codigo: resumen.ascensor_codigo,
+        ascensor_ubicacion: resumen.ascensor_ubicacion,
         tipo_servicio: plan.tipo_servicio?.nombre || null,
         es_mantenimiento_gratuito: false,
         fecha_programada: f,
@@ -1057,9 +1114,96 @@ const exportar = async (req, res) => {
   }
 };
 
+/**
+ * Soft-delete de un plan de mantenimiento (estado = 0). Solo Super Admin.
+ *
+ * BLOQUEO: no se permite borrar si alguno de los servicios generados por el
+ * plan ya fue ejecutado (finalizado) o ya tiene abonos registrados — eso
+ * borraría historial operativo o ingresos reales. En ese caso el SA debe
+ * gestionar/anular esas instancias primero.
+ *
+ * Si está limpio: da de baja en cascada cada servicio generado (pendiente) vía
+ * el motor de reversión, cancela TODOS los eventos de calendario del plan
+ * (incluidos los futuros aún sin servicio materializado), descarta sus
+ * recordatorios, purga Wasabi y libera técnicos. Queda auditado y recuperable.
+ */
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id } });
+    if (!plan || plan.estado === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+
+    const serviciosGenerados = await prisma.tbl_servicios_proyectos.findMany({
+      where: { id_mantenimiento_plan: id, estado: 1 },
+      include: { cobro: { include: { pagos: { where: { estado: 1 } } } } }
+    });
+
+    // Bloqueo por servicios ejecutados.
+    const ejecutado = serviciosGenerados.find(s => estaServicioFinalizado(s.estado_servicio));
+    if (ejecutado) {
+      return res.status(409).json({
+        error: `No se puede eliminar el plan: el servicio ${ejecutado.codigo} ya fue ejecutado. Gestione esa instancia antes de borrar el plan.`
+      });
+    }
+    // Bloqueo por servicios con abonos.
+    const cobrado = serviciosGenerados.find(s =>
+      s.cobro && (Number(s.cobro.total_abonado) > 0 || (s.cobro.pagos || []).length > 0));
+    if (cobrado) {
+      return res.status(409).json({
+        error: `No se puede eliminar el plan: el servicio ${cobrado.codigo} ya tiene abonos registrados. Gestione el cobro antes de borrar el plan.`
+      });
+    }
+
+    const wasabiKeys = [];
+    const tecnicoIds = [];
+    await prisma.$transaction(async (tx) => {
+      const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+
+      for (const s of serviciosGenerados) {
+        const r = await bajaServicioCascadaEnTx(tx, s.id, req.user.id);
+        wasabiKeys.push(...r.wasabiKeys);
+        tecnicoIds.push(...r.tecnicoIds);
+      }
+
+      // Eventos de calendario del plan: incluye los futuros aún sin id_servicio.
+      await tx.tbl_calendario_eventos.updateMany({
+        where: { id_mantenimiento_plan: id, estado: 1 },
+        data: { estado: 0, estado_evento: 'cancelado', ...stamp }
+      });
+      await tx.tbl_recordatorios.updateMany({
+        where: { id_mantenimiento_plan: id, estado: 1 },
+        data: { estado: 0, ...stamp }
+      });
+      // Ascensores del plan (junction): baja lógica para no dejar filas activas
+      // colgando de un plan eliminado.
+      await tx.tbl_mantenimientos_planes_ascensores.updateMany({
+        where: { id_plan: id, estado: 1 },
+        data: { estado: 0, ...stamp }
+      });
+
+      const planActualizado = await tx.tbl_mantenimientos_planes.update({
+        where: { id },
+        data: { estado: 0, estado_plan: 'cancelado', ...stamp }
+      });
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_mantenimientos_planes', id_entidad: id,
+        accion: 'DELETE', valor_anterior: plan, valor_nuevo: planActualizado, ip: req.ip
+      });
+    });
+
+    await purgarObjetosWasabi(wasabiKeys);
+    await liberarTecnicos(tecnicoIds, -1);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[mantenimientos.eliminar]', err);
+    res.status(500).json({ error: 'Error al eliminar plan: ' + err.message });
+  }
+};
+
 module.exports = {
   listar, crear, actualizar, materializarEvento, listarFrecuencias,
-  materializarSiguienteEventoDelPlan, listarInstancias, exportar,
+  materializarSiguienteEventoDelPlan, listarInstancias, exportar, eliminar,
   // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
   // para no duplicar la lógica de instancias + proyecciones por rango de fechas.
   construirDatasetReporteMantenimientos: _construirDatasetReporte

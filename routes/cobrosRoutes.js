@@ -16,5 +16,6 @@ router.post('/:id/pagos', c.registrarPago);
 router.post('/:id/recordatorio', c.enviarRecordatorio);
 router.patch('/:id/cerrar', c.cerrarCobro);
 router.patch('/:id/incobrable', c.marcarIncobrable);
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 module.exports = router;

@@ -7,7 +7,11 @@ const {
   esServicioPostRevision,
   estaServicioFinalizado,
   ESTADO_SERVICIO_FINALIZADO_TECNICO,
-  ESTADO_SERVICIO_FINALIZADO_OBSERVADO
+  ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
+  ESTADO_ADMIN_REVISADO,
+  ESTADO_ADMIN_OBSERVADO,
+  ESTADO_ADMIN_RECHAZADO,
+  RESULTADO_REVISION
 } = require('../utils/estadoServicio');
 const {
   ESTADO_GUIA_ADJUNTA,
@@ -21,7 +25,12 @@ const {
 } = require('../utils/estadoFactura');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
-const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+const {
+  sincronizarRecordatorioServicio,
+  sincronizarRecordatorioRevisarServicio,
+  sincronizarRecordatorioFacturarServicio,
+  sincronizarRecordatorioAvisoFinalizacion
+} = require('../utils/recordatoriosAuto');
 const { colorPorTipo } = require('../utils/visibilidadCalendario');
 
 const tipoEventoDesdeRegistro = (tipoRegistro) =>
@@ -33,9 +42,9 @@ const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { aplicaAlcance, tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
+const { validarAscensores } = require('../utils/ascensoresMonto');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
-const TOLERANCIA_SUMA_ASCENSORES = 0.01;
 
 function sanitizarPrecio(servicio, rolCodigo) {
   if (!servicio) return servicio;
@@ -48,55 +57,6 @@ function sanitizarPrecio(servicio, rolCodigo) {
   return clon;
 }
 
-/**
- * Valida y normaliza el arreglo de ascensores recibido en el body de creación
- * o edición de servicio. Retorna { ok, error, items } donde items es una lista
- * de { id_ascensor: Number, monto: Number }.
- */
-async function validarAscensores(input, idCliente, precioInterno, monedaServicio) {
-  if (!Array.isArray(input) || input.length === 0) {
-    return { ok: false, error: 'Debe seleccionar al menos un ascensor' };
-  }
-  const items = [];
-  const vistos = new Set();
-  let suma = 0;
-  for (const raw of input) {
-    const idAsc = Number(raw?.id_ascensor);
-    const monto = Number(raw?.monto);
-    if (!Number.isFinite(idAsc) || idAsc <= 0) {
-      return { ok: false, error: 'id_ascensor inválido en la lista de ascensores' };
-    }
-    if (!Number.isFinite(monto) || monto < 0) {
-      return { ok: false, error: 'monto inválido en la lista de ascensores' };
-    }
-    if (vistos.has(idAsc)) {
-      return { ok: false, error: 'No se puede repetir un mismo ascensor' };
-    }
-    vistos.add(idAsc);
-    suma += monto;
-    items.push({ id_ascensor: idAsc, monto });
-  }
-  // Validar que todos los ascensores pertenezcan al cliente. El ascensor se
-  // asocia al cliente a través de su edificio (tbl_edificios.id_cliente).
-  const ascBD = await prisma.tbl_ascensores.findMany({
-    where: { id: { in: items.map(i => i.id_ascensor) }, estado: 1 },
-    include: { edificio: { select: { id_cliente: true } } }
-  });
-  if (ascBD.length !== items.length) {
-    return { ok: false, error: 'Uno o más ascensores no existen o están inactivos' };
-  }
-  for (const a of ascBD) {
-    if (a.edificio?.id_cliente !== Number(idCliente)) {
-      return { ok: false, error: `El ascensor ${a.codigo} no pertenece al cliente seleccionado` };
-    }
-  }
-  // Validar que la suma de montos coincida con el precio total (tolerancia centavo)
-  const precio = Number(precioInterno);
-  if (Number.isFinite(precio) && Math.abs(suma - precio) > TOLERANCIA_SUMA_ASCENSORES) {
-    return { ok: false, error: `La suma de montos por ascensor (S/ ${suma.toFixed(2)}) no coincide con el precio total (S/ ${precio.toFixed(2)})` };
-  }
-  return { ok: true, items, moneda: monedaServicio || 'PEN' };
-}
 
 const listar = async (req, res) => {
   try {
@@ -429,14 +389,35 @@ const promoverBorrador = async (req, res) => {
 };
 
 /**
- * Marca el servicio como revisado por Admin/Contabilidad y lo envía a gestión de cobro.
+ * Revisión administrativa de un servicio operativo finalizado por el técnico.
+ *
+ * Resultado posible (body.resultado): 'aprobado' | 'observado' | 'rechazado'.
+ *  - APROBADO  → estado_administrativo = 'Revisado'; HABILITA gestión contable
+ *                (transición a 'A gestión de cobro' / 'Cobrado total'). Es la
+ *                única vía por la que un servicio operativo llega a Contabilidad.
+ *  - OBSERVADO → estado_administrativo = 'Observado'; devuelve el servicio a
+ *                'En curso' para que el técnico corrija y vuelva a finalizar.
+ *                NO habilita Contabilidad.
+ *  - RECHAZADO → estado_administrativo = 'Rechazado'; igual devolución a 'En
+ *                curso', sin habilitación contable.
+ *
+ * En los tres casos se guarda la trazabilidad (revisado_por, fecha_revision,
+ * resultado_revision, observacion_revision). Observado/Rechazado exigen motivo.
  */
 const revisarServicio = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { observaciones } = req.body;
+    const resultado = String(req.body.resultado || RESULTADO_REVISION.APROBADO).toLowerCase();
     if (!['super_admin', 'admin', 'contabilidad'].includes(req.user.rol_codigo)) {
       return res.status(403).json({ error: 'Solo Admin o Contabilidad pueden revisar' });
+    }
+    if (!Object.values(RESULTADO_REVISION).includes(resultado)) {
+      return res.status(400).json({ error: `Resultado inválido. Use: ${Object.values(RESULTADO_REVISION).join(', ')}` });
+    }
+    const esRechazoUObservacion = resultado !== RESULTADO_REVISION.APROBADO;
+    if (esRechazoUObservacion && !String(observaciones || '').trim()) {
+      return res.status(400).json({ error: 'Debe indicar el motivo al observar o rechazar' });
     }
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id }, include: { servicio_realizado: true, cobro: true }
@@ -446,23 +427,45 @@ const revisarServicio = async (req, res) => {
       return res.status(400).json({ error: 'El servicio no está en revisión administrativa' });
     }
 
+    const trazaRevision = {
+      revisado_por: req.user.id,
+      fecha_revision: new Date(),
+      resultado_revision: resultado,
+      observacion_revision: observaciones || null,
+      user_id_modification: req.user.id,
+      date_time_modification: new Date()
+    };
+
+    // OBSERVADO / RECHAZADO: devolver a corrección, sin habilitar Contabilidad.
+    if (esRechazoUObservacion) {
+      const estadoAdmin = resultado === RESULTADO_REVISION.OBSERVADO ? ESTADO_ADMIN_OBSERVADO : ESTADO_ADMIN_RECHAZADO;
+      await prisma.tbl_servicios_realizados.updateMany({
+        where: { id_servicio: id },
+        data: { estado_administrativo: estadoAdmin, ...trazaRevision }
+      });
+      // Regresa al flujo operativo para que el técnico corrija y re-finalice.
+      await cambiarEstadoServicio(id, 'En curso', req.user.id, `Revisión ${estadoAdmin.toLowerCase()}: ${observaciones}`);
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+        accion: 'REVIEW', valor_nuevo: { resultado, estado_administrativo: estadoAdmin }, ip: req.ip
+      });
+      return res.json({ ok: true, resultado, estado_administrativo: estadoAdmin, estado: 'En curso' });
+    }
+
+    // APROBADO: habilita gestión contable.
     await prisma.tbl_servicios_realizados.updateMany({
       where: { id_servicio: id },
-      data: {
-        estado_administrativo: 'Revisado',
-        user_id_modification: req.user.id, date_time_modification: new Date()
-      }
+      data: { estado_administrativo: ESTADO_ADMIN_REVISADO, ...trazaRevision }
     });
-
     const monto = Number(servicio.cobro?.monto_total || servicio.precio_interno || 0);
     const destino = (monto > 0 && servicio.sin_cobro !== 1) ? 'A gestión de cobro' : 'Cobrado total';
     await cambiarEstadoServicio(id, destino, req.user.id, observaciones || 'Revisión administrativa aprobada');
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
-      accion: 'REVIEW', valor_nuevo: { estado_administrativo: 'Revisado', estado_servicio: destino }, ip: req.ip
+      accion: 'REVIEW', valor_nuevo: { resultado, estado_administrativo: ESTADO_ADMIN_REVISADO, estado_servicio: destino }, ip: req.ip
     });
-    res.json({ ok: true, estado: destino });
+    res.json({ ok: true, resultado, estado_administrativo: ESTADO_ADMIN_REVISADO, estado: destino });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al revisar servicio: ' + err.message });
@@ -1013,7 +1016,6 @@ const finalizarServicio = async (req, res) => {
         numero_ot: numeroOtNormalizado || null,
         id_archivo_ot: idArchivoOtNormalizado,
         estado_administrativo: 'Pendiente revisión',
-        estado_contable: 'Pendiente',
         estado_cobro: estadoCobroInicial,
         estado_facturacion: estadoFacturacionInicial,
         user_id_registration: req.user.id
@@ -1045,7 +1047,7 @@ const finalizarServicio = async (req, res) => {
 
     // Para planes continuos: auto-materializa el siguiente evento del plan
     // como servicio (queda listo para asignar técnico, checklist y cobro)
-    // y actualiza `proximo_mantenimiento` del ascensor del plan (el plan es 1 a 1 con un ascensor).
+    // y actualiza `proximo_mantenimiento` de todos los ascensores del plan.
     if (servicio.id_mantenimiento_plan) {
       try {
         const siguienteServicio = await materializarSiguienteEventoDelPlan({
@@ -1054,10 +1056,14 @@ const finalizarServicio = async (req, res) => {
           userId: req.user.id
         });
         if (siguienteServicio) {
-          const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id: servicio.id_mantenimiento_plan }, select: { id_ascensor: true } });
-          if (plan) {
-            await prisma.tbl_ascensores.update({
-              where: { id: plan.id_ascensor },
+          const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+            where: { id: servicio.id_mantenimiento_plan },
+            select: { ascensores: { where: { estado: 1 }, select: { id_ascensor: true } } }
+          });
+          const idsAsc = (plan?.ascensores || []).map(a => a.id_ascensor);
+          if (idsAsc.length > 0) {
+            await prisma.tbl_ascensores.updateMany({
+              where: { id: { in: idsAsc } },
               data: { proximo_mantenimiento: siguienteServicio.fecha_programada }
             });
           }
@@ -1092,6 +1098,23 @@ const finalizarServicio = async (req, res) => {
     // Evento calendario
     await prisma.tbl_calendario_eventos.updateMany({
       where: { id_servicio: id }, data: { estado_evento: 'finalizado' }
+    });
+
+    // Alertas de "servicio finalizado" para el calendario. Se sincronizan AQUÍ
+    // (no en crearFinalizacion) porque recién en este punto el servicio está en
+    // estado post-finalización; antes el gate de `sincronizarAlertaServicioFinalizado`
+    // las descartaba. Idempotentes y no bloqueantes:
+    //   · servicio_finalizado_revisar  → coordinador (revisar y corregir)
+    //   · servicio_finalizado_facturar → contabilidad (emitir factura)
+    //   · servicio_finalizado_aviso    → admin (aviso informativo)
+    Promise.allSettled([
+      sincronizarRecordatorioRevisarServicio(id),
+      sincronizarRecordatorioFacturarServicio(id),
+      sincronizarRecordatorioAvisoFinalizacion(id)
+    ]).then(results => {
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') console.error(`Sync alerta finalización [#${i}]:`, r.reason);
+      });
     });
 
     res.json({ ok: true });

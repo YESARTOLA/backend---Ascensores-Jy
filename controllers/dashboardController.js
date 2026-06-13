@@ -5,6 +5,7 @@ const {
   ESTADOS_FACTURACION_COMPLETA
 } = require('../utils/estadoFactura');
 const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
+const { whereElegibleContable } = require('../utils/elegibilidadContable');
 
 const resumen = async (req, res) => {
   try {
@@ -106,8 +107,8 @@ const resumen = async (req, res) => {
           _sum: { monto: true },
           where: { fecha_pago: { gte: inicioMes, lte: finMes }, estado: 1 }
         }),
-        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: ESTADO_FACTURACION_SIN, estado: 1 } }),
-        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA }, estado: 1 } })
+        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: ESTADO_FACTURACION_SIN, estado: 1, ...whereElegibleContable() } }),
+        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA }, estado: 1, ...whereElegibleContable() } })
       ]);
       data.totalAbonadoMes = Number(totalAbonadoMes._sum.monto || 0);
       data.sinFactura = sinFactura;

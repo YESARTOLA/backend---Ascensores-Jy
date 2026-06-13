@@ -12,6 +12,7 @@ const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
+const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
@@ -1036,8 +1037,7 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
       create: {
         id_servicio: servicioExistente.id,
         id_cliente: cot.id_cliente,
-        estado_administrativo: 'En ejecución',
-        estado_contable: 'Pendiente',
+        estado_administrativo: 'En ejecución',
         estado_cobro: cobroActualizado.estado_cobro || 'Pendiente de iniciar',
         estado_facturacion: ESTADO_FACTURACION_SIN,
         user_id_registration: userId
@@ -1311,8 +1311,7 @@ const aprobar = async (req, res) => {
           id_servicio: servicio.id,
           id_cliente: cot.id_cliente,
           // técnicos quedan null hasta que se asignen y finalicen
-          estado_administrativo: 'En ejecución',
-          estado_contable: 'Pendiente',
+          estado_administrativo: 'En ejecución',
           estado_cobro: 'Pendiente de iniciar',
           estado_facturacion: ESTADO_FACTURACION_SIN,
           user_id_registration: req.user.id
@@ -1433,7 +1432,14 @@ const eliminar = async (req, res) => {
   try {
     if (req.user.rol_codigo !== 'super_admin') return res.status(403).json({ error: 'Solo Super Admin' });
     const id = Number(req.params.id);
-    const cot = await prisma.tbl_cotizaciones.findUnique({ where: { id } });
+    const cot = await prisma.tbl_cotizaciones.findUnique({
+      where: { id },
+      include: {
+        versiones: { where: { estado: 1 } },
+        ascensores: { where: { estado: 1 } },
+        archivos: { where: { estado: 1 } }
+      }
+    });
     if (!cot) return res.status(404).json({ error: 'No encontrada' });
     // No se permite eliminar cotizaciones que ya generaron servicio en curso o
     // terminado: cualquier estado_global diferente de Cotizado tiene servicio
@@ -1441,14 +1447,41 @@ const eliminar = async (req, res) => {
     if (cot.estado_global !== ESTADO_GLOBAL.COTIZADO) {
       return res.status(400).json({ error: 'No se puede eliminar una cotización con servicio asociado' });
     }
-    await prisma.tbl_cotizaciones.update({
-      where: { id },
-      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+
+    // Recolectar archivos a purgar de Wasabi: PDFs y respaldos de cada versión
+    // + adjuntos libres de la cotización.
+    const archivoIds = new Set();
+    for (const v of cot.versiones) {
+      if (v.id_archivo_pdf) archivoIds.add(v.id_archivo_pdf);
+      if (v.id_archivo_respaldo) archivoIds.add(v.id_archivo_respaldo);
+    }
+    for (const a of cot.archivos) if (a.id_archivo) archivoIds.add(a.id_archivo);
+    const versionIds = cot.versiones.map(v => v.id);
+
+    const wasabiKeys = [];
+    await prisma.$transaction(async (tx) => {
+      const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+      // Cascada manual (el soft-delete no dispara onDelete:Cascade del schema).
+      if (versionIds.length) {
+        await tx.tbl_cotizaciones_items.updateMany({ where: { id_version: { in: versionIds }, estado: 1 }, data: { estado: 0, ...stamp } });
+      }
+      await tx.tbl_cotizaciones_versiones.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_cotizaciones_ascensores.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_cotizaciones_archivos.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
+
+      for (const idArchivo of archivoIds) {
+        const key = await bajaArchivoEnTx(tx, idArchivo, req.user.id);
+        if (key) wasabiKeys.push(key);
+      }
+
+      await tx.tbl_cotizaciones.update({ where: { id }, data: { estado: 0, ...stamp } });
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
+        accion: 'DELETE', valor_anterior: cot, ip: req.ip
+      });
     });
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
-      accion: 'DELETE', valor_anterior: cot, ip: req.ip
-    });
+
+    await purgarObjetosWasabi(wasabiKeys);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cotizaciones.eliminar]', err);
@@ -1572,14 +1605,20 @@ const eliminarArchivo = async (req, res) => {
     });
     if (!adjunto) return res.status(404).json({ error: 'Adjunto no encontrado' });
 
-    await prisma.tbl_cotizaciones_archivos.update({
-      where: { id: idAdjunto },
-      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    const wasabiKeys = [];
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_cotizaciones_archivos.update({
+        where: { id: idAdjunto },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      const key = await bajaArchivoEnTx(tx, adjunto.id_archivo, req.user.id);
+      if (key) wasabiKeys.push(key);
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_cotizaciones_archivos', id_entidad: idAdjunto,
+        accion: 'DELETE', valor_anterior: adjunto, ip: req.ip
+      });
     });
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_cotizaciones_archivos', id_entidad: idAdjunto,
-      accion: 'DELETE', valor_anterior: adjunto, ip: req.ip
-    });
+    await purgarObjetosWasabi(wasabiKeys);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cotizaciones.eliminarArchivo]', err);

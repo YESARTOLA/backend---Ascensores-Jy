@@ -11,5 +11,6 @@ router.get('/', c.listar);
 router.get('/:id', c.obtener);
 router.post('/', c.crear);
 router.patch('/:id/estado', c.cambiarEstado);
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 module.exports = router;

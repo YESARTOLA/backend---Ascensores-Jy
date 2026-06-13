@@ -11,7 +11,8 @@
  *     @unique en tbl_emergencias.id_servicio / tbl_correctivos.id_servicio).
  *     Si hay multiascensor, la fila usa el primer ascensor; los demás siguen
  *     vinculados al servicio vía tbl_servicios_proyectos_ascensores.
- *   - mantenimiento: crea N planes (uno por cada ascensor).
+ *   - mantenimiento: crea 1 plan que cubre todos los ascensores (montos
+ *     heredados de la junction del servicio originante).
  *   - atencion_rapida: crea 1 fila en tbl_atenciones_rapidas con
  *     id_servicio_convertido = servicio.id (registro de origen).
  *   - null / otro valor: no hace nada.
@@ -107,25 +108,38 @@ async function replicarEnModulo(tx, args) {
     const cantidadMant = d.cantidad_mantenimientos != null ? Number(d.cantidad_mantenimientos) : null;
     const cantidadGratuitos = Math.max(0, Number(d.cantidad_mantenimientos_gratuitos) || 0);
     const fechaInicioPlan = d.fecha_inicio_plan ? parseYMDLima(d.fecha_inicio_plan) : fechaProgramada;
-    for (const idAsc of idsAscensores) {
-      await tx.tbl_mantenimientos_planes.create({
-        data: {
-          id_cliente: idCliente,
-          id_ascensor: idAsc,
-          id_tipo_servicio: tipoServicio.id,
-          tipo_plan: tipoPlan,
-          frecuencia,
-          frecuencia_dias_custom: frecDiasCustom,
-          cantidad_mantenimientos: cantidadMant,
-          cantidad_mantenimientos_gratuitos: cantidadGratuitos,
-          fecha_inicio: fechaInicioPlan,
-          hora_programada: horaProgramada,
-          estado_plan: 'activo',
-          observaciones: obs,
-          user_id_registration: usuarioId
-        }
-      });
-    }
+    // Un único plan que cubre todos los ascensores. Los montos por ascensor se
+    // heredan de la junction del servicio originante (mismo reparto del precio).
+    const ascSrv = await tx.tbl_servicios_ascensores.findMany({
+      where: { id_servicio: servicio.id, estado: 1 },
+      select: { id_ascensor: true, monto: true, moneda: true }
+    });
+    const filasAsc = (ascSrv.length > 0
+      ? ascSrv
+      : idsAscensores.map(id_ascensor => ({ id_ascensor, monto: 0, moneda: 'PEN' }))
+    ).map(a => ({
+      id_ascensor: a.id_ascensor,
+      monto: a.monto || 0,
+      moneda: a.moneda || 'PEN',
+      user_id_registration: usuarioId
+    }));
+    await tx.tbl_mantenimientos_planes.create({
+      data: {
+        id_cliente: idCliente,
+        id_tipo_servicio: tipoServicio.id,
+        tipo_plan: tipoPlan,
+        frecuencia,
+        frecuencia_dias_custom: frecDiasCustom,
+        cantidad_mantenimientos: cantidadMant,
+        cantidad_mantenimientos_gratuitos: cantidadGratuitos,
+        fecha_inicio: fechaInicioPlan,
+        hora_programada: horaProgramada,
+        estado_plan: 'activo',
+        observaciones: obs,
+        user_id_registration: usuarioId,
+        ascensores: { create: filasAsc }
+      }
+    });
     return 'mantenimiento';
   }
 

@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { TIPOS_EDIFICIO, normalizarTipoEdificio } = require('../utils/catalogosEdificios');
+const { TIPO_REGISTRO } = require('../utils/clasificacionServicio');
 
 const trimOrNull = (v) => {
   if (v === undefined || v === null) return null;
@@ -46,6 +47,10 @@ const listarDistritos = async (_req, res) => {
 };
 
 // Edificios de un cliente (o búsqueda global por nombre/distrito con ?q).
+// Además de cliente y conteo de ascensores, deriva por edificio:
+//   - tipos_ascensores: tipos distintos de sus ascensores activos (para buscar)
+//   - tiene_servicios / tiene_proyectos: si alguno de sus ascensores participa en
+//     un servicio o proyecto (tbl_servicios_proyectos.tipo_registro), para filtrar.
 const listar = async (req, res) => {
   try {
     const { id_cliente, q } = req.query;
@@ -55,13 +60,39 @@ const listar = async (req, res) => {
       { nombre: { contains: q, mode: 'insensitive' } },
       { distrito: { contains: q, mode: 'insensitive' } }
     ];
-    const data = await prisma.tbl_edificios.findMany({
+    const filas = await prisma.tbl_edificios.findMany({
       where,
       orderBy: { id: 'desc' },
       include: {
         cliente: { select: { id: true, nombre: true } },
-        _count: { select: { ascensores: true } }
+        _count: { select: { ascensores: true } },
+        ascensores: {
+          where: { estado: 1 },
+          select: {
+            tipo: true,
+            servicios_ascensores: {
+              where: { estado: 1, servicio: { estado: 1 } },
+              select: { servicio: { select: { tipo_registro: true } } }
+            }
+          }
+        }
       }
+    });
+    // Derivar campos a partir de los ascensores y descartar el detalle pesado.
+    const data = filas.map(({ ascensores, ...edificio }) => {
+      const tiposAscensores = [...new Set(ascensores.map(a => a.tipo).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, 'es'));
+      let tieneServicios = false;
+      let tieneProyectos = false;
+      for (const a of ascensores) {
+        for (const sa of a.servicios_ascensores) {
+          const tr = sa.servicio?.tipo_registro;
+          if (tr === TIPO_REGISTRO.SERVICIO) tieneServicios = true;
+          else if (tr === TIPO_REGISTRO.PROYECTO) tieneProyectos = true;
+        }
+        if (tieneServicios && tieneProyectos) break;
+      }
+      return { ...edificio, tipos_ascensores: tiposAscensores, tiene_servicios: tieneServicios, tiene_proyectos: tieneProyectos };
     });
     res.json({ data });
   } catch (err) {

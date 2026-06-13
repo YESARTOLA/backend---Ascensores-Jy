@@ -392,7 +392,7 @@ const vista360 = async (req, res) => {
         },
         mantenimientos: {
           where: { estado: 1 },
-          include: { ascensor: { select: { codigo: true } }, tipo_servicio: true }
+          include: { ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } }, tipo_servicio: true }
         },
         cobros: { where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' } },
         facturas: {

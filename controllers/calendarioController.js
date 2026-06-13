@@ -42,7 +42,7 @@ const listar = async (req, res) => {
                   precios: { where: { estado: 1 }, select: { id_tipo_servicio: true, precio: true, moneda: true } }
                 }
               },
-              ascensor: true,
+              ascensores: { where: { estado: 1 }, include: { ascensor: true } },
               tipo_servicio: true
             }
           }
@@ -71,7 +71,7 @@ const listar = async (req, res) => {
           where: whereRec,
           include: {
             servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } }, asignaciones: { where: { estado: 1 } } } },
-            mantenimiento_plan: { include: { cliente: true, ascensor: true } },
+            mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } } } },
             emergencia: { include: { cliente: true, ascensor: true } },
             cobro: { include: { cliente: true, servicio: true } }
           }

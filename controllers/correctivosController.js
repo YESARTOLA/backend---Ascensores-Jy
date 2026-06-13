@@ -24,6 +24,7 @@ const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValida
 const { esServicioEditable, esCorrectivoCerrado } = require('../utils/estadoServicio');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 
 const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
 
@@ -53,7 +54,7 @@ const listar = async (req, res) => {
         orderBy: { id: 'desc' },
         include: {
           cliente: true,
-          ascensor: true,
+          ascensor: { include: { edificio: true } },
           servicio: { include: { asignaciones: { include: { tecnico: true }, where: { estado: 1 } } } }
         }
       },
@@ -319,4 +320,52 @@ const actualizar = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar };
+/**
+ * Soft-delete de un correctivo: estado = 0. Igual que Emergencias, cada
+ * correctivo posee un servicio vinculado (1:1); la baja arrastra ese servicio y
+ * TODA su cascada (asignaciones, checklist, evidencias, cobro, facturas, folder
+ * contable, eventos de calendario, recordatorios) vía el motor de reversión,
+ * limpia los archivos en Wasabi y libera a los técnicos sin otros servicios
+ * activos. No borra físicamente: queda auditado y recuperable. Solo Super Admin.
+ */
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = await prisma.tbl_correctivos.findUnique({
+      where: { id },
+      include: { servicio: { include: { asignaciones: { where: { estado: 1 } } } } }
+    });
+    if (!previo) return res.status(404).json({ error: 'Correctivo no encontrado' });
+
+    const idServicio = previo.id_servicio;
+    let wasabiKeys = [];
+    let tecnicoIds = [];
+    await prisma.$transaction(async (tx) => {
+      const correctivo = await tx.tbl_correctivos.update({
+        where: { id },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+
+      if (idServicio) {
+        const r = await bajaServicioCascadaEnTx(tx, idServicio, req.user.id);
+        wasabiKeys = r.wasabiKeys;
+        tecnicoIds = r.tecnicoIds;
+      }
+
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_correctivos', id_entidad: id,
+        accion: 'DELETE', valor_anterior: previo, valor_nuevo: correctivo, ip: req.ip
+      });
+    });
+
+    await purgarObjetosWasabi(wasabiKeys);
+    await liberarTecnicos(tecnicoIds, idServicio);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[correctivos.eliminar]', err);
+    res.status(500).json({ error: 'Error al eliminar correctivo: ' + err.message });
+  }
+};
+
+module.exports = { listar, crear, actualizar, eliminar };

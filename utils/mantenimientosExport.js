@@ -130,9 +130,13 @@ function _mapearFilaPrograma(i) {
 }
 
 function _mapearFilaPlan(p) {
+  // Un plan cubre N ascensores; el precio total es la suma de sus montos.
+  const ascs = (p.ascensores || []).map(a => a.ascensor).filter(Boolean);
+  const total = (p.ascensores || []).reduce((acc, a) => acc + Number(a.monto || 0), 0);
+  const moneda = (p.ascensores || [])[0]?.moneda || 'PEN';
   return {
-    ascensor: p.ascensor?.codigo || '',
-    ubicacion: p.ascensor?.ubicacion || '',
+    ascensor: ascs.map(a => a.codigo).filter(Boolean).join(', '),
+    ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', '),
     tipo_servicio: p.tipo_servicio?.nombre || '',
     modalidad: p.tipo_plan ? p.tipo_plan.charAt(0).toUpperCase() + p.tipo_plan.slice(1) : '',
     frecuencia: labelFrecuencia(p),
@@ -140,7 +144,7 @@ function _mapearFilaPlan(p) {
     ejecutados: p.mantenimientos_ejecutados_total ?? 0,
     gratuitos: `${p.mantenimientos_gratuitos_ejecutados || 0} / ${p.cantidad_mantenimientos_gratuitos || 0}`,
     inicio: fechaISO(p.fecha_inicio),
-    precio: formatMonto(p.precio, p.moneda),
+    precio: formatMonto(total, moneda),
     estado_plan: p.estado_plan || ''
   };
 }

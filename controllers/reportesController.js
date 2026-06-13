@@ -12,6 +12,7 @@ const {
   servicioAlcanceWhere,
   porServicioRelacionWhere,
 } = require('../utils/alcanceUsuario');
+const { whereElegibleContable, whereCobroElegible } = require('../utils/elegibilidadContable');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
 
@@ -193,10 +194,11 @@ const pendientesDeCobro = async (req, res) => {
     const where = {
       estado: 1,
       saldo_pendiente: { gt: 0 },
-      estado_cobro: { in: ['Pendiente de iniciar', 'En gestión'] }
+      estado_cobro: { in: ['Pendiente de iniciar', 'En gestión'] },
+      // Solo cuentas por cobrar de servicios habilitados para Contabilidad.
+      AND: [porServicioRelacionWhere(req.user), whereCobroElegible()]
     };
     if (id_cliente) where.id_cliente = Number(id_cliente);
-    Object.assign(where, porServicioRelacionWhere(req.user));
     const list = await prisma.tbl_cobros.findMany({
       where, orderBy: { id: 'desc' },
       include: { cliente: true, servicio: { include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } } } } }
@@ -216,10 +218,10 @@ const cobrosVencidos = async (req, res) => {
     const where = {
       estado: 1,
       saldo_pendiente: { gt: 0 },
-      fecha_proximo_abono: { lt: hoy }
+      fecha_proximo_abono: { lt: hoy },
+      AND: [porServicioRelacionWhere(req.user), whereCobroElegible()]
     };
     if (id_cliente) where.id_cliente = Number(id_cliente);
-    Object.assign(where, porServicioRelacionWhere(req.user));
     const list = await prisma.tbl_cobros.findMany({
       where, orderBy: { fecha_proximo_abono: 'asc' },
       include: { cliente: true, servicio: { include: { ascensores: { where: { estado: 1 }, include: { ascensor: true } }, tipo_servicio: true } } }
@@ -243,9 +245,11 @@ const historialTecnicoAscensor = async (req, res) => {
     const alcanceAsc = ascensorAlcanceWhere(req.user);
     const ascensor = await prisma.tbl_ascensores.findFirst({
       where: { id: Number(id_ascensor), ...alcanceAsc },
-      include: { cliente: true }
+      include: { edificio: { include: { cliente: true } } }
     });
     if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    // `cliente` aplanado (vía edificio) para compatibilidad con el frontend.
+    ascensor.cliente = ascensor.edificio?.cliente || null;
 
     const [servicios, emergencias, mantenimientos, eventos] = await Promise.all([
       prisma.tbl_servicios_proyectos.findMany({
@@ -264,7 +268,7 @@ const historialTecnicoAscensor = async (req, res) => {
         orderBy: { fecha_reporte: 'desc' }
       }),
       prisma.tbl_mantenimientos_planes.findMany({
-        where: { id_ascensor: Number(id_ascensor), estado: 1 }
+        where: { estado: 1, ascensores: { some: { id_ascensor: Number(id_ascensor), estado: 1 } } }
       }),
       prisma.tbl_ascensores_historial.findMany({
         where: { id_ascensor: Number(id_ascensor) },
@@ -416,9 +420,13 @@ const ascensores = async (req, res) => {
   try {
     const list = await prisma.tbl_ascensores.findMany({
       where: { estado: 1, ...ascensorAlcanceWhere(req.user) },
-      include: { cliente: true, _count: { select: { servicios_ascensores: true, emergencias: true } } }
+      // El cliente del ascensor se resuelve vía su edificio (tbl_ascensores ya no
+      // tiene relación directa a cliente desde la introducción de Edificios).
+      include: { edificio: { include: { cliente: true } }, _count: { select: { servicios_ascensores: true, emergencias: true } } }
     });
-    res.json({ data: list });
+    // Se expone `cliente` aplanado para mantener compatibilidad con los consumidores.
+    const data = list.map(a => ({ ...a, cliente: a.edificio?.cliente || null }));
+    res.json({ data });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error reporte ascensores' });
@@ -455,7 +463,7 @@ const moraPorCliente = async (req, res) => {
         estado: 1,
         saldo_pendiente: { gt: 0 },
         fecha_proximo_abono: { lt: hoy },
-        ...porServicioRelacionWhere(req.user)
+        AND: [porServicioRelacionWhere(req.user), whereCobroElegible()]
       },
       include: { cliente: true, servicio: true }
     });
@@ -484,7 +492,8 @@ const facturados = async (req, res) => {
         estado_facturacion: facturados
           ? { in: ESTADOS_FACTURACION_COMPLETA }
           : { in: [ESTADO_FACTURACION_SIN, ESTADO_FACTURACION_PENDIENTE] },
-        ...porServicioRelacionWhere(req.user)
+        // Solo servicios habilitados para Contabilidad (misma regla única).
+        AND: [porServicioRelacionWhere(req.user), whereElegibleContable()]
       },
       include: {
         servicio: {
@@ -682,10 +691,11 @@ const mantenimientosPorCliente = async (req, res) => {
           // "Faltan" = programados aún por realizar (pendientes + proyectados),
           // descontando los ya realizados, en curso o cancelados.
           const faltan = programados - realizados - en_curso - cancelados;
+          const ascsPlan = (plan.ascensores || []).map(a => a.ascensor).filter(Boolean);
           return {
             id_plan: plan.id,
-            ascensor_codigo: plan.ascensor?.codigo || null,
-            ascensor_ubicacion: plan.ascensor?.ubicacion || null,
+            ascensor_codigo: ascsPlan.map(a => a.codigo).filter(Boolean).join(', ') || null,
+            ascensor_ubicacion: ascsPlan.map(a => a.ubicacion).filter(Boolean).join(', ') || null,
             tipo_servicio: plan.tipo_servicio?.nombre || null,
             tipo_plan: plan.tipo_plan,
             frecuencia: plan.frecuencia || null,
@@ -757,7 +767,7 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
                 precios: { where: { estado: 1 }, select: { id_tipo_servicio: true, precio: true, moneda: true } }
               }
             },
-            ascensor: { select: { id: true, codigo: true, ubicacion: true } },
+            ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
             tipo_servicio: { select: { id: true, nombre: true } }
           }
         }
@@ -770,13 +780,18 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
       const fecha = e.fecha_inicio;
       const vencido = fecha && new Date(fecha) < hoy;
       const precioCfg = plan?.cliente?.precios?.find(p => p.id_tipo_servicio === plan.id_tipo_servicio) || null;
+      // El plan cubre N ascensores; se muestran sus códigos/ubicaciones unidos.
+      const ascs = (plan?.ascensores || []).map(a => a.ascensor).filter(Boolean);
+      const ascensor = ascs.length
+        ? { codigo: ascs.map(a => a.codigo).filter(Boolean).join(', '), ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', ') || null }
+        : null;
       return {
         id_evento: e.id,
         fecha_programada: fecha,
         vencido,
         id_plan: plan?.id || null,
         cliente: plan?.cliente ? { id: plan.cliente.id, nombre: plan.cliente.nombre } : null,
-        ascensor: plan?.ascensor || null,
+        ascensor,
         tipo_servicio: plan?.tipo_servicio || null,
         precio: precioCfg ? Number(precioCfg.precio) : null,
         moneda: precioCfg?.moneda || 'PEN',

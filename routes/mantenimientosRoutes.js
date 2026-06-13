@@ -20,5 +20,6 @@ router.post(
   permitirRoles('super_admin', 'admin', 'coordinador'),
   c.materializarEvento
 );
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 module.exports = router;

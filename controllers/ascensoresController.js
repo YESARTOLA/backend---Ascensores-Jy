@@ -105,7 +105,7 @@ const historial = async (req, res) => {
         include: { servicio: { select: { codigo: true } } }
       }),
       prisma.tbl_mantenimientos_planes.findMany({
-        where: { id_ascensor: id, estado: 1 },
+        where: { estado: 1, ascensores: { some: { id_ascensor: id, estado: 1 } } },
         include: { tipo_servicio: true }
       }),
       prisma.tbl_ascensores_historial.findMany({ where: { id_ascensor: id }, orderBy: { fecha_evento: 'desc' }, take: 200 })

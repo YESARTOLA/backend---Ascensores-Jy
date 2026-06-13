@@ -5,6 +5,9 @@ const { diffDiasLima, parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = req
 const { sincronizarRecordatorioCobro } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
 const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA } = require('../utils/catalogosBancarios');
+const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
+const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
+const { elegibilidadContable } = require('../utils/elegibilidadContable');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -436,9 +439,21 @@ const registrarPago = async (req, res) => {
     const id = Number(req.params.id);
     const d = req.body;
     const cobro = await prisma.tbl_cobros.findUnique({
-      where: { id }, include: { pagos: { where: { estado: 1 } }, cuotas: { where: { estado: 1 } } }
+      where: { id }, include: {
+        pagos: { where: { estado: 1 } },
+        cuotas: { where: { estado: 1 } },
+        servicio: { include: { servicio_realizado: true } }
+      }
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
+
+    // Regla ÚNICA de elegibilidad: no se registran abonos contra servicios que
+    // todavía no están habilitados para Contabilidad (operativo sin aprobación
+    // administrativa, anulado, etc.).
+    const elegibilidad = elegibilidadContable({ servicio: cobro.servicio, servicioRealizado: cobro.servicio?.servicio_realizado });
+    if (!elegibilidad.habilitado) {
+      return res.status(400).json({ error: elegibilidad.motivo || 'El servicio no está habilitado para cobro' });
+    }
 
     const monto = Number(d.monto);
     if (!monto || monto <= 0) return res.status(400).json({ error: 'Monto debe ser mayor a cero' });
@@ -762,4 +777,65 @@ const listarProyectos = async (_req, res) => {
   }
 };
 
-module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, listarProyectos };
+/**
+ * Soft-delete de un cobro completo (estado = 0). Solo Super Admin. Da de baja
+ * en cascada cuotas, pagos, recordatorios de cobro, recordatorios de
+ * seguimiento y facturas del servicio, purga de Wasabi los comprobantes de pago
+ * y los PDFs de factura, y deja el servicio realizado en "Sin cobro" / "Sin
+ * factura". Se permite eliminar AUNQUE existan abonos registrados (override SA
+ * para corregir errores); queda auditado y es recuperable.
+ */
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const cobro = await prisma.tbl_cobros.findUnique({
+      where: { id },
+      include: { pagos: { where: { estado: 1 } } }
+    });
+    if (!cobro || cobro.estado === 0) return res.status(404).json({ error: 'Cobro no encontrado' });
+
+    const idServicio = cobro.id_servicio;
+    // Todas las facturas del servicio (cubre generales con id_cobro null y por cuota).
+    const facturas = await prisma.tbl_facturas.findMany({ where: { id_servicio: idServicio, estado: 1 } });
+
+    // Recolectar archivos a purgar: comprobantes de pago + PDFs de factura.
+    const archivoIds = new Set();
+    for (const p of cobro.pagos) if (p.id_archivo_comprobante) archivoIds.add(p.id_archivo_comprobante);
+    for (const f of facturas) if (f.id_archivo) archivoIds.add(f.id_archivo);
+
+    const wasabiKeys = [];
+    await prisma.$transaction(async (tx) => {
+      const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+      await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_pagos.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      await tx.tbl_facturas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+
+      for (const idArchivo of archivoIds) {
+        const key = await bajaArchivoEnTx(tx, idArchivo, req.user.id);
+        if (key) wasabiKeys.push(key);
+      }
+
+      await tx.tbl_cobros.update({ where: { id }, data: { estado: 0, ...stamp } });
+      // El folder contable del servicio queda sin cobro ni facturación.
+      await tx.tbl_servicios_realizados.updateMany({
+        where: { id_servicio: idServicio },
+        data: { estado_cobro: 'Sin cobro', estado_facturacion: ESTADO_FACTURACION_SIN, ...stamp }
+      });
+
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_cobros', id_entidad: id,
+        accion: 'DELETE', valor_anterior: cobro, ip: req.ip
+      });
+    });
+
+    await purgarObjetosWasabi(wasabiKeys);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[cobros.eliminar]', err);
+    res.status(500).json({ error: 'Error al eliminar cobro: ' + err.message });
+  }
+};
+
+module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, listarProyectos, eliminar };

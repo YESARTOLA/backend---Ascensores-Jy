@@ -20,12 +20,7 @@ const { generarInformeFinalizacionPdf, descargarArchivoImagen } = require('../ut
 const { subirObjeto, rutaDesdeKey, urlPresigned, keyDesdeRuta } = require('../utils/storage');
 const { construirKey } = require('../middleware/uploadMiddleware');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
-const {
-  sincronizarRecordatorioCotizacionUrgente,
-  sincronizarRecordatorioRevisarServicio,
-  sincronizarRecordatorioFacturarServicio,
-  sincronizarRecordatorioAvisoFinalizacion
-} = require('../utils/recordatoriosAuto');
+const { sincronizarRecordatorioCotizacionUrgente } = require('../utils/recordatoriosAuto');
 
 const CATEGORIAS_VALIDAS = ['mantenimiento', 'correctivo', 'emergencia'];
 const RESPUESTAS_VALIDAS = ['si', 'no', 'na'];
@@ -360,24 +355,13 @@ const crearFinalizacion = async (req, res) => {
       accion: 'CREATE', valor_nuevo: { id_servicio: idServicio, items: respuestasLimpias.length }, ip: req.ip
     });
 
-    // Alertas tras finalización con informe. Idempotentes (upsert por
-    // tipo+id_servicio). Cada una llega solo al rol correspondiente según
-    // `utils/visibilidadCalendario.js`:
-    //   · cotizacion_urgente            → coordinador + super_admin (legado)
-    //   · servicio_finalizado_revisar   → coordinador (revisar y corregir)
-    //   · servicio_finalizado_facturar  → contabilidad (emitir factura)
-    //   · servicio_finalizado_aviso     → admin (aviso informativo, sin cotizar)
-    Promise.allSettled([
-      sincronizarRecordatorioCotizacionUrgente(idServicio),
-      sincronizarRecordatorioRevisarServicio(idServicio),
-      sincronizarRecordatorioFacturarServicio(idServicio),
-      sincronizarRecordatorioAvisoFinalizacion(idServicio)
-    ]).then(results => {
-      results.forEach((r, i) => {
-        if (r.status === 'rejected') {
-          console.error(`Sync rec finalización [#${i}]:`, r.reason);
-        }
-      });
+    // Alerta de cotización urgente tras generar el informe. Las alertas de
+    // "servicio finalizado" (revisar / facturar / aviso) NO se sincronizan aquí:
+    // este checklist se completa mientras el servicio aún está pre-finalización,
+    // y el gate de estado las descartaría. Se sincronizan al cerrar el servicio
+    // (serviciosController.finalizar), cuando ya está en estado post-finalización.
+    sincronizarRecordatorioCotizacionUrgente(idServicio).catch(err => {
+      console.error('Sync cotización urgente:', err);
     });
 
     let urlPdf = null;

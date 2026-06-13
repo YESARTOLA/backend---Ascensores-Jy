@@ -8,6 +8,39 @@ const ESTADO_SERVICIO_FINALIZADO_TECNICO = 'Finalizado por técnico';
 const ESTADO_SERVICIO_FINALIZADO_OBSERVADO = 'Finalizado observado';
 
 /**
+ * Catálogo único de `tbl_servicios_realizados.estado_administrativo` — la etapa
+ * del servicio dentro del circuito administrativo/contable. Punto único de la
+ * verdad para revisión, elegibilidad contable, filtros y selects.
+ *
+ *  EN_EJECUCION      : servicio recién habilitado (origen cotización) o creado;
+ *                      aún no enviado a revisión.
+ *  PENDIENTE_REVISION: el técnico finalizó; espera revisión administrativa.
+ *  REVISADO          : Administración APROBÓ → habilita gestión contable.
+ *  OBSERVADO         : Administración devolvió para corrección (subsanable).
+ *  RECHAZADO         : Administración rechazó (requiere rehacer / no procede).
+ */
+const ESTADO_ADMIN_EN_EJECUCION = 'En ejecución';
+const ESTADO_ADMIN_PENDIENTE_REVISION = 'Pendiente revisión';
+const ESTADO_ADMIN_REVISADO = 'Revisado';
+const ESTADO_ADMIN_OBSERVADO = 'Observado';
+const ESTADO_ADMIN_RECHAZADO = 'Rechazado';
+
+const ESTADOS_ADMINISTRATIVOS = [
+  ESTADO_ADMIN_EN_EJECUCION,
+  ESTADO_ADMIN_PENDIENTE_REVISION,
+  ESTADO_ADMIN_REVISADO,
+  ESTADO_ADMIN_OBSERVADO,
+  ESTADO_ADMIN_RECHAZADO
+];
+
+// Resultados posibles de una revisión administrativa (payload de revisarServicio).
+const RESULTADO_REVISION = {
+  APROBADO: 'aprobado',
+  OBSERVADO: 'observado',
+  RECHAZADO: 'rechazado'
+};
+
+/**
  * Catálogo completo de estados que puede tener `tbl_servicios_proyectos.estado_servicio`.
  * Punto único de la verdad — usado por filtros, validaciones y selects.
  */
@@ -194,5 +227,12 @@ module.exports = {
   ESTADOS_POST_EJECUCION,
   ESTADOS_EMERGENCIA,
   ESTADOS_CORRECTIVO,
-  ESTADOS_ATENCION_RAPIDA
+  ESTADOS_ATENCION_RAPIDA,
+  ESTADO_ADMIN_EN_EJECUCION,
+  ESTADO_ADMIN_PENDIENTE_REVISION,
+  ESTADO_ADMIN_REVISADO,
+  ESTADO_ADMIN_OBSERVADO,
+  ESTADO_ADMIN_RECHAZADO,
+  ESTADOS_ADMINISTRATIVOS,
+  RESULTADO_REVISION
 };

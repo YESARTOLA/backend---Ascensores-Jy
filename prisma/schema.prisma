@@ -228,7 +228,7 @@ model tbl_ascensores {
   edificio               tbl_edificios               @relation(fields: [id_edificio], references: [id])
   servicios_ascensores   tbl_servicios_ascensores[]
   emergencias            tbl_emergencias[]
-  mantenimientos         tbl_mantenimientos_planes[]
+  mantenimientos_planes_ascensores tbl_mantenimientos_planes_ascensores[]
   historial              tbl_ascensores_historial[]
   atenciones_rapidas     tbl_atenciones_rapidas[]
   correctivos            tbl_correctivos[]
@@ -562,9 +562,13 @@ model tbl_servicios_realizados {
   numero_ot                    String?                 @db.VarChar(50)
   id_archivo_ot                Int?
   estado_administrativo        String                  @default("Pendiente revisión") @db.VarChar(50)
-  estado_contable              String                  @default("Pendiente") @db.VarChar(50)
   estado_cobro                 String                  @default("Pendiente de iniciar") @db.VarChar(50)
   estado_facturacion           String                  @default("Sin factura") @db.VarChar(50)
+  // Trazabilidad de la revisión administrativa (quién/cuándo/resultado/motivo).
+  revisado_por                 Int?
+  fecha_revision               DateTime?               @db.Timestamptz(6)
+  resultado_revision           String?                 @db.VarChar(20)
+  observacion_revision         String?
   estado                       Int                     @default(1)
   user_id_registration         Int?
   date_time_registration       DateTime?               @default(now()) @db.Timestamptz(6)
@@ -603,7 +607,6 @@ model tbl_entregas {
 model tbl_mantenimientos_planes {
   id                                Int                       @id @default(autoincrement())
   id_cliente                        Int
-  id_ascensor                       Int
   id_tipo_servicio                  Int
   tipo_plan                         String                    @default("continuo") @db.VarChar(20)
   frecuencia                        String?                   @db.VarChar(30)
@@ -620,11 +623,32 @@ model tbl_mantenimientos_planes {
   user_id_modification              Int?
   date_time_modification            DateTime?                 @db.Timestamptz(6)
   cliente                           tbl_clientes              @relation(fields: [id_cliente], references: [id])
-  ascensor                          tbl_ascensores            @relation(fields: [id_ascensor], references: [id])
   tipo_servicio                     tbl_tipos_servicio        @relation(fields: [id_tipo_servicio], references: [id])
+  ascensores                        tbl_mantenimientos_planes_ascensores[]
   eventos_calendario                tbl_calendario_eventos[]
   servicios_generados               tbl_servicios_proyectos[]
   recordatorios                     tbl_recordatorios[]
+}
+
+// Junction plan ↔ ascensores: un plan cubre N ascensores, cada uno con su monto
+// (el precio del catálogo del cliente repartido entre ellos). SSoT de qué
+// ascensores recibe mantenimiento un plan; la materialización de cada ocurrencia
+// copia estas filas a tbl_servicios_ascensores del servicio generado.
+model tbl_mantenimientos_planes_ascensores {
+  id                     Int                       @id @default(autoincrement())
+  id_plan                Int
+  id_ascensor            Int
+  monto                  Decimal                   @default(0) @db.Decimal(12, 2)
+  moneda                 String                    @default("PEN") @db.VarChar(10)
+  estado                 Int                       @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?                 @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?                 @db.Timestamptz(6)
+  plan                   tbl_mantenimientos_planes @relation(fields: [id_plan], references: [id], onDelete: Cascade)
+  ascensor               tbl_ascensores            @relation(fields: [id_ascensor], references: [id])
+
+  @@unique([id_plan, id_ascensor])
 }
 
 // ---------------------------------------------------------------------

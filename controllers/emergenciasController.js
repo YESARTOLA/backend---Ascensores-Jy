@@ -9,6 +9,7 @@ const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValida
 const { esServicioEditable, esEmergenciaCerrada } = require('../utils/estadoServicio');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 
 const ROLES_PRECIO_EM = ['super_admin', 'admin', 'contabilidad'];
 
@@ -35,7 +36,7 @@ const listar = async (req, res) => {
         where, orderBy: { id: 'desc' },
         include: {
           cliente: true,
-          ascensor: true,
+          ascensor: { include: { edificio: true } },
           servicio: {
             include: {
               asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
@@ -133,7 +134,7 @@ const crear = async (req, res) => {
         tipo_evento: 'emergencia',
         fecha_inicio: new Date(),
         estado_evento: 'programado',
-        color: '#ef4444'
+        color: '#dc2626'
       }
     });
 
@@ -322,9 +323,10 @@ const actualizar = async (req, res) => {
 
 /**
  * Soft-delete de una emergencia: estado = 0. Como cada emergencia crea y posee
- * un servicio vinculado (1:1), la baja arrastra ese servicio y sus artefactos
- * visibles en otros módulos (evento de calendario, folder contable,
- * recordatorios) y libera a los técnicos asignados sin otros servicios activos.
+ * un servicio vinculado (1:1), la baja arrastra ese servicio y TODA su cascada
+ * (asignaciones, checklist, evidencias, cobro, facturas, folder contable,
+ * eventos de calendario, recordatorios) vía el motor de reversión, limpia los
+ * archivos en Wasabi y libera a los técnicos sin otros servicios activos.
  * No borra físicamente: queda auditado y recuperable.
  */
 const eliminar = async (req, res) => {
@@ -337,38 +339,30 @@ const eliminar = async (req, res) => {
     if (!previo) return res.status(404).json({ error: 'Emergencia no encontrada' });
 
     const idServicio = previo.id_servicio;
+    let wasabiKeys = [];
+    let tecnicoIds = [];
     await prisma.$transaction(async (tx) => {
       const emergencia = await tx.tbl_emergencias.update({
         where: { id },
         data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
 
-      if (idServicio) {
-        await tx.tbl_servicios_proyectos.updateMany({
-          where: { id: idServicio, estado: 1 },
-          data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
-        });
-        await tx.tbl_servicios_realizados.updateMany({
-          where: { id_servicio: idServicio, estado: 1 },
-          data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
-        });
-      }
-      // Evento(s) de calendario de la emergencia y/o su servicio: baja lógica.
+      // Eventos de calendario y recordatorios ligados DIRECTAMENTE a la
+      // emergencia (los que cuelgan del servicio los cubre la cascada).
       await tx.tbl_calendario_eventos.updateMany({
-        where: {
-          estado: 1,
-          OR: [{ id_emergencia: id }, ...(idServicio ? [{ id_servicio: idServicio }] : [])]
-        },
+        where: { id_emergencia: id, estado: 1 },
         data: { estado: 0, estado_evento: 'cancelado', user_id_modification: req.user.id, date_time_modification: new Date() }
       });
-      // Recordatorios vinculados a la emergencia y/o su servicio: baja lógica.
       await tx.tbl_recordatorios.updateMany({
-        where: {
-          estado: 1,
-          OR: [{ id_emergencia: id }, ...(idServicio ? [{ id_servicio: idServicio }] : [])]
-        },
+        where: { id_emergencia: id, estado: 1 },
         data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
+
+      if (idServicio) {
+        const r = await bajaServicioCascadaEnTx(tx, idServicio, req.user.id);
+        wasabiKeys = r.wasabiKeys;
+        tecnicoIds = r.tecnicoIds;
+      }
 
       await registrarAuditoria({
         id_usuario: req.user.id, entidad: 'tbl_emergencias', id_entidad: id,
@@ -376,18 +370,8 @@ const eliminar = async (req, res) => {
       });
     });
 
-    // Liberar técnicos: volver a Disponible si no quedan otros servicios activos.
-    for (const a of (previo.servicio?.asignaciones || [])) {
-      const otrasActivas = await prisma.tbl_servicios_asignaciones.count({
-        where: {
-          id_tecnico: a.id_tecnico, estado: 1, id_servicio: { not: idServicio },
-          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
-        }
-      });
-      if (otrasActivas === 0) {
-        await prisma.tbl_tecnicos.update({ where: { id: a.id_tecnico }, data: { estado_operativo: 'Disponible' } });
-      }
-    }
+    await purgarObjetosWasabi(wasabiKeys);
+    await liberarTecnicos(tecnicoIds, idServicio);
 
     res.json({ ok: true });
   } catch (err) {

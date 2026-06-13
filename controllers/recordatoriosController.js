@@ -18,7 +18,7 @@ const includeRel = {
       asignaciones: { where: { estado: 1 } }
     }
   },
-  mantenimiento_plan: { include: { cliente: true, ascensor: true, tipo_servicio: true } },
+  mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } }, tipo_servicio: true } },
   emergencia: {
     include: {
       cliente: true,
