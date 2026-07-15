@@ -19,9 +19,24 @@
  */
 
 const { TIPO_REGISTRO } = require('./clasificacionServicio');
+const { TIPOS_EDIFICIO } = require('./catalogosEdificios');
 
 // Roles cuyo acceso se acota por los flags de ámbito. Único lugar donde se define.
 const ROLES_CON_ALCANCE = ['admin', 'coordinador'];
+
+// Roles cuyo acceso se acota por TIPO de edificio (Edificio / Obra). A diferencia
+// del ámbito Servicios/Proyectos, esta restricción aplica solo al Administrador.
+const ROLES_CON_ALCANCE_EDIFICIOS = ['admin'];
+
+// Roles acotados en la LISTA MAESTRA de clientes. El Administrador ve SIEMPRE
+// todos los clientes (dato maestro compartido) aunque su ámbito limite los
+// módulos de Servicios/Proyectos; solo el Coordinador acotado ve únicamente los
+// clientes de su(s) ámbito(s). Por eso este conjunto es más estrecho que
+// ROLES_CON_ALCANCE.
+const ROLES_CON_ALCANCE_CLIENTES = ['coordinador'];
+
+// Conjunto completo de ámbitos. Tener TODOS habilitados equivale a no estar acotado.
+const TODOS_LOS_TIPOS = Object.values(TIPO_REGISTRO);
 
 // Centinela imposible para forzar "ningún resultado" cuando un usuario acotado
 // quedara sin ámbitos (no debería ocurrir: se valida al crear/editar usuario).
@@ -32,18 +47,28 @@ function aplicaAlcance(user) {
   return !!user && ROLES_CON_ALCANCE.includes(user.rol_codigo);
 }
 
+/** ¿La lista/acceso a CLIENTES de este usuario se filtra por ámbito?
+ *  El Administrador no (ve todos los clientes); solo el Coordinador acotado. */
+function aplicaAlcanceClientes(user) {
+  return !!user && ROLES_CON_ALCANCE_CLIENTES.includes(user.rol_codigo);
+}
+
 /**
  * Lista de `tipo_registro` que el usuario puede ver.
  *   - rol no acotado → null (sin restricción).
  *   - rol acotado    → subconjunto de ['servicio','proyecto'] según sus flags.
  * Un flag ausente (p.ej. token emitido antes de esta función) se interpreta
  * como habilitado (!= 0) para no bloquear sesiones existentes.
+ * Si el usuario tiene habilitados TODOS los ámbitos no está acotado: devuelve
+ * null (sin restricción), igual que un rol no acotado, para que vea también los
+ * clientes/ascensores sin registros asociados.
  */
 function tiposRegistroPermitidos(user) {
   if (!aplicaAlcance(user)) return null;
   const tipos = [];
   if (Number(user.acceso_servicios) !== 0) tipos.push(TIPO_REGISTRO.SERVICIO);
   if (Number(user.acceso_proyectos) !== 0) tipos.push(TIPO_REGISTRO.PROYECTO);
+  if (tipos.length === TODOS_LOS_TIPOS.length) return null;
   return tipos;
 }
 
@@ -66,8 +91,13 @@ function servicioAlcanceWhere(user) {
   return { tipo_registro: inTipos(tipos) };
 }
 
-/** Fragmento Prisma para tbl_clientes: solo clientes con registros del ámbito. */
+/**
+ * Fragmento Prisma para tbl_clientes: solo clientes con registros del ámbito.
+ * El Administrador no se acota aquí (ve todos los clientes); solo el Coordinador
+ * acotado queda limitado a los clientes de su(s) ámbito(s).
+ */
 function clienteAlcanceWhere(user) {
+  if (!aplicaAlcanceClientes(user)) return {};
   const tipos = tiposRegistroPermitidos(user);
   if (tipos === null) return {};
   return { servicios: { some: { estado: 1, tipo_registro: inTipos(tipos) } } };
@@ -94,6 +124,149 @@ function porServicioRelacionWhere(user, relacion = 'servicio') {
 }
 
 /**
+ * Fragmento Prisma para filtrar tbl_cotizaciones por ámbito Servicios/Proyectos.
+ * La cotización no tiene tipo_registro propio: su clasificación la da la
+ * `categoria_funcional` del tipo de servicio PADRE (SERVICIOS↔servicio,
+ * PROYECTOS↔proyecto). Devuelve {} si el usuario no está acotado.
+ */
+function cotizacionAlcanceWhere(user) {
+  const tipos = tiposRegistroPermitidos(user);
+  if (tipos === null) return {};
+  const categorias = tipos.map(t => (t === TIPO_REGISTRO.PROYECTO ? 'PROYECTOS' : 'SERVICIOS'));
+  return { tipo_servicio: { is: { categoria_funcional: { in: categorias.length ? categorias : NINGUNO } } } };
+}
+
+// ---------------------------------------------------------------------------
+// ALCANCE por TIPO de edificio (Edificio / Obra) — solo Administrador.
+// Cada Administrador puede estar acotado a ver solo Edificios, solo Obras o
+// ambos, mediante los flags `acceso_edificios` / `acceso_obras` (tbl_usuarios).
+// Tener ambos habilitados equivale a NO estar acotado (sin restricción). Estos
+// flags se ignoran para el resto de roles (ven todos los tipos). Como un edificio
+// agrupa ascensores y casi todo lo operativo cuelga de un ascensor, el filtro se
+// propaga vía la relación a `edificio.tipo`.
+// ---------------------------------------------------------------------------
+
+const NINGUN_TIPO_EDIFICIO = ['__sin_tipo_edificio__'];
+
+/** ¿El acceso de este usuario se acota por tipo de edificio? */
+function aplicaAlcanceEdificio(user) {
+  return !!user && ROLES_CON_ALCANCE_EDIFICIOS.includes(user.rol_codigo);
+}
+
+/**
+ * Lista de `tipo` de edificio que el usuario puede ver, o null si no está acotado
+ * (rol sin alcance de edificio, o Administrador con ambos tipos habilitados). El
+ * mapeo flag→código sale del catálogo (catalogosEdificios), sin hardcodeo.
+ */
+function tiposEdificioPermitidos(user) {
+  if (!aplicaAlcanceEdificio(user)) return null;
+  const tipos = TIPOS_EDIFICIO.filter(t => Number(user[t.flag]) !== 0).map(t => t.codigo);
+  if (tipos.length === TIPOS_EDIFICIO.length) return null;
+  return tipos;
+}
+
+/** `{ in: [...] }` para el campo `tipo`, con centinela si la lista quedó vacía; o null si no aplica. */
+function tipoEdificioIn(user) {
+  const tipos = tiposEdificioPermitidos(user);
+  if (tipos === null) return null;
+  return { in: tipos.length ? tipos : NINGUN_TIPO_EDIFICIO };
+}
+
+/** Fragmento para tbl_edificios (campo `tipo` directo). */
+function edificioAlcanceWhere(user) {
+  const inTipos = tipoEdificioIn(user);
+  return inTipos ? { tipo: inTipos } : {};
+}
+
+/** Fragmento para tbl_ascensores (relación `edificio`). */
+function ascensorEdificioAlcanceWhere(user) {
+  const inTipos = tipoEdificioIn(user);
+  return inTipos ? { edificio: { is: { tipo: inTipos } } } : {};
+}
+
+/**
+ * Fragmento para una entidad con relación DIRECTA a un ascensor (emergencias,
+ * correctivos, atenciones rápidas). Opciones:
+ *   - relacion: nombre de la relación al ascensor (por defecto 'ascensor').
+ *   - fk: campo escalar del id de ascensor (por defecto 'id_ascensor').
+ *   - permitirSinAscensor: si el registro puede no tener ascensor (atención
+ *     rápida), no se oculta cuando no depende de ningún edificio (mismo criterio
+ *     que la visibilidad por estado).
+ */
+function porAscensorEdificioWhere(user, { relacion = 'ascensor', fk = 'id_ascensor', permitirSinAscensor = false } = {}) {
+  const inTipos = tipoEdificioIn(user);
+  if (!inTipos) return {};
+  const cond = { [relacion]: { is: { edificio: { is: { tipo: inTipos } } } } };
+  return permitirSinAscensor ? { OR: [{ [fk]: null }, cond] } : cond;
+}
+
+/**
+ * Fragmento para una entidad con tabla puente a ascensores (servicios, planes de
+ * mantenimiento, cotizaciones). `relacion` = junction (por defecto 'ascensores').
+ */
+function porJunctionAscensorEdificioWhere(user, relacion = 'ascensores') {
+  const inTipos = tipoEdificioIn(user);
+  return inTipos ? { [relacion]: { some: { ascensor: { is: { edificio: { is: { tipo: inTipos } } } } } } } : {};
+}
+
+/**
+ * Fragmento para una entidad que cuelga de un servicio (cobros, facturas,
+ * entregas). `relacion` = nombre de la relación al servicio (por defecto 'servicio').
+ */
+function porServicioAscensorEdificioWhere(user, relacion = 'servicio') {
+  const inTipos = tipoEdificioIn(user);
+  return inTipos
+    ? { [relacion]: { is: { ascensores: { some: { ascensor: { is: { edificio: { is: { tipo: inTipos } } } } } } } } }
+    : {};
+}
+
+/**
+ * Fragmento para entidades que cuelgan de un servicio O de un plan de
+ * mantenimiento (cobros y facturas: id_servicio o id_mantenimiento_plan, uno u
+ * otro). Se muestra si cualquiera de los dos caminos llega a un edificio de tipo
+ * permitido.
+ */
+function porServicioOPlanAscensorEdificioWhere(user) {
+  const inTipos = tipoEdificioIn(user);
+  if (!inTipos) return {};
+  const ascCond = { ascensores: { some: { ascensor: { is: { edificio: { is: { tipo: inTipos } } } } } } };
+  return { OR: [{ servicio: { is: ascCond } }, { mantenimiento_plan: { is: ascCond } }] };
+}
+
+/**
+ * Fragmento para tbl_calendario_eventos. Un evento puede colgar de un servicio,
+ * un plan de mantenimiento o una emergencia (o de ninguno, si es manual). Se
+ * muestra si su vínculo llega a un edificio de tipo permitido, o si no tiene
+ * vínculo operativo alguno (evento suelto, nunca se oculta por tipo).
+ */
+function calendarioEventoEdificioWhere(user) {
+  const inTipos = tipoEdificioIn(user);
+  if (!inTipos) return {};
+  const ascCond = { ascensores: { some: { ascensor: { is: { edificio: { is: { tipo: inTipos } } } } } } };
+  return {
+    OR: [
+      { servicio: { is: ascCond } },
+      { mantenimiento_plan: { is: ascCond } },
+      { emergencia: { is: { ascensor: { is: { edificio: { is: { tipo: inTipos } } } } } } },
+      { AND: [{ id_servicio: null }, { id_mantenimiento_plan: null }, { id_emergencia: null }] }
+    ]
+  };
+}
+
+/**
+ * Aña­de un fragmento de alcance a un `where` Prisma mediante AND, sin riesgo de
+ * colisión de claves con los filtros ya presentes. No-op si el fragmento es {}.
+ * Muta y devuelve el mismo `where`.
+ */
+function conAlcance(where, fragmento) {
+  if (fragmento && Object.keys(fragmento).length > 0) {
+    const prev = where.AND ? (Array.isArray(where.AND) ? where.AND : [where.AND]) : [];
+    where.AND = [...prev, fragmento];
+  }
+  return where;
+}
+
+/**
  * Middleware: exige que el usuario tenga el ámbito indicado para acceder al
  * módulo. `tipoRegistro` = 'servicio' | 'proyecto'.
  */
@@ -107,12 +280,27 @@ function requiereAlcance(tipoRegistro) {
 
 module.exports = {
   ROLES_CON_ALCANCE,
+  ROLES_CON_ALCANCE_CLIENTES,
+  ROLES_CON_ALCANCE_EDIFICIOS,
   aplicaAlcance,
+  aplicaAlcanceClientes,
   tiposRegistroPermitidos,
   puedeVerTipoRegistro,
   servicioAlcanceWhere,
   clienteAlcanceWhere,
   ascensorAlcanceWhere,
   porServicioRelacionWhere,
+  cotizacionAlcanceWhere,
+  // Alcance por tipo de edificio (Edificio / Obra) — solo Administrador.
+  aplicaAlcanceEdificio,
+  tiposEdificioPermitidos,
+  edificioAlcanceWhere,
+  ascensorEdificioAlcanceWhere,
+  porAscensorEdificioWhere,
+  porJunctionAscensorEdificioWhere,
+  porServicioAscensorEdificioWhere,
+  porServicioOPlanAscensorEdificioWhere,
+  calendarioEventoEdificioWhere,
+  conAlcance,
   requiereAlcance,
 };

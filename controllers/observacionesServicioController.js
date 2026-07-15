@@ -34,7 +34,12 @@ const listar = async (req, res) => {
     const observaciones = await prisma.tbl_servicios_observaciones.findMany({
       where: { id_servicio: idServicio, estado: 1 },
       orderBy: { id: 'desc' },
-      include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } }
+      include: {
+        archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
+        // Si la observación ya se jaló a una cotización, exponer su código para
+        // que el frontend la muestre como "ya cotizada" y no permita re-jalarla.
+        cotizacion: { select: { id: true, codigo: true } }
+      }
     });
     // Adjuntar info del autor y del atendedor
     const ids = [...new Set([

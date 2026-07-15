@@ -134,15 +134,23 @@ function whereElegibleContable() {
  */
 function whereCobroElegible() {
   return {
-    servicio: {
-      is: {
-        estado_servicio: { not: ESTADO_SERVICIO_CANCELADO },
-        OR: [
-          { id_cotizacion: { not: null } },
-          { servicio_realizado: { is: { estado_administrativo: { notIn: ESTADOS_ADMIN_NO_HABILITA } } } }
-        ]
+    OR: [
+      // Cobro a nivel de plan de mantenimiento: facturación única del plan,
+      // disponible desde que se crea el plan → siempre elegible (no hay servicio).
+      { id_mantenimiento_plan: { not: null } },
+      // Cobro por servicio: el servicio debe ser elegible (misma regla).
+      {
+        servicio: {
+          is: {
+            estado_servicio: { not: ESTADO_SERVICIO_CANCELADO },
+            OR: [
+              { id_cotizacion: { not: null } },
+              { servicio_realizado: { is: { estado_administrativo: { notIn: ESTADOS_ADMIN_NO_HABILITA } } } }
+            ]
+          }
+        }
       }
-    }
+    ]
   };
 }
 

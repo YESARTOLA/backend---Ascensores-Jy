@@ -102,7 +102,11 @@ async function replicarEnModulo(tx, args) {
   }
 
   if (modulo === 'mantenimiento') {
-    const tipoPlan = ['ciclico', 'continuo', 'eventual'].includes(d.tipo_plan) ? d.tipo_plan : 'ciclico';
+    // Solo existen dos tipos de plan reales: 'eventual' y 'continuo'. Cualquier
+    // otro valor (incluido el legacy 'ciclico') se normaliza a 'continuo', mismo
+    // criterio que mantenimientosController; 'ciclico' no tiene lógica propia
+    // (no materializaba ocurrencias) y quedaba como plan inerte.
+    const tipoPlan = d.tipo_plan === 'eventual' ? 'eventual' : 'continuo';
     const frecuencia = tipoPlan === 'eventual' ? null : (d.frecuencia || 'mensual');
     const frecDiasCustom = d.frecuencia_dias_custom ? Number(d.frecuencia_dias_custom) : null;
     const cantidadMant = d.cantidad_mantenimientos != null ? Number(d.cantidad_mantenimientos) : null;

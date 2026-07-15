@@ -7,13 +7,16 @@ const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
+const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
-const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { bajaServicioCascadaEnTx, bajaArchivoEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 
 // Un plan admite cupo de mantenimientos gratuitos solo si su subtipo pertenece
 // al módulo Mantenimientos (preventivo). SSoT: se deriva de modulo_asociado.
 const esModuloMantenimiento = (tipoServicio) => tipoServicio?.modulo_asociado === 'mantenimiento';
 const { idTecnicoFiltro, whereServicioGeneradoAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
+const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
+const { porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const COLOR_MANTENIMIENTO = COLORES.mantenimiento;
 
@@ -42,6 +45,10 @@ const listar = async (req, res) => {
     // tenga asignación activa.
     const filtroPlanesTecnico = whereServicioGeneradoAsignadoSiTecnico(req.user);
     if (filtroPlanesTecnico) where.servicios_generados = filtroPlanesTecnico;
+    // Oculta a roles distintos de super_admin los planes de edificios inactivos.
+    aplicarVisibilidadWhere(where, visibilidadPorJunctionWhere(req.user));
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+    conAlcance(where, porJunctionAscensorEdificioWhere(req.user));
     const result = await paginar(
       prisma.tbl_mantenimientos_planes,
       {
@@ -51,6 +58,8 @@ const listar = async (req, res) => {
           cliente: true,
           ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
           tipo_servicio: true,
+          // Cobro ÚNICO del plan (facturación a nivel de plan).
+          cobro: { select: { id: true, monto_total: true, total_abonado: true, saldo_pendiente: true, estado_cobro: true, moneda: true } },
           servicios_generados: {
             where: { estado: 1 },
             select: {
@@ -89,7 +98,7 @@ const listar = async (req, res) => {
 /**
  * Construye el payload de un evento de calendario para una fecha de programación.
  */
-function _eventoPlan({ plan, fecha, codigoServicio, idServicio, tituloBase }) {
+function _eventoPlan({ plan, fecha, fechaInicio, codigoServicio, idServicio, tituloBase }) {
   const titulo = codigoServicio
     ? `${codigoServicio} – ${tituloBase}`
     : tituloBase;
@@ -98,10 +107,33 @@ function _eventoPlan({ plan, fecha, codigoServicio, idServicio, tituloBase }) {
     id_mantenimiento_plan: plan.id,
     titulo,
     tipo_evento: 'mantenimiento',
-    fecha_inicio: combinarFechaHoraLima(fecha, plan.hora_programada),
+    // `fechaInicio` (instante absoluto) gana cuando la ocurrencia se reagenda;
+    // si no, se calcula desde la fecha + hora del plan.
+    fecha_inicio: fechaInicio || combinarFechaHoraLima(fecha, plan.hora_programada),
     estado_evento: 'programado',
     color: COLOR_MANTENIMIENTO
   };
+}
+
+/**
+ * Crea un evento de calendario (tipo 'mantenimiento') para cada servicio de la
+ * ocurrencia SALVO el primero, que ya tiene su propio evento (el de la
+ * ocurrencia). Sin esto, los N-1 servicios restantes de un plan multi-ascensor
+ * solo se verían en el calendario vía su recordatorio auto (tipo 'servicio'),
+ * apareciendo como "Servicio" y con otra nomenclatura. Con un evento por
+ * servicio, los N se ven como "Mantenimiento" con el mismo formato de título y
+ * sus recordatorios quedan deduplicados por el calendario.
+ *
+ * `servicios[0]` es el principal (ya tiene evento); se omite aquí.
+ */
+async function _crearEventosServiciosSecundarios(tx, { plan, servicios, fecha, fechaInicio, tituloBase }) {
+  const secundarios = servicios.slice(1);
+  if (secundarios.length === 0) return;
+  await Promise.all(secundarios.map(s =>
+    tx.tbl_calendario_eventos.create({
+      data: _eventoPlan({ plan, fecha, fechaInicio, codigoServicio: s.codigo, idServicio: s.id, tituloBase })
+    })
+  ));
 }
 
 /**
@@ -260,49 +292,52 @@ const crear = async (req, res) => {
         }
       });
 
-      // Nombre del edificio/obra (del primer ascensor) para el título corto.
-      const primerAsc = await tx.tbl_ascensores.findUnique({
-        where: { id: validacion.items[0].id_ascensor },
-        include: { edificio: { select: { nombre: true } } }
+      // Edificio/obra y códigos de ascensor (para el título corto y por servicio).
+      const ascData = await tx.tbl_ascensores.findMany({
+        where: { id: { in: validacion.items.map(it => it.id_ascensor) } },
+        select: { id: true, codigo: true, edificio: { select: { nombre: true } } }
       });
-      const tituloBase = _tituloBase(primerAsc?.edificio?.nombre || null);
-      const codigo = await generarCodigoServicio();
-      // El precio total por mantenimiento = suma de montos por ascensor (= precio
-      // del catálogo, ya validado). Cada ascensor del plan se materializa en el
-      // servicio con su parte.
-      const precioServicio = validacion.suma;
-      const servicio = await tx.tbl_servicios_proyectos.create({
-        data: {
-          codigo,
-          tipo_registro: 'servicio',
-          id_tipo_servicio: Number(d.id_tipo_servicio),
-          id_cliente: Number(d.id_cliente),
-          id_mantenimiento_plan: plan.id,
-          origen: 'mantenimiento',
-          titulo: tituloBase,
-          descripcion: d.observaciones || null,
-          fecha_programada: parseYMDLima(d.fecha_inicio),
-          hora_programada: d.hora_programada || null,
-          prioridad: 'media',
-          estado_servicio: 'Pendiente',
-          precio_interno: precioServicio,
-          moneda: monedaServicio,
-          sin_cobro: primerServicioGratuito ? 1 : 0,
-          es_mantenimiento_gratuito: primerServicioGratuito ? 1 : 0,
-          user_id_registration: req.user.id,
-          ascensores: {
-            create: validacion.items.map(it => ({
-              id_ascensor: it.id_ascensor,
-              monto: it.monto,
-              moneda: monedaServicio,
-              user_id_registration: req.user.id
-            }))
-          }
-        }
-      });
+      const ascById = new Map(ascData.map(a => [a.id, a]));
+      const tituloBase = _tituloBase(ascData.map(a => a.edificio?.nombre).find(Boolean) || null);
+      const fechaProgramada = parseYMDLima(d.fecha_inicio);
 
+      // Un servicio por ascensor (cada uno con su parte del precio del catálogo).
+      // El cobro NO se crea por servicio: es único a nivel de plan (abajo).
+      const ascItems = validacion.items.map(it => ({
+        id_ascensor: it.id_ascensor,
+        monto: it.monto,
+        moneda: monedaServicio,
+        codigo: ascById.get(it.id_ascensor)?.codigo || null
+      }));
+      const servicios = await _crearServiciosOcurrencia(tx, {
+        plan, tituloBase, ascItems, fechaProgramada,
+        horaProgramada: d.hora_programada || null,
+        esGratuito: primerServicioGratuito, userId: req.user.id
+      });
+      const servicioPrincipal = servicios[0];
+
+      // Evento de calendario de la ocurrencia: ligado al primer servicio (mantiene
+      // la invariante 1 evento ↔ servicio "materializado" del motor del plan).
       await tx.tbl_calendario_eventos.create({
-        data: _eventoPlan({ plan, fecha: plan.fecha_inicio, codigoServicio: codigo, idServicio: servicio.id, tituloBase })
+        data: _eventoPlan({ plan, fecha: plan.fecha_inicio, codigoServicio: servicioPrincipal.codigo, idServicio: servicioPrincipal.id, tituloBase })
+      });
+      // Un evento más por cada ascensor adicional, para que los N servicios del
+      // plan se vean todos como "Mantenimiento" con la misma nomenclatura.
+      await _crearEventosServiciosSecundarios(tx, { plan, servicios, fecha: plan.fecha_inicio, tituloBase });
+
+      // Cobro ÚNICO del plan, pero por UNA sola ocurrencia (la primera ejecución,
+      // todos los ascensores): el monto = precio por ocurrencia (= suma del precio
+      // del catálogo repartido entre los ascensores), NO multiplicado por la
+      // cantidad de mantenimientos del plan. Las ejecuciones siguientes no generan
+      // cobro automático. Si la primera ocurrencia es gratuita, el cobro nace en 0.
+      const montoPrimeraOcurrencia = primerServicioGratuito ? 0 : Number(Number(validacion.suma).toFixed(2));
+      await crearCobroInicial(tx, {
+        idMantenimientoPlan: plan.id,
+        idCliente: plan.id_cliente,
+        monto: montoPrimeraOcurrencia,
+        moneda: monedaServicio,
+        fechaCuotaUnica: plan.fecha_inicio,
+        idUsuario: req.user.id
       });
 
       let eventosFuturos = [];
@@ -316,7 +351,7 @@ const crear = async (req, res) => {
         eventosFuturos = await _crearEventosFuturos(tx, plan, fechas, tituloBase);
       }
 
-      return { plan, servicio, eventos_futuros: eventosFuturos.length };
+      return { plan, servicios, servicio: servicioPrincipal, eventos_futuros: eventosFuturos.length };
     });
 
     await registrarAuditoria({
@@ -324,7 +359,9 @@ const crear = async (req, res) => {
       accion: 'CREATE', valor_nuevo: resultado.plan, ip: req.ip
     });
     sincronizarRecordatorioMantenimientoPlan(resultado.plan.id).catch(err => console.error('Sync rec mant:', err));
-    sincronizarRecordatorioServicio(resultado.servicio.id).catch(err => console.error('Sync rec servicio:', err));
+    for (const s of resultado.servicios) {
+      sincronizarRecordatorioServicio(s.id).catch(err => console.error('Sync rec servicio:', err));
+    }
     res.status(201).json({ data: resultado });
   } catch (err) {
     console.error(err);
@@ -461,6 +498,70 @@ const actualizar = async (req, res) => {
 };
 
 /**
+ * Crea N servicios (uno por ascensor) para una ocurrencia del plan. Cada servicio
+ * cubre un solo ascensor con su parte del precio (su monto del plan) y queda listo
+ * para asignarle su propio técnico. La facturación NO ocurre por servicio: es un
+ * único cobro a nivel de plan (ver crear()), por eso estos servicios no generan
+ * cobro propio al finalizar (gate por id_mantenimiento_plan en serviciosController).
+ *
+ * @param {Array<{id_ascensor:number, monto:number, moneda:string, codigo?:string}>} ascItems
+ * @returns {Promise<Array>} servicios creados (orden = el de ascItems).
+ */
+async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fechaProgramada, horaProgramada, esGratuito, userId }) {
+  const servicios = [];
+  for (const a of ascItems) {
+    // tx-aware: ve los servicios ya creados en esta misma transacción → sin colisión.
+    const codigo = await generarCodigoServicio(tx);
+    const monto = Number(a.monto);
+    const moneda = a.moneda || 'PEN';
+    // Título por servicio: distingue el ascensor para que el coordinador asigne
+    // el técnico al servicio correcto. Sin código de ascensor, cae a tituloBase.
+    const titulo = a.codigo ? `${tituloBase} · ${a.codigo}` : tituloBase;
+    const s = await tx.tbl_servicios_proyectos.create({
+      data: {
+        codigo,
+        tipo_registro: 'servicio',
+        id_tipo_servicio: plan.id_tipo_servicio,
+        id_cliente: plan.id_cliente,
+        id_mantenimiento_plan: plan.id,
+        origen: 'mantenimiento',
+        titulo,
+        descripcion: plan.observaciones || null,
+        fecha_programada: fechaProgramada,
+        hora_programada: horaProgramada,
+        prioridad: 'media',
+        estado_servicio: 'Pendiente',
+        precio_interno: monto,
+        moneda,
+        sin_cobro: esGratuito ? 1 : 0,
+        es_mantenimiento_gratuito: esGratuito ? 1 : 0,
+        user_id_registration: userId,
+        ascensores: {
+          create: [{ id_ascensor: a.id_ascensor, monto, moneda, user_id_registration: userId }]
+        }
+      }
+    });
+    servicios.push(s);
+  }
+  return servicios;
+}
+
+/**
+ * Ordinal de ocurrencia (1-based) para una fecha dada: cantidad de fechas de
+ * ocurrencia DISTINTAS del plan estrictamente anteriores, + 1. Como cada
+ * ocurrencia genera N servicios (uno por ascensor), contar servicios sobrecontaría
+ * el cupo gratuito; por eso se cuentan fechas distintas.
+ */
+async function _ordinalOcurrencia(tx, idPlan, fechaProgramada) {
+  const previas = await tx.tbl_servicios_proyectos.findMany({
+    where: { id_mantenimiento_plan: idPlan, estado: 1, fecha_programada: { lt: fechaProgramada } },
+    select: { fecha_programada: true },
+    distinct: ['fecha_programada']
+  });
+  return previas.length + 1;
+}
+
+/**
  * Materializa un evento de calendario como servicio real dentro de una
  * transacción Prisma. Calcula el ordinal del servicio dentro del plan y
  * marca el flag de mantenimiento gratuito si corresponde.
@@ -481,7 +582,6 @@ const actualizar = async (req, res) => {
  *     se mueve el evento del calendario para mantener la vista coherente.
  */
 async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {}) {
-  const codigo = await generarCodigoServicio();
   const tituloBase = _tituloBase(_edificioNombrePlan(plan.ascensores));
 
   const horaProgramada = overrides.hora_programada || plan.hora_programada || null;
@@ -501,11 +601,10 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
     throw new Error('El plan no tiene ascensores asociados');
   }
 
-  let precio;
   let moneda;
   let montosPorAscensor;
   if (overrides.precio !== undefined && overrides.precio !== null && overrides.precio !== '') {
-    precio = Number(overrides.precio);
+    const precio = Number(overrides.precio);
     if (!Number.isFinite(precio) || precio < 0) {
       throw new Error('Precio inválido');
     }
@@ -513,7 +612,6 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
     montosPorAscensor = repartirParejo(precio, ascensoresPlan.length);
   } else {
     montosPorAscensor = ascensoresPlan.map(a => Number(a.monto));
-    precio = montosPorAscensor.reduce((acc, m) => acc + m, 0);
     moneda = ascensoresPlan[0].moneda || 'PEN';
   }
 
@@ -522,58 +620,44 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
 
   let esGratuito = false;
   if (esPreventivo && cupoGratuito > 0) {
-    const previos = await tx.tbl_servicios_proyectos.count({
-      where: {
-        id_mantenimiento_plan: plan.id,
-        estado: 1,
-        fecha_programada: { lte: fechaProgramada }
-      }
-    });
-    esGratuito = (previos + 1) <= cupoGratuito;
+    // Ordinal por OCURRENCIA (fechas distintas), no por cantidad de servicios:
+    // cada ocurrencia genera N servicios (uno por ascensor).
+    const ordinal = await _ordinalOcurrencia(tx, plan.id, fechaProgramada);
+    esGratuito = ordinal <= cupoGratuito;
   }
 
-  const servicio = await tx.tbl_servicios_proyectos.create({
-    data: {
-      codigo,
-      tipo_registro: 'servicio',
-      id_tipo_servicio: plan.id_tipo_servicio,
-      id_cliente: plan.id_cliente,
-      id_mantenimiento_plan: plan.id,
-      origen: 'mantenimiento',
-      titulo: tituloBase,
-      descripcion: plan.observaciones || null,
-      fecha_programada: fechaProgramada,
-      hora_programada: horaProgramada,
-      prioridad: 'media',
-      estado_servicio: 'Pendiente',
-      precio_interno: precio,
-      moneda,
-      sin_cobro: esGratuito ? 1 : 0,
-      es_mantenimiento_gratuito: esGratuito ? 1 : 0,
-      user_id_registration: userId,
-      ascensores: {
-        create: ascensoresPlan.map((a, i) => ({
-          id_ascensor: a.id_ascensor,
-          monto: montosPorAscensor[i],
-          moneda,
-          user_id_registration: userId
-        }))
-      }
-    }
+  // Un servicio por ascensor del plan, cada uno con su parte (sin override:
+  // el monto pactado; con override de precio: el reparto parejo). El cobro es
+  // único a nivel de plan, así que estos servicios no generan cobro propio.
+  const ascItems = ascensoresPlan.map((a, i) => ({
+    id_ascensor: a.id_ascensor,
+    monto: montosPorAscensor[i],
+    moneda,
+    codigo: a.ascensor?.codigo || null
+  }));
+  const servicios = await _crearServiciosOcurrencia(tx, {
+    plan, tituloBase, ascItems, fechaProgramada, horaProgramada, esGratuito, userId
   });
+  const servicioPrincipal = servicios[0];
 
   await tx.tbl_calendario_eventos.update({
     where: { id: evento.id },
     data: {
-      id_servicio: servicio.id,
-      titulo: `${codigo} – ${tituloBase}`,
+      id_servicio: servicioPrincipal.id,
+      titulo: `${servicioPrincipal.codigo} – ${tituloBase}`,
       ...(cambioFecha ? { fecha_inicio: fechaEventoNueva } : {}),
       user_id_modification: userId,
       date_time_modification: new Date()
     }
   });
+  // Un evento más por cada ascensor adicional de la ocurrencia (mismo instante
+  // que el principal), para que los N servicios se vean como "Mantenimiento"
+  // con la misma nomenclatura en vez de aparecer como recordatorios "Servicio".
+  await _crearEventosServiciosSecundarios(tx, {
+    plan, servicios, fechaInicio: fechaEventoNueva, tituloBase
+  });
 
-  return servicio;
+  return servicios;
 }
 
 /**
@@ -606,19 +690,21 @@ const materializarEvento = async (req, res) => {
       hora_programada: req.body?.hora_programada
     };
 
-    let servicio;
+    let servicios;
     try {
-      servicio = await prisma.$transaction(tx => _materializarEventoEnTx(tx, evento, plan, req.user.id, overrides));
+      servicios = await prisma.$transaction(tx => _materializarEventoEnTx(tx, evento, plan, req.user.id, overrides));
     } catch (e) {
       return res.status(400).json({ error: e.message });
     }
 
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: servicio.id,
-      accion: 'CREATE', valor_nuevo: servicio, ip: req.ip
-    });
-    sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync rec servicio:', err));
-    res.status(201).json({ data: { servicio } });
+    for (const s of servicios) {
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: s.id,
+        accion: 'CREATE', valor_nuevo: s, ip: req.ip
+      });
+      sincronizarRecordatorioServicio(s.id).catch(err => console.error('Sync rec servicio:', err));
+    }
+    res.status(201).json({ data: { servicios, servicio: servicios[0] } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al materializar evento: ' + err.message });
@@ -658,9 +744,11 @@ async function materializarSiguienteEventoDelPlan({ idPlan, fechaServicioFinaliz
   });
   if (!siguienteEvento) return null;
 
-  const servicio = await prisma.$transaction(tx => _materializarEventoEnTx(tx, siguienteEvento, plan, userId));
-  sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync rec servicio:', err));
-  return servicio;
+  const servicios = await prisma.$transaction(tx => _materializarEventoEnTx(tx, siguienteEvento, plan, userId));
+  for (const s of servicios) {
+    sincronizarRecordatorioServicio(s.id).catch(err => console.error('Sync rec servicio:', err));
+  }
+  return servicios[0];
 }
 
 /**
@@ -1137,6 +1225,11 @@ const eliminar = async (req, res) => {
       where: { id_mantenimiento_plan: id, estado: 1 },
       include: { cobro: { include: { pagos: { where: { estado: 1 } } } } }
     });
+    // Cobro ÚNICO del plan (la facturación es a nivel de plan, no por servicio).
+    const cobroPlan = await prisma.tbl_cobros.findFirst({
+      where: { id_mantenimiento_plan: id, estado: 1 },
+      include: { pagos: { where: { estado: 1 } } }
+    });
 
     // Bloqueo por servicios ejecutados.
     const ejecutado = serviciosGenerados.find(s => estaServicioFinalizado(s.estado_servicio));
@@ -1145,7 +1238,12 @@ const eliminar = async (req, res) => {
         error: `No se puede eliminar el plan: el servicio ${ejecutado.codigo} ya fue ejecutado. Gestione esa instancia antes de borrar el plan.`
       });
     }
-    // Bloqueo por servicios con abonos.
+    // Bloqueo por abonos: en el cobro del plan o (legacy) en algún cobro por servicio.
+    if (cobroPlan && (Number(cobroPlan.total_abonado) > 0 || (cobroPlan.pagos || []).length > 0)) {
+      return res.status(409).json({
+        error: 'No se puede eliminar el plan: su cobro ya tiene abonos registrados. Gestione el cobro antes de borrar el plan.'
+      });
+    }
     const cobrado = serviciosGenerados.find(s =>
       s.cobro && (Number(s.cobro.total_abonado) > 0 || (s.cobro.pagos || []).length > 0));
     if (cobrado) {
@@ -1180,6 +1278,22 @@ const eliminar = async (req, res) => {
         where: { id_plan: id, estado: 1 },
         data: { estado: 0, ...stamp }
       });
+
+      // Cobro único del plan + su cadena (cuotas, pagos, recordatorios, facturas).
+      // Sin abonos (bloqueado arriba), así que no hay comprobantes de pago que purgar;
+      // sí se purgan los PDF de factura del plan si los hubiera.
+      if (cobroPlan) {
+        const facturasPlan = await tx.tbl_facturas.findMany({ where: { id_mantenimiento_plan: id, estado: 1 } });
+        for (const f of facturasPlan) {
+          const key = await bajaArchivoEnTx(tx, f.id_archivo, req.user.id);
+          if (key) wasabiKeys.push(key);
+        }
+        await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
+        await tx.tbl_pagos.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
+        await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
+        await tx.tbl_facturas.updateMany({ where: { id_mantenimiento_plan: id, estado: 1 }, data: { estado: 0, ...stamp } });
+        await tx.tbl_cobros.update({ where: { id: cobroPlan.id }, data: { estado: 0, ...stamp } });
+      }
 
       const planActualizado = await tx.tbl_mantenimientos_planes.update({
         where: { id },

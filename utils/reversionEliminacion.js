@@ -116,6 +116,7 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   await tx.tbl_servicios_evidencias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_entregas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_observaciones.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+  await tx.tbl_servicios_dias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_estados_historial.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
   if (servicio.finalizacion_checklist) {

@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { paginar } = require('../utils/paginacion');
+const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
 
 const listar = async (req, res) => {
   try {
@@ -23,20 +24,7 @@ const listar = async (req, res) => {
 
     // tbl_auditoria.id_usuario no tiene relación FK declarada en Prisma, así
     // que hidratamos usuario (nombre + rol) con una consulta aparte y mergeamos.
-    const ids = Array.from(new Set(result.data.map(e => e.id_usuario).filter(Boolean)));
-    let mapaUsuarios = {};
-    if (ids.length > 0) {
-      const usuarios = await prisma.tbl_usuarios.findMany({
-        where: { id: { in: ids } },
-        select: {
-          id: true,
-          nombres: true,
-          correo: true,
-          rol: { select: { codigo: true, nombre: true } }
-        }
-      });
-      mapaUsuarios = Object.fromEntries(usuarios.map(u => [u.id, u]));
-    }
+    const mapaUsuarios = await mapaUsuariosPorId(result.data.map(e => e.id_usuario));
     const data = result.data.map(e => ({
       ...e,
       usuario: e.id_usuario ? (mapaUsuarios[e.id_usuario] || null) : null

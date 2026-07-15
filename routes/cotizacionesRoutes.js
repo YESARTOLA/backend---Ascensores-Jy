@@ -9,7 +9,10 @@ router.use(verificarToken);
 // Acceso comercial: super_admin, admin, contabilidad pueden ver.
 // Solo super_admin y admin pueden crear/editar/aprobar/rechazar.
 router.get('/', permitirRoles('super_admin', 'admin', 'contabilidad'), c.listar);
+// /exportar debe ir antes de /:id para que no lo capture como un id.
+router.get('/exportar', permitirRoles('super_admin', 'admin', 'contabilidad'), c.exportar);
 router.get('/:id', permitirRoles('super_admin', 'admin', 'contabilidad'), c.obtener);
+router.get('/:id/historial', permitirRoles('super_admin', 'admin', 'contabilidad'), c.historial);
 
 router.post('/', permitirRoles('super_admin', 'admin'), c.crear);
 router.put('/:id', permitirRoles('super_admin', 'admin'), c.actualizarCabecera);

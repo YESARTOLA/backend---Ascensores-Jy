@@ -19,7 +19,8 @@ const { parseYMDLima } = require('./tiempo');
 /**
  * @param {object} tx - cliente Prisma transaccional o el client global
  * @param {object} opts
- * @param {number} opts.idServicio
+ * @param {number} [opts.idServicio] - servicio dueño del cobro (XOR plan)
+ * @param {number} [opts.idMantenimientoPlan] - plan dueño del cobro (cobro único por el total del plan; XOR servicio)
  * @param {number} opts.idCliente
  * @param {number} opts.monto
  * @param {string} opts.moneda
@@ -30,7 +31,7 @@ const { parseYMDLima } = require('./tiempo');
  */
 async function crearCobroInicial(tx, opts) {
   const {
-    idServicio, idCliente, monto, moneda,
+    idServicio = null, idMantenimientoPlan = null, idCliente, monto, moneda,
     fechaCuotaUnica, planCuotas, saldoVariable = false, idUsuario
   } = opts;
 
@@ -53,6 +54,7 @@ async function crearCobroInicial(tx, opts) {
   return tx.tbl_cobros.create({
     data: {
       id_servicio: idServicio,
+      id_mantenimiento_plan: idMantenimientoPlan,
       id_cliente: idCliente,
       monto_total: montoNum,
       saldo_pendiente: montoNum,

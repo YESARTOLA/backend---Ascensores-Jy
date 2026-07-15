@@ -25,6 +25,8 @@ const { esServicioEditable, esCorrectivoCerrado } = require('../utils/estadoServ
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
+const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
 
@@ -46,6 +48,10 @@ const listar = async (req, res) => {
     ];
     const filtroServicio = whereServicioAsignadoSiTecnico(req.user);
     if (filtroServicio) where.servicio = filtroServicio;
+    // Oculta a roles distintos de super_admin los correctivos de edificios inactivos.
+    aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(req.user));
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+    conAlcance(where, porAscensorEdificioWhere(req.user));
 
     const result = await paginar(
       prisma.tbl_correctivos,

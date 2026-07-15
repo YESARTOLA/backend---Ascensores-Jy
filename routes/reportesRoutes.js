@@ -26,5 +26,6 @@ router.get('/historial-tecnico-ascensor', c.historialTecnicoAscensor);
 router.get('/mantenimientos-por-cliente', c.mantenimientosPorCliente);
 router.get('/mantenimientos-programados-sin-servicio', c.mantenimientosProgramadosSinServicio);
 router.get('/ingresos-por-banco', c.ingresosPorBanco);
+router.get('/clientes-estado-edificios', c.clientesEstadoEdificios);
 
 module.exports = router;

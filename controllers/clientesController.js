@@ -5,10 +5,16 @@ const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
 const {
-  aplicaAlcance,
+  aplicaAlcanceClientes,
   tiposRegistroPermitidos,
   clienteAlcanceWhere,
+  edificioAlcanceWhere,
+  porJunctionAscensorEdificioWhere,
+  porAscensorEdificioWhere,
+  porServicioOPlanAscensorEdificioWhere,
+  conAlcance,
 } = require('../utils/alcanceUsuario');
+const { visibilidadPorJunctionWhere, visibilidadPorAscensorWhere, aplicarVisibilidadWhere, veTodoPorEdificio } = require('../utils/visibilidadEdificio');
 
 const normalizarClasificacion = (v) => {
   if (v === undefined || v === null || v === '') return null;
@@ -325,7 +331,7 @@ const exportar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (aplicaAlcance(req.user)) {
+    if (aplicaAlcanceClientes(req.user)) {
       const enAmbito = await prisma.tbl_clientes.findFirst({
         where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
       });
@@ -360,22 +366,41 @@ const vista360 = async (req, res) => {
     const filtroCategoria = tipos
       ? { categoria_funcional: { in: tipos.length ? tipos.map(t => (t === 'proyecto' ? 'PROYECTOS' : 'SERVICIOS')) : ['__sin_ambito__'] } }
       : {};
-    if (aplicaAlcance(req.user)) {
+    if (aplicaAlcanceClientes(req.user)) {
       const enAmbito = await prisma.tbl_clientes.findFirst({
         where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
       });
       if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
+    // Visibilidad por estado de edificio: a los roles distintos de super_admin se
+    // les ocultan los registros de edificios inactivos también dentro del 360.
+    const whereServicios360 = aplicarVisibilidadWhere({ estado: 1, ...filtroServicio }, visibilidadPorJunctionWhere(req.user));
+    const whereEmergencias360 = aplicarVisibilidadWhere({ estado: 1 }, visibilidadPorAscensorWhere(req.user));
+    const whereMantenimientos360 = aplicarVisibilidadWhere({ estado: 1 }, visibilidadPorJunctionWhere(req.user));
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras):
+    // se filtra cada colección del 360 por el mismo criterio que en sus módulos.
+    conAlcance(whereServicios360, porJunctionAscensorEdificioWhere(req.user));
+    conAlcance(whereEmergencias360, porAscensorEdificioWhere(req.user));
+    conAlcance(whereMantenimientos360, porJunctionAscensorEdificioWhere(req.user));
+    const whereCobros360 = conAlcance({ estado: 1, ...filtroServicioRel }, porServicioOPlanAscensorEdificioWhere(req.user));
+    const whereFacturas360 = conAlcance({ estado: 1, ...filtroServicioRel }, porServicioOPlanAscensorEdificioWhere(req.user));
+    // El Super Admin ve también los edificios inactivos del cliente (para poder
+    // reactivarlos desde el 360); los demás roles solo los activos. Un Administrador
+    // acotado por tipo solo ve los edificios de su(s) tipo(s) permitido(s).
+    const includeEdificios360 = veTodoPorEdificio(req.user)
+      ? { orderBy: { id: 'desc' }, include: { ascensores: { where: { estado: 1 } }, _count: { select: { ascensores: true } } } }
+      : { ...INCLUDE_EDIFICIOS, where: { ...INCLUDE_EDIFICIOS.where, ...edificioAlcanceWhere(req.user) } };
+
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
-        edificios: INCLUDE_EDIFICIOS,
+        edificios: includeEdificios360,
         archivos: INCLUDE_ARCHIVOS,
         precios: INCLUDE_PRECIOS,
         archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
         servicios: {
-          where: { estado: 1, ...filtroServicio },
+          where: whereServicios360,
           orderBy: { id: 'desc' },
           take: 100,
           include: {
@@ -387,16 +412,16 @@ const vista360 = async (req, res) => {
         emergencias: {
           orderBy: { fecha_reporte: 'desc' },
           take: 50,
-          where: { estado: 1 },
+          where: whereEmergencias360,
           include: { ascensor: { select: { codigo: true } } }
         },
         mantenimientos: {
-          where: { estado: 1 },
+          where: whereMantenimientos360,
           include: { ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } }, tipo_servicio: true }
         },
-        cobros: { where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' } },
+        cobros: { where: whereCobros360, orderBy: { id: 'desc' } },
         facturas: {
-          where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' }, take: 50,
+          where: whereFacturas360, orderBy: { id: 'desc' }, take: 50,
           include: { archivo: true, servicio: { select: { codigo: true } } }
         },
         cotizaciones: {

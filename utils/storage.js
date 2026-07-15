@@ -13,6 +13,7 @@ const {
   DeleteObjectCommand,
   HeadObjectCommand,
   GetObjectCommand,
+  CopyObjectCommand,
   HeadBucketCommand,
   CreateBucketCommand,
   ListObjectsV2Command
@@ -74,6 +75,21 @@ async function subirObjeto({ key, body, contentType }) {
     ContentType: contentType || 'application/octet-stream'
   }));
   return { key, ruta: rutaDesdeKey(key) };
+}
+
+/**
+ * Copia un objeto existente en Wasabi a una nueva key (copia del lado servidor,
+ * sin descargar/subir el contenido). Devuelve la nueva key y su ruta para BD.
+ */
+async function copiarObjeto({ keyOrigen, keyDestino }) {
+  asegurarConfig();
+  await client.send(new CopyObjectCommand({
+    Bucket: BUCKET,
+    // CopySource debe incluir el bucket y venir URL-encoded.
+    CopySource: encodeURIComponent(`${BUCKET}/${keyOrigen}`),
+    Key: keyDestino
+  }));
+  return { key: keyDestino, ruta: rutaDesdeKey(keyDestino) };
 }
 
 async function eliminarObjeto(key) {
@@ -150,6 +166,7 @@ module.exports = {
   keyDesdeRuta,
   rutaDesdeKey,
   subirObjeto,
+  copiarObjeto,
   eliminarObjeto,
   existeObjeto,
   urlPresigned,

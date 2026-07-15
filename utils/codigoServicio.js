@@ -8,9 +8,13 @@ const prisma = require('../config/prisma');
  * Los códigos van con relleno a 6 dígitos, por lo que el orden lexicográfico
  * descendente coincide con el numérico.
  */
-async function generarCodigoServicio() {
+async function generarCodigoServicio(db = prisma) {
+  // `db` puede ser el cliente global o una transacción. Pasar la transacción es
+  // CLAVE cuando se generan varios códigos seguidos dentro de un mismo $transaction
+  // (ej. N servicios por ascensor de un plan): así cada llamada ve los servicios
+  // recién creados en la misma transacción y no colisiona el correlativo.
   const anio = new Date().getFullYear();
-  const ultimo = await prisma.tbl_servicios_proyectos.findFirst({
+  const ultimo = await db.tbl_servicios_proyectos.findFirst({
     where: { codigo: { startsWith: `SRV-${anio}-` } },
     orderBy: { codigo: 'desc' },
     select: { codigo: true }

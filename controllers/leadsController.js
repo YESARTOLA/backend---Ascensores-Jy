@@ -423,7 +423,10 @@ const convertir = async (req, res) => {
       }
       // Si el subtipo pertenece a un módulo operativo, crear su fila/plan para que
       // el servicio sea visible en Emergencias/Correctivos/Mantenimientos.
-      if (clasifLead.modulo_asociado) {
+      // atencion_rapida se omite: es punto de captura inicial, no resultado de la
+      // conversión, y replicarEnModulo exigiría contacto (nombre/teléfono) que el
+      // lead no aporta (mismo criterio que cotizacionesController y atencionesRapidasController).
+      if (clasifLead.modulo_asociado && clasifLead.modulo_asociado !== 'atencion_rapida') {
         await replicarEnModulo(tx, {
           servicio: s,
           tipoServicio: subtipoLead,

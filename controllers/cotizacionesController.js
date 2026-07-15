@@ -1,18 +1,21 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const { generarCodigoCotizacion } = require('../utils/codigoCotizacion');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { calcularTotalesVersion, normalizarPlanCuotas } = require('../utils/cotizacionCalculos');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
-const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { clonarArchivo } = require('../utils/clonarArchivo');
+const { clasificarTipoServicio, TIPO_REGISTRO } = require('../utils/clasificacionServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
+const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
+const { cotizacionAlcanceWhere, puedeVerTipoRegistro, conAlcance } = require('../utils/alcanceUsuario');
 
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
@@ -170,70 +173,141 @@ async function cargarVersionActiva(idCotizacion) {
   return { cotizacion: cot, version: ver };
 }
 
+// Include compartido por listar() y exportar() para que ambos devuelvan los
+// mismos datos (cliente, ascensores/edificio, tipos, versión vigente, servicio
+// generado).
+const INCLUDE_LISTA = {
+  cliente: { select: { id: true, nombre: true, telefono: true } },
+  ascensores: {
+    where: { estado: 1 },
+    orderBy: { orden: 'asc' },
+    include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
+  },
+  tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+  subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
+  versiones: {
+    where: { estado: 1 },
+    orderBy: { numero_version: 'desc' },
+    take: 1,
+    select: {
+      id: true, numero_version: true, estado_version: true,
+      monto_total: true, moneda: true, fecha_validez: true
+    }
+  },
+  servicios: {
+    where: { estado: 1 },
+    orderBy: { id: 'asc' },
+    select: { id: true, codigo: true, estado_servicio: true }
+  }
+};
+
+/**
+ * Construye el `where` Prisma de tbl_cotizaciones a partir de los filtros de
+ * querystring. Centralizado para que listar() y exportar() apliquen exactamente
+ * los mismos criterios (q, estado_global, cliente, tipo, rango de fechas).
+ */
+function construirWhereCotizaciones(query) {
+  const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = query;
+  const where = { estado: 1 };
+  if (q) where.OR = [
+    // Código de la cotización
+    { codigo: { contains: q, mode: 'insensitive' } },
+    // Nombre del cliente
+    { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+    // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
+    // los ascensores existentes vinculados a la cotización
+    { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+    // Nombre del edificio / obra donde están los ascensores de la cotización
+    { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
+    // Código de servicio generado por la cotización (cuando ya fue aprobada)
+    { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
+  ];
+  if (estado_global === 'Aprobadas') {
+    // Filtro agregado del frontend: todas las cotizaciones que el cliente
+    // aprobó alguna vez. No es un estado real — engloba todas las etapas con
+    // servicio en marcha, incluidas las ya facturadas/cobradas, que avanzaron
+    // más allá de 'Aceptado'.
+    where.estado_global = { in: [ESTADO_GLOBAL.ACEPTADO, ESTADO_GLOBAL.EJECUCION, ESTADO_GLOBAL.PENDIENTE, ESTADO_GLOBAL.TERMINADO] };
+  } else if (estado_global) {
+    where.estado_global = estado_global;
+  }
+  if (id_cliente) where.id_cliente = Number(id_cliente);
+  if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
+  if (desde || hasta) {
+    where.date_time_registration = {};
+    if (desde) where.date_time_registration.gte = parseYMDLima(desde);
+    if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
+  }
+  return where;
+}
+
+// Hidrata cada cotización con `creado_por` (usuario que la registró). La columna
+// user_id_registration no tiene relación FK en Prisma, así que se resuelve con
+// una consulta por lote. Muta y devuelve el mismo arreglo recibido.
+async function adjuntarCreador(cotizaciones) {
+  const mapa = await mapaUsuariosPorId(cotizaciones.map(c => c.user_id_registration));
+  for (const c of cotizaciones) {
+    c.creado_por = c.user_id_registration ? (mapa[c.user_id_registration] || null) : null;
+  }
+  return cotizaciones;
+}
+
 const listar = async (req, res) => {
   try {
     if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = req.query;
-    const where = { estado: 1 };
-    if (q) where.OR = [
-      // Código de la cotización
-      { codigo: { contains: q, mode: 'insensitive' } },
-      // Nombre del cliente
-      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
-      // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
-      // los ascensores existentes vinculados a la cotización
-      { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
-      // Nombre del edificio / obra donde están los ascensores de la cotización
-      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
-      // Código de servicio generado por la cotización (cuando ya fue aprobada)
-      { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
-    ];
-    if (estado_global) where.estado_global = estado_global;
-    if (id_cliente) where.id_cliente = Number(id_cliente);
-    if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
-    if (desde || hasta) {
-      where.date_time_registration = {};
-      if (desde) where.date_time_registration.gte = parseYMDLima(desde);
-      if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
-    }
-
+    const where = construirWhereCotizaciones(req.query);
+    conAlcance(where, cotizacionAlcanceWhere(req.user));
     const result = await paginar(
       prisma.tbl_cotizaciones,
-      {
-        where,
-        orderBy: { id: 'desc' },
-        include: {
-          cliente: { select: { id: true, nombre: true, telefono: true } },
-          ascensores: {
-            where: { estado: 1 },
-            orderBy: { orden: 'asc' },
-            include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
-          },
-          tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
-          subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
-          versiones: {
-            where: { estado: 1 },
-            orderBy: { numero_version: 'desc' },
-            take: 1,
-            select: {
-              id: true, numero_version: true, estado_version: true,
-              monto_total: true, moneda: true, fecha_validez: true
-            }
-          },
-          servicios: {
-            where: { estado: 1 },
-            orderBy: { id: 'asc' },
-            select: { id: true, codigo: true, estado_servicio: true }
-          }
-        }
-      },
+      { where, orderBy: { id: 'desc' }, include: INCLUDE_LISTA },
       req.query
     );
-
+    await adjuntarCreador(result.data);
     res.json(result);
   } catch (err) {
     console.error('[cotizaciones.listar]', err);
     res.status(500).json({ error: 'Error al listar cotizaciones' });
+  }
+};
+
+/**
+ * Exporta el listado de cotizaciones en XLSX o PDF según ?formato=excel|pdf.
+ * Reusa exactamente el mismo `where` que listar() (sin paginar).
+ */
+const exportar = async (req, res) => {
+  try {
+    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
+    const formato = String(req.query.formato || 'excel').toLowerCase();
+    if (!['excel', 'pdf'].includes(formato)) {
+      return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
+    }
+
+    const where = construirWhereCotizaciones(req.query);
+    conAlcance(where, cotizacionAlcanceWhere(req.user));
+    const cotizaciones = await prisma.tbl_cotizaciones.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      include: INCLUDE_LISTA
+    });
+    await adjuntarCreador(cotizaciones);
+
+    const { generarExcelCotizaciones, generarPdfCotizaciones } = require('../utils/cotizacionesExport');
+    const stamp = ymdLima();
+
+    if (formato === 'excel') {
+      const buffer = await generarExcelCotizaciones(cotizaciones);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.xlsx"`);
+      return res.end(buffer);
+    }
+
+    const buffer = await generarPdfCotizaciones(cotizaciones);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.pdf"`);
+    return res.end(buffer);
+  } catch (err) {
+    console.error('[cotizaciones.exportar]', err);
+    res.status(500).json({ error: 'Error al exportar cotizaciones: ' + err.message });
   }
 };
 
@@ -253,7 +327,11 @@ const obtener = async (req, res) => {
           where: { estado: 1 },
           orderBy: { numero_version: 'asc' },
           include: {
-            items: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
+            items: {
+              where: { estado: 1 },
+              orderBy: { orden: 'asc' },
+              include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } }
+            },
             archivo_pdf: true,
             archivo_respaldo: true
           }
@@ -271,10 +349,84 @@ const obtener = async (req, res) => {
     });
     if (!cotizacion) return res.status(404).json({ error: 'Cotización no encontrada' });
 
+    // Ámbito: si la cotización pertenece a un ámbito (Servicios/Proyectos) fuera
+    // del alcance del usuario, se oculta también por acceso directo vía URL.
+    const trCot = cotizacion.tipo_servicio?.categoria_funcional === 'PROYECTOS'
+      ? TIPO_REGISTRO.PROYECTO : TIPO_REGISTRO.SERVICIO;
+    if (!puedeVerTipoRegistro(req.user, trCot)) {
+      return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+
+    // Hidrata los usuarios involucrados (creador de la cotización y, por cada
+    // versión, quién la creó / aprobó / rechazó) en una sola consulta. Estas
+    // columnas no tienen relación FK en Prisma, por eso se resuelven aparte.
+    const versiones = cotizacion.versiones || [];
+    const mapa = await mapaUsuariosPorId([
+      cotizacion.user_id_registration,
+      ...versiones.flatMap(v => [v.user_id_registration, v.aprobada_por, v.rechazada_por])
+    ]);
+    const usuario = (uid) => (uid ? (mapa[uid] || null) : null);
+    cotizacion.creado_por = usuario(cotizacion.user_id_registration);
+    for (const v of versiones) {
+      v.creado_por = usuario(v.user_id_registration);
+      v.aprobada_por_usuario = usuario(v.aprobada_por);
+      v.rechazada_por_usuario = usuario(v.rechazada_por);
+    }
+
     res.json({ data: cotizacion });
   } catch (err) {
     console.error('[cotizaciones.obtener]', err);
     res.status(500).json({ error: 'Error al obtener cotización' });
+  }
+};
+
+// Línea de tiempo de la cotización: reúne los eventos auditados sobre la
+// cotización (CREATE/UPDATE/APPROVE/RE_APPROVE/REOPEN/DELETE) y sobre cada una
+// de sus versiones (NEW_VERSION/REJECT), resuelve el usuario y devuelve la
+// lista cronológica. La etiqueta legible de cada acción la pone el frontend.
+const historial = async (req, res) => {
+  try {
+    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
+    const id = Number(req.params.id);
+    const cot = await prisma.tbl_cotizaciones.findUnique({
+      where: { id },
+      select: { id: true, versiones: { select: { id: true, numero_version: true } } }
+    });
+    if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+
+    // numero_version por id de versión, para etiquetar los eventos de versión.
+    const numeroVersionPorId = Object.fromEntries(cot.versiones.map(v => [v.id, v.numero_version]));
+    const versionIds = cot.versiones.map(v => v.id);
+
+    const filtros = [{ entidad: 'tbl_cotizaciones', id_entidad: id }];
+    if (versionIds.length > 0) {
+      filtros.push({ entidad: 'tbl_cotizaciones_versiones', id_entidad: { in: versionIds } });
+    }
+    const eventos = await prisma.tbl_auditoria.findMany({
+      where: { OR: filtros },
+      orderBy: { fecha_evento: 'asc' }
+    });
+
+    const mapa = await mapaUsuariosPorId(eventos.map(e => e.id_usuario));
+    const data = eventos.map(e => ({
+      id: e.id,
+      accion: e.accion,
+      fecha_evento: e.fecha_evento,
+      ip: e.ip,
+      usuario: e.id_usuario ? (mapa[e.id_usuario] || null) : null,
+      // Número de versión afectada: directo si el evento es sobre una versión,
+      // o derivado del payload auditado (APPROVE/RE_APPROVE guardan `version`).
+      numero_version: e.entidad === 'tbl_cotizaciones_versiones'
+        ? (numeroVersionPorId[e.id_entidad] ?? null)
+        : (e.valor_nuevo?.version ?? e.valor_nuevo?.numero_version ?? null),
+      // Motivo asociado (rechazo / cambio / reapertura) cuando exista.
+      motivo: e.valor_nuevo?.motivo ?? e.valor_nuevo?.motivo_cambio ?? null
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    console.error('[cotizaciones.historial]', err);
+    res.status(500).json({ error: 'Error al obtener historial de la cotización' });
   }
 };
 
@@ -314,6 +466,13 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'El subtipo no pertenece al tipo de servicio padre seleccionado' });
     }
     const idPadreCot = subtipoCot.id_padre;
+
+    // Ámbito: un usuario acotado no puede cotizar fuera de su ámbito (Servicios/Proyectos).
+    const trCotizacion = subtipoCot.padre?.categoria_funcional === 'PROYECTOS'
+      ? TIPO_REGISTRO.PROYECTO : TIPO_REGISTRO.SERVICIO;
+    if (!puedeVerTipoRegistro(req.user, trCotizacion)) {
+      return res.status(403).json({ error: 'No tiene acceso a ese ámbito (Servicios / Proyectos) según su configuración' });
+    }
 
     let ascensoresLimpios;
     try {
@@ -360,6 +519,30 @@ const crear = async (req, res) => {
       });
       if (existentes.length !== archivosIds.length) {
         return res.status(400).json({ error: 'Uno o más archivos adjuntos no existen' });
+      }
+    }
+
+    // Observaciones de origen (flujo "crear cotización desde observaciones de un
+    // servicio"). Cada ítem puede declarar `id_observacion_origen`. Validamos que
+    // existan, pertenezcan al mismo cliente y no estén ya cotizadas; la foto de la
+    // observación se clona por ítem dentro de la transacción.
+    const obsOrigenIds = [...new Set(items
+      .map(it => Number(it.id_observacion_origen))
+      .filter(n => Number.isInteger(n) && n > 0))];
+    const obsPorId = new Map();
+    if (obsOrigenIds.length > 0) {
+      const obs = await prisma.tbl_servicios_observaciones.findMany({
+        where: { id: { in: obsOrigenIds }, estado: 1 },
+        include: { servicio: { select: { id_cliente: true } } }
+      });
+      for (const o of obs) obsPorId.set(o.id, o);
+      for (const idObs of obsOrigenIds) {
+        const o = obsPorId.get(idObs);
+        if (!o) return res.status(400).json({ error: `La observación ${idObs} no existe` });
+        if (o.id_cotizacion) return res.status(400).json({ error: `La observación ${idObs} ya fue usada en otra cotización` });
+        if (o.servicio?.id_cliente !== Number(d.id_cliente)) {
+          return res.status(400).json({ error: `La observación ${idObs} pertenece a otro cliente` });
+        }
       }
     }
 
@@ -413,6 +596,18 @@ const crear = async (req, res) => {
 
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
+        // Si el ítem viene de una observación con foto, clonamos esa foto (copia
+        // propia en Wasabi) para que el ítem conserve su imagen aunque luego se
+        // elimine la observación de origen.
+        let idArchivoItem = null;
+        const idObs = Number(it.id_observacion_origen);
+        if (Number.isInteger(idObs) && idObs > 0) {
+          const o = obsPorId.get(idObs);
+          if (o && o.id_archivo) {
+            const copia = await clonarArchivo(tx, o.id_archivo, { tipo: 'cotizaciones', usuarioId: req.user.id });
+            idArchivoItem = copia?.id || null;
+          }
+        }
         await tx.tbl_cotizaciones_items.create({
           data: {
             id_version: ver.id,
@@ -423,6 +618,7 @@ const crear = async (req, res) => {
             precio_unitario: it.precio_unitario || 0,
             descuento_porcentaje: it.descuento_porcentaje || 0,
             importe: require('../utils/cotizacionCalculos').calcularImporteLinea(it),
+            id_archivo: idArchivoItem,
             user_id_registration: req.user.id
           }
         });
@@ -439,6 +635,15 @@ const crear = async (req, res) => {
         });
       }
 
+      // Marcar las observaciones de origen como ya cotizadas (trazabilidad +
+      // evita que se vuelvan a jalar a otra cotización).
+      if (obsOrigenIds.length > 0) {
+        await tx.tbl_servicios_observaciones.updateMany({
+          where: { id: { in: obsOrigenIds } },
+          data: { id_cotizacion: cot.id, user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+      }
+
       // Si la cotización nace de un lead, marcarlo como 'Cotizado' (salvo que ya
       // esté 'Ingresado', para no degradar un lead ya convertido en servicio).
       if (cot.id_lead) {
@@ -449,7 +654,7 @@ const crear = async (req, res) => {
       }
 
       return cot;
-    });
+    }, { maxWait: 15000, timeout: 30000 });
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: creada.id,
@@ -755,6 +960,12 @@ const crearNuevaVersion = async (req, res) => {
       return ver;
     });
 
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_cotizaciones_versiones', id_entidad: nueva.id,
+      accion: 'NEW_VERSION',
+      valor_nuevo: { numero_version: nueva.numero_version, motivo_cambio: motivo }, ip: req.ip
+    });
+
     res.status(201).json({ data: nueva });
   } catch (err) {
     console.error('[cotizaciones.crearNuevaVersion]', err);
@@ -1037,7 +1248,7 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
       create: {
         id_servicio: servicioExistente.id,
         id_cliente: cot.id_cliente,
-        estado_administrativo: 'En ejecución',
+        estado_administrativo: 'En ejecución',
         estado_cobro: cobroActualizado.estado_cobro || 'Pendiente de iniciar',
         estado_facturacion: ESTADO_FACTURACION_SIN,
         user_id_registration: userId
@@ -1311,7 +1522,7 @@ const aprobar = async (req, res) => {
           id_servicio: servicio.id,
           id_cliente: cot.id_cliente,
           // técnicos quedan null hasta que se asignen y finalicen
-          estado_administrativo: 'En ejecución',
+          estado_administrativo: 'En ejecución',
           estado_cobro: 'Pendiente de iniciar',
           estado_facturacion: ESTADO_FACTURACION_SIN,
           user_id_registration: req.user.id
@@ -1329,20 +1540,26 @@ const aprobar = async (req, res) => {
       //     PRIMER ascensor; los demás siguen vinculados via tbl_servicios_proyectos_ascensores.
       //   - mantenimiento: 1 plan por cada ascensor (planes son independientes).
       //   - atencion_rapida: no aplica al aprobar cotización (es captura inicial).
-      await replicarEnModulo(tx, {
-        servicio,
-        tipoServicio: cot.subtipo_servicio,
-        idsAscensores: idsResueltos,
-        idCliente: cot.id_cliente,
-        // Sin hora de programación al aprobar; el inicio de plan de mantenimiento
-        // cae por defecto a la fecha de aprobación (hoy) salvo que el form indique
-        // una "Fecha de inicio del plan".
-        horaProgramada: null,
-        fechaProgramada: fechaAprobacion,
-        usuarioId: req.user.id,
-        datosModulo: d,
-        origenEtiqueta: `aprobación de ${cot.codigo} v${version.numero_version}`
-      });
+      //     La atención rápida es el punto de captura, no el resultado de aprobar;
+      //     replicarEnModulo exigiría contacto (nombre/teléfono) que no existe en
+      //     el flujo de aprobación, por lo que se omite (mismo criterio que
+      //     atencionesRapidasController al convertir).
+      if (clasificacionCot.modulo_asociado && clasificacionCot.modulo_asociado !== 'atencion_rapida') {
+        await replicarEnModulo(tx, {
+          servicio,
+          tipoServicio: cot.subtipo_servicio,
+          idsAscensores: idsResueltos,
+          idCliente: cot.id_cliente,
+          // Sin hora de programación al aprobar; el inicio de plan de mantenimiento
+          // cae por defecto a la fecha de aprobación (hoy) salvo que el form indique
+          // una "Fecha de inicio del plan".
+          horaProgramada: null,
+          fechaProgramada: fechaAprobacion,
+          usuarioId: req.user.id,
+          datosModulo: d,
+          origenEtiqueta: `aprobación de ${cot.codigo} v${version.numero_version}`
+        });
+      }
 
       // 4. marcar versión aprobada
       const versionApro = await tx.tbl_cotizaciones_versiones.update({
@@ -1408,7 +1625,7 @@ const aprobar = async (req, res) => {
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
-      accion: 'APPROVE', valor_nuevo: { id_servicio: resultado.servicio.id, monto: version.monto_total }, ip: req.ip
+      accion: 'APPROVE', valor_nuevo: { version: version.numero_version, id_servicio: resultado.servicio.id, monto: version.monto_total }, ip: req.ip
     });
 
     sincronizarRecordatorioServicio(resultado.servicio.id).catch(err =>
@@ -1507,7 +1724,13 @@ const generarPdf = async (req, res) => {
 
     const version = await prisma.tbl_cotizaciones_versiones.findUnique({
       where: { id_cotizacion_numero_version: { id_cotizacion: id, numero_version: numero } },
-      include: { items: { where: { estado: 1 }, orderBy: { orden: 'asc' } } }
+      include: {
+        items: {
+          where: { estado: 1 },
+          orderBy: { orden: 'asc' },
+          include: { archivo: { select: { id: true, ruta_almacenamiento: true, mime_type: true } } }
+        }
+      }
     });
     if (!version) return res.status(404).json({ error: 'Versión no encontrada' });
 
@@ -1628,7 +1851,9 @@ const eliminarArchivo = async (req, res) => {
 
 module.exports = {
   listar,
+  exportar,
   obtener,
+  historial,
   crear,
   actualizarCabecera,
   actualizarVersion,

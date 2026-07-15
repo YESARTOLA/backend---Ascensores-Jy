@@ -11,6 +11,36 @@
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const prisma = require('../config/prisma');
+const { keyDesdeRuta, obtenerStream } = require('./storage');
+
+/** Lee un stream (Body de S3) completo a Buffer. */
+async function streamABuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Descarga las fotos (solo imágenes) de los ítems que tengan una, devolviendo un
+ * Map id_item → Buffer. Falla en silencio por foto (una imagen rota no debe
+ * impedir generar el PDF).
+ */
+async function cargarImagenesItems(items) {
+  const mapa = new Map();
+  for (const it of items || []) {
+    const arch = it.archivo;
+    if (!arch || !arch.mime_type || !arch.mime_type.startsWith('image/')) continue;
+    try {
+      const key = keyDesdeRuta(arch.ruta_almacenamiento);
+      if (!key) continue;
+      const r = await obtenerStream(key);
+      mapa.set(it.id, await streamABuffer(r.Body));
+    } catch (_err) {
+      // imagen inaccesible → se omite del PDF
+    }
+  }
+  return mapa;
+}
 
 const PALETA = {
   acento: '#e8853a',
@@ -70,6 +100,9 @@ async function generarPdfCotizacion(ctx) {
   ]);
   const terminos = ctx.version.terminos || (await configuracion.obtener('COTIZACION_TERMINOS'));
   const cuentasBancarias = await obtenerCuentasBancariasPdf(ctx.version.cuentas_pdf);
+  // Fotos por ítem (las jaladas desde observaciones del técnico). Se descargan
+  // una sola vez aquí; el render de la tabla es síncrono.
+  const imagenesItems = await cargarImagenesItems(ctx.items);
 
   const doc = new PDFDocument({ size: 'A4', margin: 40 });
   const chunks = [];
@@ -188,10 +221,13 @@ async function generarPdfCotizacion(ctx) {
 
   doc.font('Helvetica').fontSize(9).fillColor(PALETA.texto);
   let alterna = false;
+  const IMG_LADO = 60; // lado de la miniatura cuadrada por ítem
   for (let i = 0; i < ctx.items.length; i++) {
     const it = ctx.items[i];
+    const imgBuf = imagenesItems.get(it.id) || null;
     const descAltura = doc.heightOfString(it.descripcion, { width: cols[1].w - 8 });
-    const altura = Math.max(18, descAltura + 8);
+    // Si el ítem trae foto, la fila debe ser lo bastante alta para texto + imagen.
+    const altura = Math.max(18, descAltura + 8 + (imgBuf ? IMG_LADO + 6 : 0));
     if (y + altura > doc.page.height - doc.page.margins.bottom - 140) {
       doc.addPage();
       y = doc.page.margins.top;
@@ -204,6 +240,14 @@ async function generarPdfCotizacion(ctx) {
     const dsctoPct = Number(it.descuento_porcentaje) || 0;
     doc.text(String(i + 1), cols[0].x + 4, y + 2, { width: cols[0].w - 8, align: cols[0].align });
     doc.text(it.descripcion, cols[1].x + 4, y + 2, { width: cols[1].w - 8 });
+    // Miniatura debajo de la descripción.
+    if (imgBuf) {
+      try {
+        doc.image(imgBuf, cols[1].x + 4, y + descAltura + 6, { fit: [IMG_LADO, IMG_LADO] });
+      } catch (_err) {
+        // formato no soportado por pdfkit (p. ej. webp) → se omite la imagen
+      }
+    }
     doc.text(`${Number(it.cantidad).toFixed(2)} ${it.unidad || ''}`, cols[2].x + 4, y + 2, { width: cols[2].w - 8, align: cols[2].align });
     doc.text(formatearMonto(it.precio_unitario, ctx.version.moneda), cols[3].x + 4, y + 2, { width: cols[3].w - 8, align: cols[3].align });
     doc.text(dsctoPct > 0 ? `${dsctoPct.toFixed(2)}%` : '—', cols[4].x + 4, y + 2, { width: cols[4].w - 8, align: cols[4].align });

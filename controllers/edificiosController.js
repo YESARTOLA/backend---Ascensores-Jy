@@ -2,6 +2,18 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { TIPOS_EDIFICIO, normalizarTipoEdificio } = require('../utils/catalogosEdificios');
 const { TIPO_REGISTRO } = require('../utils/clasificacionServicio');
+const { veTodoPorEdificio } = require('../utils/visibilidadEdificio');
+const { edificioAlcanceWhere, tiposEdificioPermitidos, conAlcance } = require('../utils/alcanceUsuario');
+
+// Filtro de estado para la lista de edificios. Solo el Super Admin puede ver los
+// inactivos; el resto de roles siempre se limita a los activos (estado=1).
+//   activos (default) | inactivos | todos
+const filtroEstadoEdificio = (user, estado) => {
+  if (!veTodoPorEdificio(user)) return { estado: 1 };
+  if (estado === 'inactivos') return { estado: 0 };
+  if (estado === 'todos') return {};
+  return { estado: 1 };
+};
 
 const trimOrNull = (v) => {
   if (v === undefined || v === null) return null;
@@ -53,13 +65,15 @@ const listarDistritos = async (_req, res) => {
 //     un servicio o proyecto (tbl_servicios_proyectos.tipo_registro), para filtrar.
 const listar = async (req, res) => {
   try {
-    const { id_cliente, q } = req.query;
-    const where = { estado: 1 };
+    const { id_cliente, q, estado } = req.query;
+    const where = { ...filtroEstadoEdificio(req.user, estado) };
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (q) where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
       { distrito: { contains: q, mode: 'insensitive' } }
     ];
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+    conAlcance(where, edificioAlcanceWhere(req.user));
     const filas = await prisma.tbl_edificios.findMany({
       where,
       orderBy: { id: 'desc' },
@@ -112,6 +126,15 @@ const obtener = async (req, res) => {
       }
     });
     if (!edificio) return res.status(404).json({ error: 'Edificio no encontrado' });
+    // Un edificio inactivo solo es accesible por el Super Admin (ni siquiera por URL).
+    if (edificio.estado !== 1 && !veTodoPorEdificio(req.user)) {
+      return res.status(404).json({ error: 'Edificio no encontrado' });
+    }
+    // Alcance por tipo: un Administrador acotado no accede al tipo no permitido ni por URL.
+    const tiposEdif = tiposEdificioPermitidos(req.user);
+    if (tiposEdif && !tiposEdif.includes(edificio.tipo)) {
+      return res.status(404).json({ error: 'Edificio no encontrado' });
+    }
     res.json({ data: edificio });
   } catch (err) {
     console.error('[edificios.obtener]', err);
@@ -206,25 +229,21 @@ const actualizar = async (req, res) => {
   }
 };
 
+// Inactiva (estado=0) o reactiva (estado=1) un edificio. Exclusivo del Super
+// Admin (ver rutas). Modelo "ocultar, no borrar": inactivar solo cambia el
+// estado del edificio; sus ascensores, servicios y proyectos quedan intactos y
+// simplemente dejan de verse para los demás roles (utils/visibilidadEdificio).
 const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { estado } = req.body;
-    // No permitir desactivar un edificio con ascensores activos (quedarían
-    // huérfanos de ubicación visible).
-    if (Number(estado) === 0) {
-      const ascensoresActivos = await prisma.tbl_ascensores.count({ where: { id_edificio: id, estado: 1 } });
-      if (ascensoresActivos > 0) {
-        return res.status(400).json({ error: 'No se puede desactivar: el edificio tiene ascensores activos' });
-      }
-    }
+    const estado = Number(req.body.estado) === 1 ? 1 : 0;
     const edificio = await prisma.tbl_edificios.update({
       where: { id },
-      data: { estado: Number(estado), user_id_modification: req.user.id, date_time_modification: new Date() }
+      data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_edificios', id_entidad: id,
-      accion: 'STATUS_CHANGE', valor_nuevo: { estado: Number(estado) }, ip: req.ip
+      accion: 'STATUS_CHANGE', valor_nuevo: { estado }, ip: req.ip
     });
     res.json({ data: edificio });
   } catch (err) {
@@ -233,4 +252,38 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listarTipos, listarDistritos, listar, obtener, crear, actualizar, cambiarEstado };
+// Inactiva o reactiva TODOS los edificios de un cliente en una sola operación.
+// Exclusivo del Super Admin (ver rutas). Pensado para cuando un cliente deja de
+// recibir servicios: oculta todos sus edificios (y lo relacionado) a los demás
+// roles. Registra auditoría por cada edificio afectado para mantener trazabilidad.
+const cambiarEstadoPorCliente = async (req, res) => {
+  try {
+    const idCliente = Number(req.params.idCliente);
+    const estado = Number(req.body.estado) === 1 ? 1 : 0;
+    const cliente = await prisma.tbl_clientes.findUnique({ where: { id: idCliente }, select: { id: true } });
+    if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    // Solo se tocan los edificios que cambian de estado (evita auditoría de ruido).
+    const aCambiar = await prisma.tbl_edificios.findMany({
+      where: { id_cliente: idCliente, estado: estado === 1 ? 0 : 1 },
+      select: { id: true }
+    });
+    if (aCambiar.length === 0) return res.json({ data: { afectados: 0 } });
+
+    const ids = aCambiar.map(e => e.id);
+    await prisma.tbl_edificios.updateMany({
+      where: { id: { in: ids } },
+      data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    await Promise.all(ids.map(id => registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_edificios', id_entidad: id,
+      accion: 'STATUS_CHANGE', valor_nuevo: { estado }, ip: req.ip
+    })));
+    res.json({ data: { afectados: ids.length } });
+  } catch (err) {
+    console.error('[edificios.cambiarEstadoPorCliente]', err);
+    res.status(500).json({ error: 'Error al cambiar el estado de los edificios del cliente' });
+  }
+};
+
+module.exports = { listarTipos, listarDistritos, listar, obtener, crear, actualizar, cambiarEstado, cambiarEstadoPorCliente };

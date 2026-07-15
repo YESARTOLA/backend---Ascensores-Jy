@@ -1,13 +1,22 @@
 /**
- * Checklist de finalización de servicio.
+ * Checklist de finalización de servicio — PROGRESIVO.
+ *
+ * El checklist se llena DURANTE la ejecución (estado "En curso"), ítem por ítem:
+ * el técnico marca cada ítem (Sí / No / N/A + nota) y, cuando marca "Sí", adjunta
+ * al menos una foto. Cada foto se guarda como una evidencia ligada a la respuesta
+ * (tbl_servicios_evidencias.id_respuesta) y puede llevar lat/long para verificar
+ * la ubicación. Al cerrar el servicio se genera el PDF del informe con las fotos
+ * junto a cada ítem.
  *
  * Endpoints:
- *  - GET    /checklist-plantillas               → lista de plantillas activas
- *  - GET    /checklist-plantillas/:categoria    → plantilla + items por categoría
- *  - PUT    /checklist-plantillas/:categoria    → reemplazo de items (super_admin/admin)
- *  - GET    /servicios/:id/finalizacion         → checklist existente (si ya se completó)
- *  - GET    /servicios/:id/finalizacion/plantilla → plantilla aplicable al servicio
- *  - POST   /servicios/:id/finalizacion         → guarda respuestas + genera PDF
+ *  - GET    /checklist-plantillas                         → lista de plantillas activas
+ *  - GET    /checklist-plantillas/:categoria              → plantilla + items por categoría
+ *  - PUT    /checklist-plantillas/:categoria              → reemplazo de items (super_admin/admin)
+ *  - GET    /servicios/:id/finalizacion                   → checklist + respuestas + fotos (panel)
+ *  - PATCH  /servicios/:id/finalizacion/items/:idItem     → guarda/actualiza la respuesta de un ítem
+ *  - POST   /servicios/:id/finalizacion/items/:idItem/fotos → adjunta una foto al ítem
+ *  - DELETE /servicios/:id/finalizacion/fotos/:idFoto     → quita una foto del ítem
+ *  - POST   /servicios/:id/finalizacion                   → genera el informe PDF (al cerrar)
  *
  * Reglas de categoría: el servicio pertenece a:
  *   'emergencia'   si está vinculado a tbl_emergencias
@@ -26,16 +35,55 @@ const CATEGORIAS_VALIDAS = ['mantenimiento', 'correctivo', 'emergencia'];
 const RESPUESTAS_VALIDAS = ['si', 'no', 'na'];
 const ROLES_EDIT_PLANTILLA = ['super_admin', 'admin'];
 
-async function resolverCategoriaParaServicio(idServicio) {
-  const s = await prisma.tbl_servicios_proyectos.findUnique({
-    where: { id: idServicio },
-    select: { emergencia: { select: { id: true } }, correctivo: { select: { id: true } } }
-  });
-  if (!s) return null;
-  if (s.emergencia) return 'emergencia';
-  if (s.correctivo) return 'correctivo';
+function categoriaDeServicio(servicio) {
+  if (servicio.emergencia) return 'emergencia';
+  if (servicio.correctivo) return 'correctivo';
   return 'mantenimiento';
 }
+
+/**
+ * ¿El usuario puede EDITAR el checklist de este servicio?
+ * Técnico responsable de documentación (o único técnico asignado) y admin/super_admin.
+ */
+function puedeEditarChecklist(user, servicio) {
+  if (['super_admin', 'admin'].includes(user.rol_codigo)) return true;
+  if (user.rol_codigo !== 'tecnico') return false;
+  const asignaciones = servicio.asignaciones || [];
+  const asig = asignaciones.find(a => a.id_tecnico === user.id_tecnico);
+  if (!asig) return false;
+  return asig.responsable_documentacion === 1 || asignaciones.length === 1;
+}
+
+/**
+ * Garantiza que exista la instancia de checklist de finalización del servicio,
+ * usando la plantilla activa de su categoría. Idempotente.
+ * @returns {Promise<{ checklist:object, plantilla:object, categoria:string }|null>}
+ *          null si la plantilla de la categoría no tiene ítems configurados.
+ */
+async function ensureChecklistFinalizacion(db, servicio, userId) {
+  const categoria = categoriaDeServicio(servicio);
+  const plantilla = await db.tbl_checklist_plantillas.findUnique({
+    where: { categoria },
+    include: { items: { where: { estado: 1 }, orderBy: [{ orden: 'asc' }, { id: 'asc' }] } }
+  });
+  if (!plantilla || plantilla.items.length === 0) return null;
+
+  let checklist = await db.tbl_servicios_finalizacion_checklist.findUnique({
+    where: { id_servicio: servicio.id }
+  });
+  if (!checklist) {
+    checklist = await db.tbl_servicios_finalizacion_checklist.create({
+      data: {
+        id_servicio: servicio.id,
+        id_plantilla: plantilla.id,
+        user_id_registration: userId
+      }
+    });
+  }
+  return { checklist, plantilla, categoria };
+}
+
+const SELECT_ARCHIVO = { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true };
 
 const listarPlantillas = async (_req, res) => {
   try {
@@ -108,8 +156,16 @@ const actualizarPlantilla = async (req, res) => {
             data: { ...data, categoria, user_id_registration: req.user.id }
           });
 
-      // Reemplazo total de items
-      await tx.tbl_checklist_plantilla_items.deleteMany({ where: { id_plantilla: cabecera.id } });
+      // Reemplazo del set ACTIVO de ítems. No se borran físicamente: las
+      // respuestas de checklists ya finalizados (tbl_servicios_finalizacion_respuestas)
+      // referencian estos ítems por id; un DELETE viola la FK (P2003) e impediría
+      // editar la plantilla en cuanto algún servicio la haya usado —y además
+      // perdería el histórico de lo que respondió el técnico. En su lugar se
+      // desactivan (estado 0) los ítems vigentes y se crean los nuevos activos.
+      await tx.tbl_checklist_plantilla_items.updateMany({
+        where: { id_plantilla: cabecera.id, estado: 1 },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
       for (const it of itemsLimpios) {
         await tx.tbl_checklist_plantilla_items.create({
           data: {
@@ -138,46 +194,259 @@ const actualizarPlantilla = async (req, res) => {
   }
 };
 
-const obtenerPlantillaParaServicio = async (req, res) => {
+const SERVICIO_INCLUDE_PERMISO = {
+  asignaciones: { where: { estado: 1 } },
+  emergencia: { select: { id: true } },
+  correctivo: { select: { id: true } }
+};
+
+/**
+ * Carga el checklist de finalización completo para el panel del frontend:
+ * plantilla (items ordenados/agrupados), respuestas por ítem y sus fotos
+ * (con archivo, lat/long y día). En estado "En curso" lo crea si no existe.
+ */
+const obtenerFinalizacion = async (req, res) => {
   try {
     const idServicio = Number(req.params.idServicio);
-    const categoria = await resolverCategoriaParaServicio(idServicio);
-    if (!categoria) return res.status(404).json({ error: 'Servicio no encontrado' });
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: idServicio },
+      include: SERVICIO_INCLUDE_PERMISO
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+    const categoria = categoriaDeServicio(servicio);
     const plantilla = await prisma.tbl_checklist_plantillas.findUnique({
       where: { categoria },
       include: { items: { where: { estado: 1 }, orderBy: [{ orden: 'asc' }, { id: 'asc' }] } }
     });
-    if (!plantilla || plantilla.items.length === 0) {
-      return res.status(400).json({
-        error: `La plantilla "${categoria}" no tiene ítems. Pídale a un administrador que la configure en /configuracion.`
-      });
-    }
-    res.json({ data: { categoria, plantilla } });
-  } catch (err) {
-    console.error('[checklistFinalizacion.obtenerPlantillaParaServicio]', err);
-    res.status(500).json({ error: 'Error al resolver plantilla' });
-  }
-};
 
-const obtenerFinalizacion = async (req, res) => {
-  try {
-    const idServicio = Number(req.params.idServicio);
+    const puedeEditar = puedeEditarChecklist(req.user, servicio) && servicio.estado_servicio === 'En curso';
+
+    // Crear el checklist al vuelo si el servicio está en curso y hay plantilla.
+    if (!plantilla || plantilla.items.length === 0) {
+      return res.json({ data: { categoria, plantilla_vacia: true, plantilla: null, checklist: null, respuestas: {}, puede_editar: puedeEditar } });
+    }
+    if (servicio.estado_servicio === 'En curso') {
+      const existe = await prisma.tbl_servicios_finalizacion_checklist.findUnique({ where: { id_servicio: idServicio } });
+      if (!existe && (puedeEditar || ['super_admin', 'admin'].includes(req.user.rol_codigo))) {
+        await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
+      }
+    }
+
     const checklist = await prisma.tbl_servicios_finalizacion_checklist.findUnique({
       where: { id_servicio: idServicio },
       include: {
-        plantilla: { include: { items: { where: { estado: 1 }, orderBy: [{ orden: 'asc' }, { id: 'asc' }] } } },
-        respuestas: { where: { estado: 1 } },
-        archivo_pdf: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
+        archivo_pdf: { select: SELECT_ARCHIVO },
+        respuestas: {
+          where: { estado: 1 },
+          include: {
+            fotos: {
+              where: { estado: 1 },
+              orderBy: { id: 'asc' },
+              include: { archivo: { select: SELECT_ARCHIVO } }
+            }
+          }
+        }
       }
     });
-    res.json({ data: checklist || null });
+
+    // Mapa id_item → respuesta (con fotos) para consumo directo del panel.
+    const respuestas = {};
+    for (const r of (checklist?.respuestas || [])) {
+      respuestas[r.id_item] = {
+        id: r.id,
+        respuesta: r.respuesta,
+        nota: r.nota || '',
+        fotos: r.fotos.map(f => ({
+          id: f.id,
+          id_archivo: f.id_archivo,
+          archivo: f.archivo,
+          latitud: f.latitud,
+          longitud: f.longitud,
+          id_dia: f.id_dia
+        }))
+      };
+    }
+
+    res.json({
+      data: {
+        categoria,
+        plantilla: { id: plantilla.id, titulo: plantilla.titulo, items: plantilla.items },
+        checklist: checklist
+          ? { id: checklist.id, id_archivo_pdf: checklist.id_archivo_pdf, archivo_pdf: checklist.archivo_pdf }
+          : null,
+        respuestas,
+        puede_editar: puedeEditar
+      }
+    });
   } catch (err) {
     console.error('[checklistFinalizacion.obtenerFinalizacion]', err);
     res.status(500).json({ error: 'Error al obtener checklist de finalización' });
   }
 };
 
-const crearFinalizacion = async (req, res) => {
+/** Guarda/actualiza la respuesta (si/no/na + nota) de un ítem. Upsert. */
+const guardarRespuestaItem = async (req, res) => {
+  try {
+    const idServicio = Number(req.params.idServicio);
+    const idItem = Number(req.params.idItem);
+    const respuesta = String(req.body?.respuesta || '').toLowerCase();
+    const nota = req.body?.nota ? String(req.body.nota).trim().substring(0, 1000) : null;
+    if (!RESPUESTAS_VALIDAS.includes(respuesta)) {
+      return res.status(400).json({ error: 'Respuesta inválida (esperado: si | no | na)' });
+    }
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: idServicio }, include: SERVICIO_INCLUDE_PERMISO
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'En curso') {
+      return res.status(400).json({ error: 'El servicio debe estar en curso para editar el checklist' });
+    }
+    if (!puedeEditarChecklist(req.user, servicio)) {
+      return res.status(403).json({ error: 'Solo el técnico responsable puede completar el checklist' });
+    }
+
+    const ctx = await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
+    if (!ctx) return res.status(400).json({ error: 'La plantilla de checklist no tiene ítems. Pídale a un administrador que la configure.' });
+
+    const item = ctx.plantilla.items.find(it => it.id === idItem);
+    if (!item) return res.status(400).json({ error: 'El ítem no pertenece al checklist de este servicio' });
+
+    const respuestaGuardada = await prisma.tbl_servicios_finalizacion_respuestas.upsert({
+      where: { id_checklist_id_item: { id_checklist: ctx.checklist.id, id_item: idItem } },
+      update: { respuesta, nota, estado: 1, user_id_modification: req.user.id, date_time_modification: new Date() },
+      create: { id_checklist: ctx.checklist.id, id_item: idItem, respuesta, nota, user_id_registration: req.user.id },
+      include: { fotos: { where: { estado: 1 }, include: { archivo: { select: SELECT_ARCHIVO } } } }
+    });
+
+    res.json({ data: respuestaGuardada });
+  } catch (err) {
+    console.error('[checklistFinalizacion.guardarRespuestaItem]', err);
+    res.status(500).json({ error: 'Error al guardar la respuesta del ítem' });
+  }
+};
+
+/** Adjunta una foto (evidencia ligada a la respuesta) a un ítem. */
+const agregarFotoItem = async (req, res) => {
+  try {
+    const idServicio = Number(req.params.idServicio);
+    const idItem = Number(req.params.idItem);
+    const { id_archivo, id_dia, latitud, longitud } = req.body || {};
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: idServicio }, include: SERVICIO_INCLUDE_PERMISO
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'En curso') {
+      return res.status(400).json({ error: 'El servicio debe estar en curso para editar el checklist' });
+    }
+    if (!puedeEditarChecklist(req.user, servicio)) {
+      return res.status(403).json({ error: 'Solo el técnico responsable puede completar el checklist' });
+    }
+
+    const idArchivo = Number(id_archivo);
+    if (!Number.isFinite(idArchivo) || idArchivo <= 0) {
+      return res.status(400).json({ error: 'Debe adjuntar un archivo válido' });
+    }
+    const archivo = await prisma.tbl_archivos.findUnique({ where: { id: idArchivo }, select: { id: true, mime_type: true } });
+    if (!archivo) return res.status(400).json({ error: 'Archivo no encontrado' });
+    if (!String(archivo.mime_type || '').startsWith('image/')) {
+      return res.status(400).json({ error: 'La evidencia del ítem debe ser una imagen' });
+    }
+
+    const ctx = await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
+    if (!ctx) return res.status(400).json({ error: 'La plantilla de checklist no tiene ítems.' });
+    if (!ctx.plantilla.items.some(it => it.id === idItem)) {
+      return res.status(400).json({ error: 'El ítem no pertenece al checklist de este servicio' });
+    }
+
+    const respuesta = await prisma.tbl_servicios_finalizacion_respuestas.findUnique({
+      where: { id_checklist_id_item: { id_checklist: ctx.checklist.id, id_item: idItem } }
+    });
+    if (!respuesta) {
+      return res.status(400).json({ error: 'Marque el ítem antes de adjuntar una foto' });
+    }
+
+    // Día del servicio (multidía). Opcional; si viene, debe pertenecer al servicio.
+    let idDia = null;
+    if (id_dia !== undefined && id_dia !== null && id_dia !== '') {
+      const dia = await prisma.tbl_servicios_dias.findFirst({
+        where: { id: Number(id_dia), id_servicio: idServicio, estado: 1 }
+      });
+      if (!dia) return res.status(400).json({ error: 'El día indicado no pertenece al servicio' });
+      idDia = dia.id;
+    }
+
+    const lat = latitud === undefined || latitud === null || latitud === '' ? null : Number(latitud);
+    const lng = longitud === undefined || longitud === null || longitud === '' ? null : Number(longitud);
+    const latOk = lat !== null && Number.isFinite(lat) && lat >= -90 && lat <= 90;
+    const lngOk = lng !== null && Number.isFinite(lng) && lng >= -180 && lng <= 180;
+
+    const idTecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
+    if (!idTecnico) return res.status(400).json({ error: 'No hay técnico asignado' });
+
+    const foto = await prisma.tbl_servicios_evidencias.create({
+      data: {
+        id_servicio: idServicio,
+        id_tecnico: idTecnico,
+        id_dia: idDia,
+        id_respuesta: respuesta.id,
+        id_archivo: idArchivo,
+        tipo_evidencia: 'Foto',
+        latitud: latOk && lngOk ? lat : null,
+        longitud: latOk && lngOk ? lng : null,
+        user_id_registration: req.user.id
+      },
+      include: { archivo: { select: SELECT_ARCHIVO } }
+    });
+
+    res.status(201).json({ data: foto });
+  } catch (err) {
+    console.error('[checklistFinalizacion.agregarFotoItem]', err);
+    res.status(500).json({ error: 'Error al adjuntar la foto del ítem' });
+  }
+};
+
+/** Quita (baja lógica) una foto de un ítem del checklist. */
+const eliminarFotoItem = async (req, res) => {
+  try {
+    const idServicio = Number(req.params.idServicio);
+    const idFoto = Number(req.params.idFoto);
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: idServicio }, include: SERVICIO_INCLUDE_PERMISO
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.estado_servicio !== 'En curso') {
+      return res.status(400).json({ error: 'El servicio debe estar en curso para editar el checklist' });
+    }
+    if (!puedeEditarChecklist(req.user, servicio)) {
+      return res.status(403).json({ error: 'Solo el técnico responsable puede completar el checklist' });
+    }
+
+    const foto = await prisma.tbl_servicios_evidencias.findFirst({
+      where: { id: idFoto, id_servicio: idServicio, estado: 1, id_respuesta: { not: null } }
+    });
+    if (!foto) return res.status(404).json({ error: 'Foto no encontrada' });
+
+    await prisma.tbl_servicios_evidencias.update({
+      where: { id: idFoto },
+      data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[checklistFinalizacion.eliminarFotoItem]', err);
+    res.status(500).json({ error: 'Error al quitar la foto del ítem' });
+  }
+};
+
+/**
+ * Genera el informe PDF del servicio a partir del checklist ya completado
+ * progresivamente. Valida completitud (todos respondidos + cada "Sí" con ≥1 foto)
+ * y enlaza el PDF al checklist. Se invoca al cerrar el servicio.
+ */
+const generarInforme = async (req, res) => {
   try {
     const idServicio = Number(req.params.idServicio);
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
@@ -185,147 +454,111 @@ const crearFinalizacion = async (req, res) => {
       include: {
         cliente: true,
         tipo_servicio: true,
-        ascensores: { where: { estado: 1 }, include: { ascensor: true } },
+        ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
         asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
+        dias: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
         emergencia: { select: { id: true } },
         correctivo: { select: { id: true } },
         historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } }
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-
-    // Permiso: técnico asignado responsable de documentación, o admin/super_admin
-    const esAdmin = ['super_admin', 'admin'].includes(req.user.rol_codigo);
-    if (!esAdmin) {
-      if (req.user.rol_codigo !== 'tecnico') {
-        return res.status(403).json({ error: 'No autorizado' });
-      }
-      const asig = servicio.asignaciones.find(a => a.id_tecnico === req.user.id_tecnico);
-      const esResponsable = asig && (asig.responsable_documentacion === 1 || servicio.asignaciones.length === 1);
-      if (!esResponsable) {
-        return res.status(403).json({ error: 'Solo el técnico responsable puede completar el checklist de finalización' });
-      }
+    if (!puedeEditarChecklist(req.user, servicio)) {
+      return res.status(403).json({ error: 'Solo el técnico responsable puede generar el informe' });
     }
 
-    const categoria = servicio.emergencia ? 'emergencia' : servicio.correctivo ? 'correctivo' : 'mantenimiento';
-    const plantilla = await prisma.tbl_checklist_plantillas.findUnique({
-      where: { categoria },
-      include: { items: { where: { estado: 1 }, orderBy: [{ orden: 'asc' }, { id: 'asc' }] } }
+    const ctx = await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
+    if (!ctx) return res.status(400).json({ error: `La plantilla de checklist no tiene ítems. Pídale a un administrador que la configure.` });
+    const { plantilla } = ctx;
+
+    // Respuestas persistidas + fotos por ítem.
+    const checklist = await prisma.tbl_servicios_finalizacion_checklist.findUnique({
+      where: { id_servicio: idServicio },
+      include: {
+        respuestas: {
+          where: { estado: 1 },
+          include: { fotos: { where: { estado: 1 }, include: { archivo: { select: SELECT_ARCHIVO } } } }
+        }
+      }
     });
-    if (!plantilla || plantilla.items.length === 0) {
-      return res.status(400).json({ error: `La plantilla "${categoria}" no tiene ítems. Pídale a un administrador que la configure.` });
+    const respuestasPorItemId = new Map((checklist?.respuestas || []).map(r => [r.id_item, r]));
+
+    // Validar completitud: todos respondidos + cada "Sí" con ≥1 foto.
+    const sinResponder = [];
+    const siSinFoto = [];
+    for (const it of plantilla.items) {
+      const r = respuestasPorItemId.get(it.id);
+      if (!r) { sinResponder.push(it.texto); continue; }
+      if (r.respuesta === 'si' && (!r.fotos || r.fotos.length === 0)) siSinFoto.push(it.texto);
+    }
+    if (sinResponder.length > 0 || siSinFoto.length > 0) {
+      const partes = [];
+      if (sinResponder.length) partes.push(`sin responder: ${sinResponder.slice(0, 5).join('; ')}${sinResponder.length > 5 ? '…' : ''}`);
+      if (siSinFoto.length) partes.push(`marcados "Sí" sin foto: ${siSinFoto.slice(0, 5).join('; ')}${siSinFoto.length > 5 ? '…' : ''}`);
+      return res.status(400).json({ error: `Checklist incompleto — ${partes.join(' · ')}` });
     }
 
-    const respuestasBody = Array.isArray(req.body?.respuestas) ? req.body.respuestas : [];
-    const indicePorId = new Map(plantilla.items.map(it => [it.id, it]));
-    const respuestasLimpias = [];
-    for (const r of respuestasBody) {
-      const idItem = Number(r?.id_item);
-      const respuesta = String(r?.respuesta || '').toLowerCase();
-      if (!indicePorId.has(idItem)) continue;
-      if (!RESPUESTAS_VALIDAS.includes(respuesta)) {
-        return res.status(400).json({ error: `Respuesta inválida para el ítem ${idItem} (esperado: si | no | na)` });
-      }
-      const nota = r?.nota ? String(r.nota).trim().substring(0, 1000) : null;
-      respuestasLimpias.push({ id_item: idItem, respuesta, nota });
-    }
-    // Validar que todos los ítems tengan respuesta
-    if (respuestasLimpias.length !== plantilla.items.length) {
-      return res.status(400).json({ error: 'Debe responder todos los ítems del checklist' });
-    }
-
-    // Cargar observaciones técnicas (incluyendo archivo adjunto si tiene)
-    // para incluirlas en el PDF y para alimentar la sección fotográfica.
+    // Observaciones técnicas (para el PDF).
     const observacionesTecnicas = await prisma.tbl_servicios_observaciones.findMany({
       where: { id_servicio: idServicio, estado: 1 },
       orderBy: { id: 'asc' },
-      include: {
-        archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
-      }
+      include: { archivo: { select: SELECT_ARCHIVO } }
     });
 
-    // Cargar evidencias fotográficas activas del servicio (tbl_servicios_evidencias).
-    const evidencias = await prisma.tbl_servicios_evidencias.findMany({
-      where: { id_servicio: idServicio, estado: 1 },
+    // Evidencias GENERALES (id_respuesta NULL) → sección fotográfica general del PDF.
+    const evidenciasGenerales = await prisma.tbl_servicios_evidencias.findMany({
+      where: { id_servicio: idServicio, estado: 1, id_respuesta: null },
       orderBy: { fecha_carga: 'asc' },
-      include: {
-        archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
-        tecnico: { select: { nombre: true } }
-      }
+      include: { archivo: { select: SELECT_ARCHIVO }, tecnico: { select: { nombre: true } } }
     });
 
-    // Construir lista unificada de fotos (evidencias + observaciones con
-    // imagen adjunta) descargando el binario desde Wasabi. Errores
-    // individuales no abortan la generación: se omiten silenciosamente.
-    const fuentesFoto = [
-      ...evidencias.map(e => ({
+    const diasPorId = new Map((servicio.dias || []).map(d => [d.id, d]));
+
+    // Descargar binarios de las fotos por ítem (para incrustarlas junto al ítem).
+    const respuestasPdf = new Map();
+    for (const it of plantilla.items) {
+      const r = respuestasPorItemId.get(it.id);
+      if (!r) continue;
+      const fotos = [];
+      for (const f of (r.fotos || [])) {
+        const buffer = await descargarArchivoImagen(f.archivo);
+        const dia = f.id_dia ? diasPorId.get(f.id_dia) : null;
+        fotos.push({
+          buffer,
+          latitud: f.latitud != null ? Number(f.latitud) : null,
+          longitud: f.longitud != null ? Number(f.longitud) : null,
+          dia: dia ? dia.orden : null
+        });
+      }
+      respuestasPdf.set(it.id, { respuesta: r.respuesta, nota: r.nota, fotos });
+    }
+
+    // Sección general: evidencias generales + observaciones con imagen.
+    const fuentesGenerales = [
+      ...evidenciasGenerales.map(e => ({
         archivo: e.archivo,
-        caption: [
-          e.tipo_evidencia || 'Foto',
-          e.tecnico?.nombre,
-          e.descripcion
-        ].filter(Boolean).join(' · ')
+        caption: [e.tipo_evidencia || 'Foto', e.tecnico?.nombre, e.descripcion].filter(Boolean).join(' · ')
       })),
       ...observacionesTecnicas.filter(o => o.archivo).map(o => ({
         archivo: o.archivo,
         caption: `Observación: ${(o.texto || '').slice(0, 90)}${(o.texto || '').length > 90 ? '…' : ''}`
       }))
     ];
-    const fotos = [];
-    for (const f of fuentesFoto) {
+    const fotosGenerales = [];
+    for (const f of fuentesGenerales) {
       const buffer = await descargarArchivoImagen(f.archivo);
-      if (buffer) fotos.push({ buffer, caption: f.caption });
+      if (buffer) fotosGenerales.push({ buffer, caption: f.caption });
     }
 
     const ejecucion = derivarEjecucion(servicio);
 
-    // Persistencia transaccional: checklist + respuestas; el PDF se genera después
-    // de la transacción (operación I/O) y se asigna mediante un UPDATE final.
-    const checklistGuardado = await prisma.$transaction(async (tx) => {
-      const existente = await tx.tbl_servicios_finalizacion_checklist.findUnique({ where: { id_servicio: idServicio } });
-      const cabecera = existente
-        ? await tx.tbl_servicios_finalizacion_checklist.update({
-            where: { id: existente.id },
-            data: {
-              id_plantilla: plantilla.id,
-              completado_por: req.user.id,
-              user_id_modification: req.user.id,
-              date_time_modification: new Date()
-            }
-          })
-        : await tx.tbl_servicios_finalizacion_checklist.create({
-            data: {
-              id_servicio: idServicio,
-              id_plantilla: plantilla.id,
-              completado_por: req.user.id,
-              user_id_registration: req.user.id
-            }
-          });
-
-      await tx.tbl_servicios_finalizacion_respuestas.deleteMany({ where: { id_checklist: cabecera.id } });
-      for (const r of respuestasLimpias) {
-        await tx.tbl_servicios_finalizacion_respuestas.create({
-          data: {
-            id_checklist: cabecera.id,
-            id_item: r.id_item,
-            respuesta: r.respuesta,
-            nota: r.nota,
-            user_id_registration: req.user.id
-          }
-        });
-      }
-      return cabecera;
-    });
-
-    // Generar PDF y subirlo a Wasabi
-    const respuestasPorItem = new Map(respuestasLimpias.map(r => [r.id_item, r]));
     const buffer = await generarInformeFinalizacionPdf({
       servicio,
       plantilla,
-      respuestasPorItem,
+      respuestasPorItem: respuestasPdf,
       observacionesTecnicas,
       ejecucion,
-      fotos
+      fotos: fotosGenerales
     });
     const nombre = `${servicio.codigo}-informe.pdf`;
     const key = construirKey('informes-servicio', nombre);
@@ -341,25 +574,23 @@ const crearFinalizacion = async (req, res) => {
       }
     });
     const checklistFinal = await prisma.tbl_servicios_finalizacion_checklist.update({
-      where: { id: checklistGuardado.id },
-      data: { id_archivo_pdf: archivo.id, user_id_modification: req.user.id, date_time_modification: new Date() },
-      include: {
-        plantilla: { include: { items: { where: { estado: 1 }, orderBy: [{ orden: 'asc' }, { id: 'asc' }] } } },
-        respuestas: { where: { estado: 1 } },
-        archivo_pdf: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
-      }
+      where: { id: ctx.checklist.id },
+      data: {
+        id_archivo_pdf: archivo.id,
+        completado_por: req.user.id,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      },
+      include: { archivo_pdf: { select: SELECT_ARCHIVO } }
     });
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_finalizacion_checklist', id_entidad: checklistFinal.id,
-      accion: 'CREATE', valor_nuevo: { id_servicio: idServicio, items: respuestasLimpias.length }, ip: req.ip
+      accion: 'UPDATE', valor_nuevo: { id_servicio: idServicio, items: plantilla.items.length, informe: true }, ip: req.ip
     });
 
     // Alerta de cotización urgente tras generar el informe. Las alertas de
-    // "servicio finalizado" (revisar / facturar / aviso) NO se sincronizan aquí:
-    // este checklist se completa mientras el servicio aún está pre-finalización,
-    // y el gate de estado las descartaría. Se sincronizan al cerrar el servicio
-    // (serviciosController.finalizar), cuando ya está en estado post-finalización.
+    // "servicio finalizado" se sincronizan al cerrar el servicio (serviciosController).
     sincronizarRecordatorioCotizacionUrgente(idServicio).catch(err => {
       console.error('Sync cotización urgente:', err);
     });
@@ -369,17 +600,19 @@ const crearFinalizacion = async (req, res) => {
 
     res.status(201).json({ data: { ...checklistFinal, url_pdf: urlPdf } });
   } catch (err) {
-    console.error('[checklistFinalizacion.crearFinalizacion]', err);
-    res.status(500).json({ error: 'Error al guardar checklist de finalización: ' + err.message });
+    console.error('[checklistFinalizacion.generarInforme]', err);
+    res.status(500).json({ error: 'Error al generar el informe de finalización: ' + err.message });
   }
 };
 
 module.exports = {
-  resolverCategoriaParaServicio,
+  ensureChecklistFinalizacion,
   listarPlantillas,
   obtenerPlantilla,
   actualizarPlantilla,
-  obtenerPlantillaParaServicio,
   obtenerFinalizacion,
-  crearFinalizacion
+  guardarRespuestaItem,
+  agregarFotoItem,
+  eliminarFotoItem,
+  generarInforme
 };

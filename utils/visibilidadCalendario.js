@@ -14,7 +14,7 @@
  */
 const VISIBILIDAD_POR_ROL = {
   super_admin:  { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
-  admin:        { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'servicio_finalizado_aviso'] },
+  admin:        { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
   coordinador:  { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
   tecnico:      { operativos: 'asignados', tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia'] },
   contabilidad: { operativos: 'todos',     tipos_recordatorio: ['cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] },

@@ -482,6 +482,56 @@ const moraPorCliente = async (req, res) => {
   }
 };
 
+// Estado de los edificios por cliente. Clasifica cada cliente activo en cuatro
+// grupos mutuamente excluyentes (la suma cuadra con el total de clientes):
+//   activos      → tiene edificios y todos están activos
+//   inactivos    → tiene edificios y todos están inactivos (dejó de recibir servicios)
+//   mixto        → tiene edificios activos e inactivos
+//   sin_edificios→ no tiene edificios registrados
+// Exclusivo del Super Admin: es el único que ve el estado de edificios inactivos.
+const GRUPO_EDIFICIOS = { ACTIVOS: 'activos', INACTIVOS: 'inactivos', MIXTO: 'mixto', SIN_EDIFICIOS: 'sin_edificios' };
+const ORDEN_GRUPO_EDIFICIOS = [GRUPO_EDIFICIOS.INACTIVOS, GRUPO_EDIFICIOS.MIXTO, GRUPO_EDIFICIOS.ACTIVOS, GRUPO_EDIFICIOS.SIN_EDIFICIOS];
+
+const clasificarEdificiosCliente = (edificios) => {
+  const total = edificios.length;
+  if (total === 0) return GRUPO_EDIFICIOS.SIN_EDIFICIOS;
+  const activos = edificios.filter(e => e.estado === 1).length;
+  const inactivos = total - activos;
+  if (inactivos === 0) return GRUPO_EDIFICIOS.ACTIVOS;
+  if (activos === 0) return GRUPO_EDIFICIOS.INACTIVOS;
+  return GRUPO_EDIFICIOS.MIXTO;
+};
+
+const clientesEstadoEdificios = async (req, res) => {
+  try {
+    if (req.user.rol_codigo !== 'super_admin') return res.status(403).json({ error: 'No autorizado' });
+    const clientes = await prisma.tbl_clientes.findMany({
+      where: { estado: 1 },
+      select: { id: true, nombre: true, edificios: { select: { estado: true } } },
+      orderBy: { nombre: 'asc' }
+    });
+    const data = clientes.map(c => {
+      const total = c.edificios.length;
+      const activos = c.edificios.filter(e => e.estado === 1).length;
+      return {
+        cliente: { id: c.id, nombre: c.nombre },
+        activos,
+        inactivos: total - activos,
+        total,
+        grupo: clasificarEdificiosCliente(c.edificios)
+      };
+    });
+    data.sort((a, b) => {
+      const da = ORDEN_GRUPO_EDIFICIOS.indexOf(a.grupo) - ORDEN_GRUPO_EDIFICIOS.indexOf(b.grupo);
+      return da !== 0 ? da : a.cliente.nombre.localeCompare(b.cliente.nombre, 'es');
+    });
+    res.json({ data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error reporte estado de edificios por cliente' });
+  }
+};
+
 const facturados = async (req, res) => {
   try {
     if (!ROLES_PRECIO.includes(req.user.rol_codigo)) return res.status(403).json({ error: 'No autorizado' });
@@ -818,5 +868,6 @@ module.exports = {
   emergenciasAtendidas, mantenimientosCumplidos, serviciosFinalizados,
   pendientesDeCobro, cobrosVencidos, historialTecnicoAscensor,
   mantenimientosPorCliente, mantenimientosProgramadosSinServicio,
-  ingresosPorBanco, correctivos, atencionesRapidas
+  ingresosPorBanco, correctivos, atencionesRapidas,
+  clientesEstadoEdificios
 };

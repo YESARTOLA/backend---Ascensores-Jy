@@ -77,6 +77,10 @@ model tbl_usuarios {
   // 1 = el usuario accede a ese ámbito. Para el resto de roles se ignoran (siempre 1).
   acceso_servicios       Int           @default(1)
   acceso_proyectos       Int           @default(1)
+  // Alcance por tipo de edificio (solo Administrador): ver Edificios y/o Obras.
+  // 1 = habilitado. Ambos en 1 = sin restricción. Para el resto de roles se ignoran.
+  acceso_edificios       Int           @default(1)
+  acceso_obras           Int           @default(1)
   ultimo_login           DateTime?     @db.Timestamptz(6)
   estado                 Int           @default(1)
   user_id_registration   Int?
@@ -368,6 +372,9 @@ model tbl_servicios_proyectos {
   descripcion               String?
   fecha_programada          DateTime?                         @db.Date
   hora_programada           String?                           @db.VarChar(10)
+  // Días que dura el trabajo (consecutivos desde fecha_programada). 1 = servicio
+  // de un solo día (retrocompatible). La grilla de días vive en tbl_servicios_dias.
+  duracion_dias             Int                               @default(1)
   fecha_estimada_entrega    DateTime?                         @db.Date
   prioridad                 String                            @default("media") @db.VarChar(20)
   estado_servicio           String                            @default("Pendiente") @db.VarChar(50)
@@ -387,6 +394,7 @@ model tbl_servicios_proyectos {
   cotizacion                tbl_cotizaciones?                 @relation(fields: [id_cotizacion], references: [id])
   ascensores                tbl_servicios_ascensores[]
   asignaciones              tbl_servicios_asignaciones[]
+  dias                      tbl_servicios_dias[]
   checklists                tbl_checklists_salida[]
   guias                     tbl_servicios_guias[]
   evidencias                tbl_servicios_evidencias[]
@@ -416,6 +424,9 @@ model tbl_servicios_observaciones {
   atendida_por           Int?
   fecha_atendida         DateTime?               @db.Timestamptz(6)
   genera_alerta          Int                     @default(0)
+  // Cotización a la que esta observación fue "jalada" como ítem (si la hay).
+  // Marca la observación como ya cotizada para no convertirla dos veces.
+  id_cotizacion          Int?
   estado                 Int                     @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?               @default(now()) @db.Timestamptz(6)
@@ -423,8 +434,10 @@ model tbl_servicios_observaciones {
   date_time_modification DateTime?               @db.Timestamptz(6)
   servicio               tbl_servicios_proyectos @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
   archivo                tbl_archivos?           @relation(fields: [id_archivo], references: [id])
+  cotizacion             tbl_cotizaciones?       @relation("ObservacionCotizada", fields: [id_cotizacion], references: [id])
 
   @@index([id_servicio])
+  @@index([id_cotizacion])
 }
 
 model tbl_servicios_ascensores {
@@ -532,18 +545,54 @@ model tbl_servicios_evidencias {
   id                     Int                     @id @default(autoincrement())
   id_servicio            Int
   id_tecnico             Int
+  id_dia                 Int?
+  // Si está presente, esta evidencia es la FOTO de un ítem del checklist de
+  // finalización (no una evidencia "general" del servicio). Las evidencias
+  // generales (mínimo 1, 1 por día en multidía) son las que tienen id_respuesta
+  // NULL. Las fotos de ítem capturan además lat/long para verificar ubicación.
+  id_respuesta           Int?
   id_archivo             Int?
   tipo_evidencia         String                  @default("Foto") @db.VarChar(30)
   descripcion            String?
+  latitud                Decimal?                @db.Decimal(10, 7)
+  longitud               Decimal?                @db.Decimal(10, 7)
   fecha_carga            DateTime                @default(now()) @db.Timestamptz(6)
   estado                 Int                     @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?               @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?               @db.Timestamptz(6)
-  servicio               tbl_servicios_proyectos @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
-  tecnico                tbl_tecnicos            @relation(fields: [id_tecnico], references: [id])
-  archivo                tbl_archivos?           @relation(fields: [id_archivo], references: [id])
+  servicio               tbl_servicios_proyectos                @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
+  tecnico                tbl_tecnicos                           @relation(fields: [id_tecnico], references: [id])
+  dia                    tbl_servicios_dias?                    @relation(fields: [id_dia], references: [id])
+  archivo                tbl_archivos?                          @relation(fields: [id_archivo], references: [id])
+  respuesta              tbl_servicios_finalizacion_respuestas? @relation(fields: [id_respuesta], references: [id], onDelete: SetNull)
+
+  @@index([id_dia])
+  @@index([id_respuesta])
+}
+
+// Un día programado del trabajo (servicios/proyectos multidía). Fuente de verdad
+// de la grilla de días: una fila por día consecutivo desde fecha_programada.
+// La completitud de un día NO se almacena: se DERIVA de tener ≥1 evidencia activa
+// (evita columnas que se desincronizan). Cada día tiene su evento de calendario.
+model tbl_servicios_dias {
+  id                     Int                       @id @default(autoincrement())
+  id_servicio            Int
+  orden                  Int
+  fecha                  DateTime                  @db.Date
+  estado                 Int                       @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?                 @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?                 @db.Timestamptz(6)
+  servicio               tbl_servicios_proyectos   @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
+  evidencias             tbl_servicios_evidencias[]
+  eventos                tbl_calendario_eventos[]
+
+  @@unique([id_servicio, orden])
+  @@index([id_servicio])
+  @@index([fecha])
 }
 
 // ---------------------------------------------------------------------
@@ -628,6 +677,9 @@ model tbl_mantenimientos_planes {
   eventos_calendario                tbl_calendario_eventos[]
   servicios_generados               tbl_servicios_proyectos[]
   recordatorios                     tbl_recordatorios[]
+  // Facturación a nivel de plan: un único cobro por el total del plan + sus facturas.
+  cobro                             tbl_cobros?
+  facturas                          tbl_facturas[]
 }
 
 // Junction plan ↔ ascensores: un plan cubre N ascensores, cada uno con su monto
@@ -798,6 +850,7 @@ model tbl_leads_cotizaciones {
 model tbl_calendario_eventos {
   id                     Int                        @id @default(autoincrement())
   id_servicio            Int?
+  id_dia                 Int?
   id_mantenimiento_plan  Int?
   id_emergencia          Int?
   titulo                 String                     @db.VarChar(200)
@@ -812,8 +865,11 @@ model tbl_calendario_eventos {
   user_id_modification   Int?
   date_time_modification DateTime?                  @db.Timestamptz(6)
   servicio               tbl_servicios_proyectos?   @relation(fields: [id_servicio], references: [id])
+  dia                    tbl_servicios_dias?        @relation(fields: [id_dia], references: [id])
   mantenimiento_plan     tbl_mantenimientos_planes? @relation(fields: [id_mantenimiento_plan], references: [id])
   emergencia             tbl_emergencias?           @relation(fields: [id_emergencia], references: [id])
+
+  @@index([id_dia])
 }
 
 // ---------------------------------------------------------------------
@@ -822,7 +878,11 @@ model tbl_calendario_eventos {
 
 model tbl_cobros {
   id                        Int                        @id @default(autoincrement())
-  id_servicio               Int                        @unique
+  // Un cobro pertenece a un servicio XOR a un plan de mantenimiento. Los planes
+  // facturan en un único cobro por el total (no por servicio); ahí id_servicio
+  // es null e id_mantenimiento_plan está set.
+  id_servicio               Int?                       @unique
+  id_mantenimiento_plan     Int?                       @unique
   id_cliente                Int
   monto_total               Decimal                    @default(0) @db.Decimal(12, 2)
   moneda                    String                     @default("PEN") @db.VarChar(10)
@@ -842,7 +902,8 @@ model tbl_cobros {
   date_time_registration    DateTime?                  @default(now()) @db.Timestamptz(6)
   user_id_modification      Int?
   date_time_modification    DateTime?                  @db.Timestamptz(6)
-  servicio                  tbl_servicios_proyectos    @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
+  servicio                  tbl_servicios_proyectos?   @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
+  mantenimiento_plan        tbl_mantenimientos_planes? @relation(fields: [id_mantenimiento_plan], references: [id])
   cliente                   tbl_clientes               @relation(fields: [id_cliente], references: [id])
   cuotas                    tbl_cobros_cuotas[]
   pagos                     tbl_pagos[]
@@ -912,7 +973,10 @@ model tbl_cobros_recordatorios {
 
 model tbl_facturas {
   id                     Int                     @id @default(autoincrement())
-  id_servicio            Int
+  // Una factura referencia un servicio XOR un plan de mantenimiento (las del plan
+  // facturan el cobro único del plan; ahí id_servicio es null).
+  id_servicio            Int?
+  id_mantenimiento_plan  Int?
   id_cobro               Int?
   id_cuota               Int?
   id_cliente             Int
@@ -927,7 +991,8 @@ model tbl_facturas {
   date_time_registration DateTime?               @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?               @db.Timestamptz(6)
-  servicio               tbl_servicios_proyectos @relation(fields: [id_servicio], references: [id])
+  servicio               tbl_servicios_proyectos?  @relation(fields: [id_servicio], references: [id])
+  mantenimiento_plan     tbl_mantenimientos_planes? @relation(fields: [id_mantenimiento_plan], references: [id])
   cobro                  tbl_cobros?             @relation(fields: [id_cobro], references: [id])
   cuota                  tbl_cobros_cuotas?      @relation(fields: [id_cuota], references: [id])
   cliente                tbl_clientes            @relation(fields: [id_cliente], references: [id])
@@ -965,6 +1030,7 @@ model tbl_archivos {
   servicios_observaciones tbl_servicios_observaciones[]
   finalizacion_informes   tbl_servicios_finalizacion_checklist[]
   leads_cotizaciones      tbl_leads_cotizaciones[]
+  cotizaciones_items      tbl_cotizaciones_items[]     @relation("ItemCotizacionArchivo")
 }
 
 // ---------------------------------------------------------------------
@@ -1119,6 +1185,7 @@ model tbl_cotizaciones {
   servicios              tbl_servicios_proyectos[]
   versiones              tbl_cotizaciones_versiones[]
   archivos               tbl_cotizaciones_archivos[]
+  observaciones_origen   tbl_servicios_observaciones[] @relation("ObservacionCotizada")
 
   @@index([id_cliente])
   @@index([estado_global])
@@ -1192,12 +1259,15 @@ model tbl_cotizaciones_items {
   precio_unitario        Decimal                    @default(0) @db.Decimal(12, 2)
   descuento_porcentaje   Decimal                    @default(0) @db.Decimal(5, 2)
   importe                Decimal                    @default(0) @db.Decimal(12, 2)
+  // Foto opcional del ítem (p. ej. la copiada desde la observación de origen).
+  id_archivo             Int?
   estado                 Int                        @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?                  @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?                  @db.Timestamptz(6)
   version                tbl_cotizaciones_versiones @relation(fields: [id_version], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos?              @relation("ItemCotizacionArchivo", fields: [id_archivo], references: [id])
 }
 
 // Tabla puente cotización ↔ ascensores. Cada cotización puede referir uno o más
@@ -1331,6 +1401,8 @@ model tbl_servicios_finalizacion_respuestas {
   date_time_modification   DateTime?                            @db.Timestamptz(6)
   checklist                tbl_servicios_finalizacion_checklist @relation(fields: [id_checklist], references: [id], onDelete: Cascade)
   item                     tbl_checklist_plantilla_items        @relation(fields: [id_item], references: [id])
+  // Evidencias fotográficas adjuntas a esta respuesta (obligatorias si 'si').
+  fotos                    tbl_servicios_evidencias[]
 
   @@unique([id_checklist, id_item])
   @@index([id_checklist])

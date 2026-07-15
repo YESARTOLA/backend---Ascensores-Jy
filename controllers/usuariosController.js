@@ -2,31 +2,47 @@ const prisma = require('../config/prisma');
 const bcrypt = require('bcrypt');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
-const { ROLES_CON_ALCANCE } = require('../utils/alcanceUsuario');
+const { ROLES_CON_ALCANCE, ROLES_CON_ALCANCE_EDIFICIOS } = require('../utils/alcanceUsuario');
 
 /**
- * Resuelve los flags de ámbito (acceso_servicios / acceso_proyectos) a guardar.
- * Solo aplican a roles con alcance (Administrador / Coordinador); para el resto
- * se fuerzan a 1 (se ignoran en runtime). En roles con alcance se exige marcar
- * al menos uno. `previo` permite conservar el valor actual en una edición parcial.
- * @returns {{acceso_servicios:number, acceso_proyectos:number}|{error:string}}
+ * Resuelve los flags de ámbito a guardar:
+ *   - acceso_servicios / acceso_proyectos → Administrador y Coordinador.
+ *   - acceso_edificios / acceso_obras     → solo Administrador.
+ * Para los roles a los que no aplican se fuerzan a 1 (se ignoran en runtime). En
+ * cada dimensión con alcance se exige marcar al menos uno. `previo` conserva el
+ * valor actual en una edición parcial.
+ * @returns {{acceso_servicios,acceso_proyectos,acceso_edificios,acceso_obras}|{error:string}}
  */
 async function resolverAccesoAmbito(idRol, body, previo = null) {
   const rol = await prisma.tbl_roles.findUnique({ where: { id: Number(idRol) }, select: { codigo: true } });
-  if (!rol || !ROLES_CON_ALCANCE.includes(rol.codigo)) {
-    return { acceso_servicios: 1, acceso_proyectos: 1 };
-  }
+  const codigo = rol?.codigo;
   const resolver = (campo) => {
     if (body[campo] !== undefined) return body[campo] ? 1 : 0;
     if (previo && previo[campo] !== undefined && previo[campo] !== null) return previo[campo];
     return 1;
   };
-  const acceso_servicios = resolver('acceso_servicios');
-  const acceso_proyectos = resolver('acceso_proyectos');
-  if (acceso_servicios === 0 && acceso_proyectos === 0) {
-    return { error: 'Debe marcar al menos un ámbito (Servicios o Proyectos)' };
+
+  // Ámbito Servicios / Proyectos (Administrador y Coordinador).
+  let acceso_servicios = 1, acceso_proyectos = 1;
+  if (codigo && ROLES_CON_ALCANCE.includes(codigo)) {
+    acceso_servicios = resolver('acceso_servicios');
+    acceso_proyectos = resolver('acceso_proyectos');
+    if (acceso_servicios === 0 && acceso_proyectos === 0) {
+      return { error: 'Debe marcar al menos un ámbito (Servicios o Proyectos)' };
+    }
   }
-  return { acceso_servicios, acceso_proyectos };
+
+  // Alcance por tipo de edificio: Edificios / Obras (solo Administrador).
+  let acceso_edificios = 1, acceso_obras = 1;
+  if (codigo && ROLES_CON_ALCANCE_EDIFICIOS.includes(codigo)) {
+    acceso_edificios = resolver('acceso_edificios');
+    acceso_obras = resolver('acceso_obras');
+    if (acceso_edificios === 0 && acceso_obras === 0) {
+      return { error: 'Debe marcar al menos un tipo de ubicación (Edificios u Obras)' };
+    }
+  }
+
+  return { acceso_servicios, acceso_proyectos, acceso_edificios, acceso_obras };
 }
 
 const listar = async (req, res) => {
@@ -74,6 +90,8 @@ const crear = async (req, res) => {
         telefono: d.telefono || null,
         acceso_servicios: acceso.acceso_servicios,
         acceso_proyectos: acceso.acceso_proyectos,
+        acceso_edificios: acceso.acceso_edificios,
+        acceso_obras: acceso.acceso_obras,
         user_id_registration: req.user.id
       }
     });
@@ -102,6 +120,8 @@ const actualizar = async (req, res) => {
       telefono: d.telefono ?? previo.telefono,
       acceso_servicios: acceso.acceso_servicios,
       acceso_proyectos: acceso.acceso_proyectos,
+      acceso_edificios: acceso.acceso_edificios,
+      acceso_obras: acceso.acceso_obras,
       user_id_modification: req.user.id,
       date_time_modification: new Date()
     };

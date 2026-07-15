@@ -21,9 +21,10 @@ const {
 } = require('../utils/estadoGuia');
 const {
   ESTADO_FACTURA_ANULADA,
+  ESTADO_FACTURACION_SIN,
   calcularEstadoFacturacion
 } = require('../utils/estadoFactura');
-const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const {
   sincronizarRecordatorioServicio,
@@ -31,17 +32,20 @@ const {
   sincronizarRecordatorioFacturarServicio,
   sincronizarRecordatorioAvisoFinalizacion
 } = require('../utils/recordatoriosAuto');
-const { colorPorTipo } = require('../utils/visibilidadCalendario');
-
-const tipoEventoDesdeRegistro = (tipoRegistro) =>
-  tipoRegistro === 'proyecto' ? 'proyecto' : 'servicio';
+const {
+  sincronizarDiasYEventos,
+  diasSinEvidencia,
+  ConfirmacionRequeridaError
+} = require('../utils/diasServicio');
 const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
-const { aplicaAlcance, tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
+const { aplicaAlcance, aplicaAlcanceEdificio, tiposRegistroPermitidos, tiposEdificioPermitidos, porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere, servicioVisiblePorEdificio } = require('../utils/visibilidadEdificio');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
+const { ensureChecklistFinalizacion } = require('./checklistFinalizacionController');
 const { validarAscensores } = require('../utils/ascensoresMonto');
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
@@ -54,6 +58,20 @@ function sanitizarPrecio(servicio, rolCodigo) {
   if (Array.isArray(clon.ascensores)) {
     clon.ascensores = clon.ascensores.map(a => ({ ...a, monto: null }));
   }
+  return clon;
+}
+
+/**
+ * Para el rol técnico, retira del detalle todo bloque económico (cobros y
+ * facturas, con sus montos, pagos y cuotas). Complementa a `sanitizarPrecio`
+ * (que solo anula precio_interno/monto): el técnico únicamente ve la información
+ * operativa de sus servicios/proyectos asignados, nada económico.
+ */
+function sanitizarEconomicoTecnico(servicio, rolCodigo) {
+  if (!servicio || rolCodigo !== 'tecnico') return servicio;
+  const clon = { ...servicio };
+  delete clon.cobro;
+  delete clon.facturas;
   return clon;
 }
 
@@ -109,6 +127,11 @@ const listar = async (req, res) => {
       where.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
     }
 
+    // Oculta a roles distintos de super_admin lo asociado a edificios inactivos.
+    aplicarVisibilidadWhere(where, visibilidadPorJunctionWhere(req.user));
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+    conAlcance(where, porJunctionAscensorEdificioWhere(req.user));
+
     const result = await paginar(
       prisma.tbl_servicios_proyectos,
       {
@@ -162,6 +185,7 @@ const obtener = async (req, res) => {
         emergencia: { select: { id: true, id_ascensor: true, motivo: true, nivel_urgencia: true, estado_emergencia: true, fecha_reporte: true } },
         correctivo: { select: { id: true, id_ascensor: true, falla: true, nivel_urgencia: true, estado_correctivo: true, fecha_reporte: true } },
         asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
+        dias: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
         checklists: { include: { items: { where: { estado: 1 } } } },
         guias: { include: { archivo: true, tecnico: true } },
         evidencias: { include: { archivo: true, tecnico: true } },
@@ -181,7 +205,30 @@ const obtener = async (req, res) => {
         return res.status(404).json({ error: 'Servicio no encontrado' });
       }
     }
-    res.json({ data: sanitizarPrecio(servicio, req.user.rol_codigo) });
+    // Un servicio/proyecto de un edificio inactivo no es accesible (salvo super_admin).
+    if (!servicioVisiblePorEdificio(req.user, servicio)) {
+      return res.status(404).json({ error: 'Servicio no encontrado' });
+    }
+    // Alcance por tipo de edificio: el Administrador acotado no accede a un
+    // servicio cuyos ascensores no estén en un tipo permitido (ni por URL).
+    const tiposEdif = tiposEdificioPermitidos(req.user);
+    if (tiposEdif) {
+      const vinculos = (servicio.ascensores || []).filter(sa => sa.estado === 1);
+      if (vinculos.length > 0 && !vinculos.some(sa => tiposEdif.includes(sa.ascensor?.edificio?.tipo))) {
+        return res.status(404).json({ error: 'Servicio no encontrado' });
+      }
+    }
+    // Un técnico solo accede al detalle de servicios/proyectos donde está
+    // asignado (igual que la lista). Sin esto podría abrir cualquiera por URL.
+    if (req.user.rol_codigo === 'tecnico') {
+      const asignado = (servicio.asignaciones || []).some(a => a.id_tecnico === req.user.id_tecnico);
+      if (!asignado) return res.status(404).json({ error: 'Servicio no encontrado' });
+    }
+    const data = sanitizarEconomicoTecnico(
+      sanitizarPrecio(servicio, req.user.rol_codigo),
+      req.user.rol_codigo
+    );
+    res.json({ data });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener servicio' });
@@ -228,6 +275,9 @@ const crear = async (req, res) => {
     const tipoRegistro = clasificacion.tipo_registro;
     const origenDerivado = clasificacion.modulo_asociado || 'directo';
 
+    // Duración en días (consecutivos desde la fecha programada). Default 1.
+    const duracionDias = Math.max(1, parseInt(d.duracion_dias, 10) || 1);
+
     // Ámbito: un usuario acotado no puede crear registros fuera de su ámbito.
     const permitidosCrear = tiposRegistroPermitidos(req.user);
     if (permitidosCrear && !permitidosCrear.includes(tipoRegistro)) {
@@ -247,6 +297,7 @@ const crear = async (req, res) => {
           descripcion: d.descripcion || null,
           fecha_programada: parseYMDLima(d.fecha_programada),
           hora_programada: d.hora_programada || null,
+          duracion_dias: duracionDias,
           fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null,
           prioridad: d.prioridad || 'media',
           estado_servicio: estadoInicial,
@@ -285,18 +336,8 @@ const crear = async (req, res) => {
     // Solo registrar en calendario, historiales y notificar a otros módulos si NO es borrador.
     // Los borradores quedan invisibles para todos los flujos operativos hasta promoverse.
     if (!esBorrador) {
-      const fechaInicio = combinarFechaHoraLima(d.fecha_programada, d.hora_programada);
-      const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
-      await prisma.tbl_calendario_eventos.create({
-        data: {
-          id_servicio: servicio.id,
-          titulo: `${servicio.codigo} – ${servicio.titulo}`,
-          tipo_evento: tipoEvento,
-          fecha_inicio: fechaInicio,
-          estado_evento: 'programado',
-          color: colorPorTipo(tipoEvento)
-        }
-      });
+      // Genera la grilla de días (1..N) y un evento de calendario por día.
+      await sincronizarDiasYEventos(prisma, servicio.id, { userId: req.user.id });
       sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));
 
       await prisma.tbl_clientes_historial.create({
@@ -351,18 +392,8 @@ const promoverBorrador = async (req, res) => {
     // cambiarEstadoServicio registra historial, recordatorio y sincroniza
     // estado_global de la cotización (si la hay).
     await cambiarEstadoServicio(id, 'Pendiente', req.user.id);
-    const fechaInicio = combinarFechaHoraLima(servicio.fecha_programada, servicio.hora_programada);
-    const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
-    await prisma.tbl_calendario_eventos.create({
-      data: {
-        id_servicio: servicio.id,
-        titulo: `${servicio.codigo} – ${servicio.titulo}`,
-        tipo_evento: tipoEvento,
-        fecha_inicio: fechaInicio,
-        estado_evento: 'programado',
-        color: colorPorTipo(tipoEvento)
-      }
-    });
+    // Genera la grilla de días y sus eventos de calendario al salir de borrador.
+    await sincronizarDiasYEventos(prisma, servicio.id, { userId: req.user.id });
     await prisma.tbl_clientes_historial.create({
       data: {
         id_cliente: servicio.id_cliente, id_servicio: servicio.id,
@@ -507,6 +538,10 @@ const actualizar = async (req, res) => {
 
     const nuevaFechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : previo.fecha_programada;
     const nuevaHoraProgramada = d.hora_programada ?? previo.hora_programada;
+    const nuevaDuracionDias = d.duracion_dias !== undefined
+      ? Math.max(1, parseInt(d.duracion_dias, 10) || 1)
+      : previo.duracion_dias;
+    const cambiaDuracion = nuevaDuracionDias !== previo.duracion_dias;
     // `fecha_programada` puede ser null (servicio aprobado sin programar): la
     // comparación debe ser null-safe para no romper al registrar la fecha.
     const msFecha = (f) => (f instanceof Date ? f.getTime() : null);
@@ -539,6 +574,7 @@ const actualizar = async (req, res) => {
         descripcion: d.descripcion ?? previo.descripcion,
         fecha_programada: nuevaFechaProgramada,
         hora_programada: nuevaHoraProgramada,
+        duracion_dias: nuevaDuracionDias,
         fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : previo.fecha_estimada_entrega,
         prioridad: d.prioridad ?? previo.prioridad,
         precio_interno: puedeCambiarPrecio && d.precio_interno !== undefined ? d.precio_interno : previo.precio_interno,
@@ -574,38 +610,17 @@ const actualizar = async (req, res) => {
       }
     }
 
-    // Sincronizar evento de calendario y título.
-    // Un servicio aprobado por cotización nace SIN fecha y, por tanto, SIN evento.
-    // Al registrar la fecha por primera vez se CREA el evento; si ya existía, se
-    // actualiza. Sin fecha programada no hay nada que llevar al calendario.
-    // Solo aplica a servicios fuera de borrador (los borradores no tienen evento).
+    // Sincronizar la grilla de días y sus eventos de calendario.
+    // Un servicio aprobado por cotización nace SIN fecha (y sin días/eventos): al
+    // registrar la fecha por primera vez se generan; si ya existían, se regeneran
+    // conservando los días ya trabajados. Sin fecha programada no hay nada que
+    // llevar al calendario. No aplica a borradores (no tienen días/eventos).
     if (previo.estado_servicio !== 'Borrador') {
       const cambiaTitulo = d.titulo !== undefined && d.titulo !== previo.titulo;
-      if ((cambiaFechaHora || cambiaTitulo) && nuevaFechaProgramada) {
-        const nuevaFechaInicio = combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada);
-        const actualizados = await prisma.tbl_calendario_eventos.updateMany({
-          where: { id_servicio: id, estado: 1 },
-          data: {
-            ...(cambiaFechaHora ? { fecha_inicio: nuevaFechaInicio } : {}),
-            ...(cambiaTitulo ? { titulo: `${servicio.codigo} – ${servicio.titulo}` } : {}),
-            user_id_modification: req.user.id,
-            date_time_modification: new Date()
-          }
-        });
-        // No existía evento (servicio aprobado sin fecha): se crea al programar.
-        if (actualizados.count === 0) {
-          const tipoEvento = tipoEventoDesdeRegistro(servicio.tipo_registro);
-          await prisma.tbl_calendario_eventos.create({
-            data: {
-              id_servicio: id,
-              titulo: `${servicio.codigo} – ${servicio.titulo}`,
-              tipo_evento: tipoEvento,
-              fecha_inicio: nuevaFechaInicio,
-              estado_evento: 'programado',
-              color: colorPorTipo(tipoEvento)
-            }
-          });
-        }
+      if ((cambiaFechaHora || cambiaTitulo || cambiaDuracion) && nuevaFechaProgramada) {
+        // `actualizar` solo opera en estados pre-campo (esServicioEditable), donde
+        // aún no hay evidencia: regenerar es seguro sin pedir confirmación.
+        await sincronizarDiasYEventos(prisma, id, { userId: req.user.id, confirmar: true });
       }
     }
 
@@ -813,7 +828,12 @@ const iniciarServicio = async (req, res) => {
     const { accion = 'iniciar_servicio' } = req.body;
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id },
-      include: { checklists: { include: { items: { where: { estado: 1 } } } }, asignaciones: { where: { estado: 1 } } }
+      include: {
+        checklists: { include: { items: { where: { estado: 1 } } } },
+        asignaciones: { where: { estado: 1 } },
+        emergencia: { select: { id: true } },
+        correctivo: { select: { id: true } }
+      }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
     if (servicio.estado_servicio === 'Cancelado' || servicio.estado_servicio.startsWith('Finalizado')) {
@@ -831,6 +851,18 @@ const iniciarServicio = async (req, res) => {
     else if (accion === 'iniciar_servicio') nuevoEstado = 'En curso';
 
     await cambiarEstadoServicio(id, nuevoEstado, req.user.id);
+
+    // Al pasar a "En curso" se crea el checklist de finalización para que el
+    // técnico lo vaya completando durante la ejecución (foto por ítem). Si la
+    // plantilla de la categoría no tiene ítems configurados no se crea (el panel
+    // mostrará el aviso para configurarla); no debe bloquear el inicio.
+    if (nuevoEstado === 'En curso') {
+      try {
+        await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
+      } catch (err) {
+        console.error('[iniciarServicio] No se pudo crear el checklist de finalización:', err.message);
+      }
+    }
 
     // Marcar técnicos como ocupados
     for (const a of servicio.asignaciones) {
@@ -894,6 +926,16 @@ const finalizarServicio = async (req, res) => {
     // Admin/SuperAdmin pueden cerrar sin OT (mismo patrón que guía y evidencias).
     if (req.user.rol_codigo === 'tecnico' && (!numeroOtNormalizado || !idArchivoOtNormalizado)) {
       return res.status(400).json({ error: 'Debe adjuntar la OT (número y documento) para finalizar' });
+    }
+    // Servicios multidía: el técnico no puede subir la OT si algún día programado
+    // quedó sin evidencia. Admin/SuperAdmin pueden cerrar igual (mismo patrón que
+    // guía/evidencia/OT). Los servicios de un solo día conservan la regla previa.
+    if (req.user.rol_codigo === 'tecnico' && servicio.duracion_dias > 1) {
+      const faltantes = await diasSinEvidencia(prisma, id);
+      if (faltantes.length > 0) {
+        const lista = faltantes.map(dd => `Día ${dd.orden}`).join(', ');
+        return res.status(400).json({ error: `Cada día debe tener al menos una evidencia antes de la OT. Faltan: ${lista}.` });
+      }
     }
     // Si no hay guía: solo Admin/Super Admin puede cerrar marcándolo como observado
     if (sinGuia && !finalizar_observado) {
@@ -968,17 +1010,24 @@ const finalizarServicio = async (req, res) => {
         facturas: { where: { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } } }
       }
     });
+    // Servicios de un plan de mantenimiento: la facturación es ÚNICA a nivel de
+    // plan (un solo cobro por el total del plan, creado al crear el plan), nunca
+    // por servicio. Por eso estos servicios no llevan cobro propio ni alerta de
+    // "facturar"; su folder contable queda 'Sin cobro' / 'Sin factura'.
+    const esServicioDePlan = !!servicio.id_mantenimiento_plan;
     // Mantenimiento gratuito / cobertura: nunca debe ir a "Pendiente de iniciar"
     // porque no se le crea cobro (ver fallback más abajo). Si por error legacy
     // existiera un cobroPrevio para este servicio, su estado tampoco aplica.
     const esGratuito = servicio.sin_cobro === 1;
-    const estadoCobroInicial = esGratuito
+    const estadoCobroInicial = (esServicioDePlan || esGratuito)
       ? 'Sin cobro'
       : (cobroPrevio?.estado_cobro || 'Pendiente de iniciar');
-    const estadoFacturacionInicial = calcularEstadoFacturacion({
-      facturas: cobroPrevio?.facturas || [],
-      cuotas: cobroPrevio?.cuotas || []
-    });
+    const estadoFacturacionInicial = esServicioDePlan
+      ? ESTADO_FACTURACION_SIN
+      : calcularEstadoFacturacion({
+          facturas: cobroPrevio?.facturas || [],
+          cuotas: cobroPrevio?.cuotas || []
+        });
 
     // Crear/actualizar folder contable. Caso típico: el folder ya fue creado
     // al aprobar la cotización (estado 'En ejecución'); aquí transicionamos a
@@ -1023,9 +1072,10 @@ const finalizarServicio = async (req, res) => {
     });
 
     // Fallback: crear cobro si el servicio no viene de cotización aprobada
-    // (servicios directos o mantenimientos). Los aprobados desde cotización
-    // ya tienen su cobro creado en cotizacionesController.aprobar.
-    if (!cobroPrevio && servicio.sin_cobro !== 1) {
+    // (servicios directos). Los aprobados desde cotización ya tienen su cobro.
+    // Los servicios de un PLAN de mantenimiento NUNCA crean cobro propio: la
+    // facturación es única a nivel de plan.
+    if (!cobroPrevio && servicio.sin_cobro !== 1 && !esServicioDePlan) {
       await crearCobroInicial(prisma, {
         idServicio: id,
         idCliente: servicio.id_cliente,
@@ -1101,15 +1151,17 @@ const finalizarServicio = async (req, res) => {
     });
 
     // Alertas de "servicio finalizado" para el calendario. Se sincronizan AQUÍ
-    // (no en crearFinalizacion) porque recién en este punto el servicio está en
+    // (no al generar el informe) porque recién en este punto el servicio está en
     // estado post-finalización; antes el gate de `sincronizarAlertaServicioFinalizado`
     // las descartaba. Idempotentes y no bloqueantes:
     //   · servicio_finalizado_revisar  → coordinador (revisar y corregir)
     //   · servicio_finalizado_facturar → contabilidad (emitir factura)
     //   · servicio_finalizado_aviso    → admin (aviso informativo)
+    // La alerta "facturar" se OMITE para servicios de plan: la facturación es
+    // única a nivel de plan, no por servicio.
     Promise.allSettled([
       sincronizarRecordatorioRevisarServicio(id),
-      sincronizarRecordatorioFacturarServicio(id),
+      esServicioDePlan ? Promise.resolve() : sincronizarRecordatorioFacturarServicio(id),
       sincronizarRecordatorioAvisoFinalizacion(id)
     ]).then(results => {
       results.forEach((r, i) => {
@@ -1499,9 +1551,73 @@ const eliminar = async (req, res) => {
   }
 };
 
+/**
+ * Cambia la duración (días) de un servicio ya programado y regenera su grilla de
+ * días + eventos de calendario. A diferencia de `actualizar` (gated a estados
+ * pre-campo), esto opera también con el servicio En camino/En curso, conservando
+ * los días ya trabajados con su evidencia.
+ *
+ * Si reducir la duración dejaría fuera días que YA tienen evidencia, responde 409
+ * con `requiere_confirmacion: true`; el cliente debe reenviar con `confirmar: true`.
+ */
+const cambiarDuracion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const confirmar = req.body.confirmar === true || req.body.confirmar === 1;
+    const nuevaDuracion = Math.max(1, parseInt(req.body.duracion_dias, 10) || 0);
+    if (!nuevaDuracion) return res.status(400).json({ error: 'Duración inválida (mínimo 1 día)' });
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: { id: true, estado_servicio: true, duracion_dias: true, fecha_programada: true }
+    });
+    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (!servicio.fecha_programada) {
+      return res.status(400).json({ error: 'El servicio no tiene fecha programada: prográmela antes de definir la duración' });
+    }
+    // Editable desde que está programado hasta que está En curso (no en borrador
+    // ni una vez finalizado/cancelado).
+    const editables = ['Pendiente', 'Asignado', 'Checklist de salida pendiente', 'Listo para salida', 'En camino', 'En curso'];
+    if (!editables.includes(servicio.estado_servicio)) {
+      return res.status(409).json({ error: `No se puede cambiar la duración de un servicio en estado "${servicio.estado_servicio}"` });
+    }
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.tbl_servicios_proyectos.update({
+          where: { id },
+          data: { duracion_dias: nuevaDuracion, user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+        await sincronizarDiasYEventos(tx, id, { userId: req.user.id, confirmar });
+      });
+    } catch (e) {
+      if (e instanceof ConfirmacionRequeridaError || e.code === 'REQUIERE_CONFIRMACION') {
+        return res.status(409).json({
+          error: 'Reducir la duración eliminaría días que ya tienen evidencia',
+          requiere_confirmacion: true,
+          dias_con_evidencia: e.diasConEvidencia || []
+        });
+      }
+      throw e;
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: { duracion_dias: servicio.duracion_dias },
+      valor_nuevo: { duracion_dias: nuevaDuracion }, ip: req.ip
+    });
+    sincronizarRecordatorioServicio(id).catch(err => console.error('Sync recordatorio:', err));
+    res.json({ ok: true, duracion_dias: nuevaDuracion });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al cambiar la duración: ' + err.message });
+  }
+};
+
 module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
   asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
-  promoverBorrador, revisarServicio,
+  promoverBorrador, revisarServicio, cambiarDuracion,
   crearGuia, actualizarGuia, eliminarGuia
 };

@@ -8,6 +8,7 @@ const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA } = require
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
+const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -143,6 +144,9 @@ const listar = async (req, res) => {
     if (id_tipo_servicio) filtroServicio.id_tipo_servicio = Number(id_tipo_servicio);
     if (id_tecnico) filtroServicio.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
     if (Object.keys(filtroServicio).length > 0) where.servicio = filtroServicio;
+    // Alcance por tipo de edificio (Administrador): el cobro cuelga de un servicio
+    // o de un plan de mantenimiento; se muestra si llega a un tipo permitido.
+    conAlcance(where, porServicioOPlanAscensorEdificioWhere(req.user));
 
     const cobros = await prisma.tbl_cobros.findMany({
       where,
@@ -156,6 +160,14 @@ const listar = async (req, res) => {
             ascensores: { where: { estado: 1 }, include: { ascensor: true } },
             asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
             servicio_realizado: { include: { archivo_ot: true } }
+          }
+        },
+        // Cobro de plan de mantenimiento (sin servicio): se muestra con el plan,
+        // su tipo de servicio y los ascensores que cubre.
+        mantenimiento_plan: {
+          include: {
+            tipo_servicio: true,
+            ascensores: { where: { estado: 1 }, include: { ascensor: true } }
           }
         },
         pagos: { where: { estado: 1 }, include: { cuenta_bancaria: true }, orderBy: { id: 'desc' } },
@@ -197,6 +209,12 @@ const obtener = async (req, res) => {
       include: {
         cliente: true,
         servicio: { include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } } } },
+        mantenimiento_plan: {
+          include: {
+            tipo_servicio: true,
+            ascensores: { where: { estado: 1 }, include: { ascensor: true } }
+          }
+        },
         pagos: { where: { estado: 1 }, include: { archivo: true, cuenta_bancaria: true }, orderBy: { id: 'desc' } },
         cuotas: { where: { estado: 1 }, orderBy: { numero_cuota: 'asc' }, include: { facturas: { where: { estado: 1 } } } },
         recordatorios: { orderBy: { id: 'desc' } },
@@ -278,6 +296,12 @@ const actualizarPlanCuotas = async (req, res) => {
       }
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
+    // Un cobro cerrado es inmutable: no se puede reestructurar su plan de cuotas.
+    // La UI oculta el botón "Plan de cuotas" en estado Cerrado; este guard cubre
+    // el acceso directo a la API.
+    if (cobro.estado_cobro === 'Cerrado') {
+      return res.status(409).json({ error: 'El cobro está cerrado; no se puede modificar el plan de cuotas' });
+    }
 
     const pagadas = cobro.cuotas_pagadas;
     const cuotasArrIn = Array.isArray(cuotas) ? cuotas : [];
@@ -447,12 +471,16 @@ const registrarPago = async (req, res) => {
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
 
-    // Regla ÚNICA de elegibilidad: no se registran abonos contra servicios que
-    // todavía no están habilitados para Contabilidad (operativo sin aprobación
-    // administrativa, anulado, etc.).
-    const elegibilidad = elegibilidadContable({ servicio: cobro.servicio, servicioRealizado: cobro.servicio?.servicio_realizado });
-    if (!elegibilidad.habilitado) {
-      return res.status(400).json({ error: elegibilidad.motivo || 'El servicio no está habilitado para cobro' });
+    // Cobro de plan de mantenimiento: facturación única del plan, disponible desde
+    // que se crea el plan → siempre elegible (no depende de un servicio).
+    const esCobroDePlan = !!cobro.id_mantenimiento_plan;
+    // Regla ÚNICA de elegibilidad (solo cobros por servicio): no se registran
+    // abonos contra servicios aún no habilitados para Contabilidad.
+    if (!esCobroDePlan) {
+      const elegibilidad = elegibilidadContable({ servicio: cobro.servicio, servicioRealizado: cobro.servicio?.servicio_realizado });
+      if (!elegibilidad.habilitado) {
+        return res.status(400).json({ error: elegibilidad.motivo || 'El servicio no está habilitado para cobro' });
+      }
     }
 
     const monto = Number(d.monto);
@@ -562,33 +590,37 @@ const registrarPago = async (req, res) => {
       }
     });
 
-    // Actualizar estado en servicio realizado
-    await prisma.tbl_servicios_realizados.updateMany({
-      where: { id_servicio: cobro.id_servicio },
-      data: {
-        estado_cobro: nuevoEstado,
-        user_id_modification: req.user.id, date_time_modification: new Date()
-      }
-    });
-
-    // Transición del estado del servicio según cobro.
-    // Solo aplica si el servicio ya está en post-ejecución (admin/cobro). Si
-    // el cobro nació al aprobar la cotización (adelanto pagado antes de
-    // ejecutar el servicio), el servicio permanece en su estado operativo y
-    // las cuotas siguen su ciclo en paralelo.
-    const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({
-      where: { id: cobro.id_servicio },
-      select: { estado_servicio: true }
-    });
-    if (estaServicioFinalizado(servicioActual?.estado_servicio)) {
-      const facturas = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
-      const nuevoEstadoServ = estadoServicioDesdeCobro({
-        estado_cobro: nuevoEstado,
-        total_abonado: totalAbonado,
-        saldo_pendiente: nuevoSaldo,
-        facturado: !!facturas
+    // Side-effects sobre el servicio: solo para cobros por servicio. Los cobros
+    // de plan no tienen servicio asociado (facturación única del plan).
+    if (!esCobroDePlan && cobro.id_servicio) {
+      // Actualizar estado en servicio realizado
+      await prisma.tbl_servicios_realizados.updateMany({
+        where: { id_servicio: cobro.id_servicio },
+        data: {
+          estado_cobro: nuevoEstado,
+          user_id_modification: req.user.id, date_time_modification: new Date()
+        }
       });
-      await cambiarEstadoServicio(cobro.id_servicio, nuevoEstadoServ, req.user.id, `Abono registrado: ${monto}`);
+
+      // Transición del estado del servicio según cobro.
+      // Solo aplica si el servicio ya está en post-ejecución (admin/cobro). Si
+      // el cobro nació al aprobar la cotización (adelanto pagado antes de
+      // ejecutar el servicio), el servicio permanece en su estado operativo y
+      // las cuotas siguen su ciclo en paralelo.
+      const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({
+        where: { id: cobro.id_servicio },
+        select: { estado_servicio: true }
+      });
+      if (estaServicioFinalizado(servicioActual?.estado_servicio)) {
+        const facturas = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
+        const nuevoEstadoServ = estadoServicioDesdeCobro({
+          estado_cobro: nuevoEstado,
+          total_abonado: totalAbonado,
+          saldo_pendiente: nuevoSaldo,
+          facturado: !!facturas
+        });
+        await cambiarEstadoServicio(cobro.id_servicio, nuevoEstadoServ, req.user.id, `Abono registrado: ${monto}`);
+      }
     }
 
     await registrarAuditoria({
@@ -649,6 +681,11 @@ const cerrarCobro = async (req, res) => {
     await prisma.tbl_cobros.update({
       where: { id }, data: { estado_cobro: 'Cerrado', user_id_modification: req.user.id, date_time_modification: new Date() }
     });
+    // Cobro de plan: no hay servicio que transicionar; cerrar el cobro basta.
+    if (cobro.id_mantenimiento_plan || !cobro.id_servicio) {
+      sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
+      return res.json({ ok: true });
+    }
     const facturas = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
     // Solo transiciona el estado del servicio si ya está en post-ejecución.
     // Si el cobro se cierra antes de ejecutar (caso atípico, pero posible si
@@ -795,8 +832,12 @@ const eliminar = async (req, res) => {
     if (!cobro || cobro.estado === 0) return res.status(404).json({ error: 'Cobro no encontrado' });
 
     const idServicio = cobro.id_servicio;
-    // Todas las facturas del servicio (cubre generales con id_cobro null y por cuota).
-    const facturas = await prisma.tbl_facturas.findMany({ where: { id_servicio: idServicio, estado: 1 } });
+    const esCobroDePlan = !!cobro.id_mantenimiento_plan;
+    // Facturas a dar de baja: por servicio (cobros por servicio) o por plan (cobro
+    // único del plan). En el caso de plan se filtran por id_mantenimiento_plan.
+    const facturas = esCobroDePlan
+      ? await prisma.tbl_facturas.findMany({ where: { id_mantenimiento_plan: cobro.id_mantenimiento_plan, estado: 1 } })
+      : await prisma.tbl_facturas.findMany({ where: { id_servicio: idServicio, estado: 1 } });
 
     // Recolectar archivos a purgar: comprobantes de pago + PDFs de factura.
     const archivoIds = new Set();
@@ -810,7 +851,11 @@ const eliminar = async (req, res) => {
       await tx.tbl_pagos.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
-      await tx.tbl_facturas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+      if (esCobroDePlan) {
+        await tx.tbl_facturas.updateMany({ where: { id_mantenimiento_plan: cobro.id_mantenimiento_plan, estado: 1 }, data: { estado: 0, ...stamp } });
+      } else {
+        await tx.tbl_facturas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+      }
 
       for (const idArchivo of archivoIds) {
         const key = await bajaArchivoEnTx(tx, idArchivo, req.user.id);
@@ -818,11 +863,14 @@ const eliminar = async (req, res) => {
       }
 
       await tx.tbl_cobros.update({ where: { id }, data: { estado: 0, ...stamp } });
-      // El folder contable del servicio queda sin cobro ni facturación.
-      await tx.tbl_servicios_realizados.updateMany({
-        where: { id_servicio: idServicio },
-        data: { estado_cobro: 'Sin cobro', estado_facturacion: ESTADO_FACTURACION_SIN, ...stamp }
-      });
+      // El folder contable del servicio queda sin cobro ni facturación. Los cobros
+      // de plan no tienen folder de servicio que actualizar.
+      if (!esCobroDePlan && idServicio) {
+        await tx.tbl_servicios_realizados.updateMany({
+          where: { id_servicio: idServicio },
+          data: { estado_cobro: 'Sin cobro', estado_facturacion: ESTADO_FACTURACION_SIN, ...stamp }
+        });
+      }
 
       await registrarAuditoria({
         id_usuario: req.user.id, entidad: 'tbl_cobros', id_entidad: id,

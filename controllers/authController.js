@@ -29,7 +29,9 @@ const login = async (req, res) => {
         rol_codigo: usuario.rol_codigo,
         id_tecnico: usuario.id_tecnico,
         acceso_servicios: usuario.acceso_servicios,
-        acceso_proyectos: usuario.acceso_proyectos
+        acceso_proyectos: usuario.acceso_proyectos,
+        acceso_edificios: usuario.acceso_edificios,
+        acceso_obras: usuario.acceso_obras
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
@@ -48,6 +50,8 @@ const login = async (req, res) => {
         id_tecnico: usuario.id_tecnico,
         acceso_servicios: usuario.acceso_servicios,
         acceso_proyectos: usuario.acceso_proyectos,
+        acceso_edificios: usuario.acceso_edificios,
+        acceso_obras: usuario.acceso_obras,
         rol: usuario.rol,
         rol_codigo: usuario.rol_codigo,
         permisos: usuario.permisos

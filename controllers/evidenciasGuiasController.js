@@ -5,7 +5,7 @@ const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const subirEvidencia = async (req, res) => {
   try {
     const id_servicio = Number(req.params.id);
-    const { id_archivo, tipo_evidencia, descripcion } = req.body;
+    const { id_archivo, tipo_evidencia, descripcion, id_dia } = req.body;
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id: id_servicio }, include: { asignaciones: { where: { estado: 1 } } }
     });
@@ -16,9 +16,21 @@ const subirEvidencia = async (req, res) => {
     const id_tecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
     if (!id_tecnico) return res.status(400).json({ error: 'No hay técnico asignado' });
 
+    // Día del servicio al que pertenece la evidencia (servicios multidía). Opcional;
+    // si viene, debe ser un día activo de ESTE servicio.
+    let idDia = null;
+    if (id_dia !== undefined && id_dia !== null && id_dia !== '') {
+      const dia = await prisma.tbl_servicios_dias.findFirst({
+        where: { id: Number(id_dia), id_servicio, estado: 1 }
+      });
+      if (!dia) return res.status(400).json({ error: 'El día indicado no pertenece al servicio' });
+      idDia = dia.id;
+    }
+
     const evidencia = await prisma.tbl_servicios_evidencias.create({
       data: {
         id_servicio, id_tecnico,
+        id_dia: idDia,
         id_archivo: id_archivo || null,
         tipo_evidencia: tipo_evidencia || 'Foto',
         descripcion: descripcion || null,

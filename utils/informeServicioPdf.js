@@ -5,8 +5,10 @@
  * edificio, ascensores, técnicos asignados, observaciones técnicas
  * registradas durante el servicio, las respuestas del checklist de
  * finalización (Sí / No / N/A + nota) renderizadas bajo el título
- * "Actividades realizadas", y un bloque "Registros fotográficos" con todas
- * las imágenes adjuntas al servicio (evidencias y observaciones).
+ * "Actividades realizadas" — cada ítem con sus fotos (día y coordenadas
+ * clicables) — y un bloque "Registros fotográficos" con las evidencias
+ * GENERALES del servicio (las fotos por ítem ya van junto a su ítem) y las
+ * imágenes adjuntas a observaciones técnicas.
  */
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
@@ -43,6 +45,14 @@ const PALETA = {
 };
 
 const LABEL_RESPUESTA = { si: 'Sí', no: 'No', na: 'N/A' };
+
+function coordsTexto(lat, lng) {
+  if (lat == null || lng == null) return null;
+  return `${Number(lat).toFixed(5)}, ${Number(lng).toFixed(5)}`;
+}
+function coordsUrl(lat, lng) {
+  return `https://www.google.com/maps?q=${lat},${lng}`;
+}
 
 function fechaFmt(d) {
   if (!d) return '—';
@@ -160,10 +170,18 @@ async function generarInformeFinalizacionPdf(ctx) {
     y += 4;
   }
 
-  // Checklist de finalización
+  // Checklist de finalización (cada ítem con su respuesta, nota y fotos).
   if (plantilla?.items?.length > 0) {
     if (y > doc.page.height - doc.page.margins.bottom - 60) { doc.addPage(); y = doc.page.margins.top; }
     doc.fillColor(PALETA.acento).font('Helvetica-Bold').fontSize(12).text('ACTIVIDADES REALIZADAS', x0, y); y += 18;
+
+    // Layout de miniaturas por ítem (fila de 3).
+    const colsFoto = 3;
+    const gapFoto = 8;
+    const anchoFotoItem = (ancho - 12 - gapFoto * (colsFoto - 1)) / colsFoto;
+    const altoFotoItem = 90;
+    const altoCaptionItem = 12;
+
     let grupoActual = null;
     plantilla.items.forEach((it) => {
       if (y > doc.page.height - doc.page.margins.bottom - 50) { doc.addPage(); y = doc.page.margins.top; }
@@ -184,6 +202,39 @@ async function generarInformeFinalizacionPdf(ctx) {
         doc.font('Helvetica-Oblique').fontSize(9).fillColor(PALETA.gris)
           .text(`Nota: ${r.nota}`, x0 + 12, y, { width: ancho - 12 });
         y += doc.heightOfString(`Nota: ${r.nota}`, { width: ancho - 12 });
+      }
+
+      // Fotos del ítem (con día y coordenadas clicables).
+      const fotos = (r?.fotos || []).filter(f => f.buffer);
+      if (fotos.length > 0) {
+        const xFoto0 = x0 + 12;
+        for (let i = 0; i < fotos.length; i += colsFoto) {
+          const fila = fotos.slice(i, i + colsFoto);
+          const alturaFila = altoFotoItem + altoCaptionItem + 6;
+          if (y + alturaFila > doc.page.height - doc.page.margins.bottom) { doc.addPage(); y = doc.page.margins.top; }
+          fila.forEach((foto, j) => {
+            const xCol = xFoto0 + j * (anchoFotoItem + gapFoto);
+            try {
+              doc.image(foto.buffer, xCol, y, { fit: [anchoFotoItem, altoFotoItem], align: 'center', valign: 'center' });
+            } catch {
+              doc.rect(xCol, y, anchoFotoItem, altoFotoItem).strokeColor(PALETA.grisClaro).lineWidth(0.5).stroke();
+            }
+            const txtCoord = coordsTexto(foto.latitud, foto.longitud);
+            const prefijoDia = foto.dia ? `Día ${foto.dia} · ` : '';
+            const yCap = y + altoFotoItem + 2;
+            if (txtCoord) {
+              doc.font('Helvetica').fontSize(7).fillColor('#1d4ed8')
+                .text(`${prefijoDia}📍 ${txtCoord}`, xCol, yCap, {
+                  width: anchoFotoItem, ellipsis: true, link: coordsUrl(foto.latitud, foto.longitud), underline: true
+                });
+            } else {
+              doc.font('Helvetica-Oblique').fontSize(7).fillColor(PALETA.gris)
+                .text(`${prefijoDia}Sin ubicación`, xCol, yCap, { width: anchoFotoItem, ellipsis: true });
+            }
+            doc.fillColor(PALETA.texto);
+          });
+          y += alturaFila;
+        }
       }
       y += 4;
     });

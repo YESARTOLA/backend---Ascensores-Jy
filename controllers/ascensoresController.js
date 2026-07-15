@@ -4,9 +4,12 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
 const {
   aplicaAlcance,
+  aplicaAlcanceEdificio,
   tiposRegistroPermitidos,
   servicioAlcanceWhere,
   ascensorAlcanceWhere,
+  ascensorEdificioAlcanceWhere,
+  conAlcance,
 } = require('../utils/alcanceUsuario');
 
 // Datos del edificio (y su cliente) que la UI muestra junto al ascensor.
@@ -40,8 +43,9 @@ const listar = async (req, res) => {
 
     // Ámbito del usuario: solo ascensores de clientes dentro del ámbito. Se aplica
     // vía AND para no pisar el filtro por edificio/cliente de arriba.
-    const alcance = ascensorAlcanceWhere(req.user);
-    if (Object.keys(alcance).length) where.AND = [...(where.AND || []), alcance];
+    conAlcance(where, ascensorAlcanceWhere(req.user));
+    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+    conAlcance(where, ascensorEdificioAlcanceWhere(req.user));
 
     const result = await paginar(
       prisma.tbl_ascensores,
@@ -58,10 +62,11 @@ const listar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (aplicaAlcance(req.user)) {
-      const enAmbito = await prisma.tbl_ascensores.findFirst({
-        where: { id, ...ascensorAlcanceWhere(req.user) }, select: { id: true }
-      });
+    if (aplicaAlcance(req.user) || aplicaAlcanceEdificio(req.user)) {
+      const w = { id };
+      conAlcance(w, ascensorAlcanceWhere(req.user));
+      conAlcance(w, ascensorEdificioAlcanceWhere(req.user));
+      const enAmbito = await prisma.tbl_ascensores.findFirst({ where: w, select: { id: true } });
       if (!enAmbito) return res.status(404).json({ error: 'Ascensor no encontrado' });
     }
     const ascensor = await prisma.tbl_ascensores.findUnique({
@@ -79,10 +84,11 @@ const obtener = async (req, res) => {
 const historial = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (aplicaAlcance(req.user)) {
-      const enAmbito = await prisma.tbl_ascensores.findFirst({
-        where: { id, ...ascensorAlcanceWhere(req.user) }, select: { id: true }
-      });
+    if (aplicaAlcance(req.user) || aplicaAlcanceEdificio(req.user)) {
+      const w = { id };
+      conAlcance(w, ascensorAlcanceWhere(req.user));
+      conAlcance(w, ascensorEdificioAlcanceWhere(req.user));
+      const enAmbito = await prisma.tbl_ascensores.findFirst({ where: w, select: { id: true } });
       if (!enAmbito) return res.status(404).json({ error: 'Ascensor no encontrado' });
     }
     const tipos = tiposRegistroPermitidos(req.user);

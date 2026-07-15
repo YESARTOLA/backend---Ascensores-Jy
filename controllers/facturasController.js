@@ -14,6 +14,7 @@ const {
 } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
+const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const listar = async (req, res) => {
   try {
@@ -53,10 +54,12 @@ const listar = async (req, res) => {
       estado_factura: { estado_factura: direccion }
     };
     const orderBy = ORDEN[sort] || { id: 'asc' };
+    // Alcance por tipo de edificio (Administrador): factura de servicio o de plan.
+    conAlcance(where, porServicioOPlanAscensorEdificioWhere(req.user));
 
     const result = await paginar(
       prisma.tbl_facturas,
-      { where, orderBy, include: { cliente: true, servicio: true, archivo: true, cobro: true, cuota: true } },
+      { where, orderBy, include: { cliente: true, servicio: true, mantenimiento_plan: { include: { tipo_servicio: true } }, archivo: true, cobro: true, cuota: true } },
       req.query
     );
     res.json(result);
@@ -70,7 +73,7 @@ const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const f = await prisma.tbl_facturas.findUnique({
-      where: { id }, include: { cliente: true, servicio: true, archivo: true, cobro: true, cuota: true }
+      where: { id }, include: { cliente: true, servicio: true, mantenimiento_plan: { include: { tipo_servicio: true } }, archivo: true, cobro: true, cuota: true }
     });
     if (!f) return res.status(404).json({ error: 'No encontrada' });
     res.json({ data: f });
@@ -109,17 +112,88 @@ async function recomputarEstadoFacturacionServicio(idServicio, idUsuario) {
   return estadoFacturacion;
 }
 
+/**
+ * Crea una factura para el cobro ÚNICO de un plan de mantenimiento (sin servicio).
+ * El plan se factura una sola vez por el total; admite factura general o por cuota,
+ * con las mismas reglas de exclusividad que las facturas por servicio.
+ */
+async function _crearFacturaPlan(req, res, d) {
+  const idPlan = Number(d.id_mantenimiento_plan);
+  const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+    where: { id: idPlan }, include: { cobro: true }
+  });
+  if (!plan || plan.estado === 0) return res.status(400).json({ error: 'Plan de mantenimiento no existe' });
+  const cobro = plan.cobro && plan.cobro.estado === 1 ? plan.cobro : null;
+  if (!cobro) return res.status(400).json({ error: 'El plan no tiene cobro activo para facturar' });
+
+  const idCuota = d.id_cuota ? Number(d.id_cuota) : null;
+  const facturasExistentes = await prisma.tbl_facturas.findMany({
+    where: { id_mantenimiento_plan: idPlan, estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } }
+  });
+  const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
+  const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
+
+  if (idCuota === null) {
+    if (hayPorCuota) return res.status(400).json({ error: 'Este plan ya tiene facturas por cuota. No se puede emitir una factura general además.' });
+    if (hayGeneral) return res.status(400).json({ error: 'Este plan ya tiene una factura general emitida.' });
+    const totalCobrable = Number(cobro.monto_total || 0);
+    if (totalCobrable > 0 && Number(d.monto) - totalCobrable > 0.01) {
+      return res.status(400).json({ error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) excede el total del plan (S/ ${totalCobrable.toFixed(2)}).` });
+    }
+  } else {
+    if (hayGeneral) return res.status(400).json({ error: 'Este plan ya tiene una factura general. No se puede emitir factura por cuota además.' });
+    const cuota = await prisma.tbl_cobros_cuotas.findUnique({ where: { id: idCuota } });
+    if (!cuota) return res.status(400).json({ error: 'Cuota no existe' });
+    if (cuota.id_cobro !== cobro.id) return res.status(400).json({ error: 'La cuota no pertenece a este plan' });
+    const yaFacturada = facturasExistentes.find(f => f.id_cuota === idCuota);
+    if (yaFacturada) return res.status(400).json({ error: `La cuota N° ${cuota.numero_cuota} ya tiene factura (${yaFacturada.numero_factura})` });
+    if (Math.abs(Number(d.monto) - Number(cuota.monto)) > 0.01) {
+      return res.status(400).json({ error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) debe igualar el monto de la cuota N° ${cuota.numero_cuota} (S/ ${Number(cuota.monto).toFixed(2)})` });
+    }
+  }
+
+  const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
+    ? d.estado_factura : ESTADO_FACTURA_EMITIDA;
+  const factura = await prisma.tbl_facturas.create({
+    data: {
+      id_servicio: null,
+      id_mantenimiento_plan: idPlan,
+      id_cobro: cobro.id,
+      id_cuota: idCuota,
+      id_cliente: plan.id_cliente,
+      numero_factura: d.numero_factura,
+      fecha_emision: parseYMDLima(d.fecha_emision),
+      monto: d.monto,
+      id_archivo: d.id_archivo || null,
+      estado_factura: estadoFacturaInicial,
+      registrado_por: req.user.id,
+      user_id_registration: req.user.id
+    }
+  });
+  await registrarAuditoria({
+    id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'CREATE', valor_nuevo: factura, ip: req.ip
+  });
+  return res.status(201).json({ data: factura });
+}
+
 const crear = async (req, res) => {
   try {
     const d = req.body;
-    if (!d.id_servicio || !d.numero_factura || !d.fecha_emision) {
-      return res.status(400).json({ error: 'Servicio, número y fecha son obligatorios' });
+    if (!d.numero_factura || !d.fecha_emision) {
+      return res.status(400).json({ error: 'Número y fecha son obligatorios' });
     }
     if (d.monto === undefined || d.monto === null || d.monto === '') {
       return res.status(400).json({ error: 'Monto obligatorio' });
     }
     if (Number(d.monto) < 0) {
       return res.status(400).json({ error: 'Monto no puede ser negativo' });
+    }
+    // Factura de plan de mantenimiento (cobro único del plan, sin servicio).
+    if (d.id_mantenimiento_plan) {
+      return await _crearFacturaPlan(req, res, d);
+    }
+    if (!d.id_servicio) {
+      return res.status(400).json({ error: 'Servicio (o plan de mantenimiento) es obligatorio' });
     }
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id: Number(d.id_servicio) }, include: { cobro: true, servicio_realizado: true }
@@ -251,31 +325,31 @@ const cambiarEstado = async (req, res) => {
       data: { estado_factura, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
 
-    // Recalcular estado_facturacion agregado del servicio. Si la factura se
-    // anula y queda sin facturas activas, el helper devuelve 'Sin factura'.
-    const estadoFacturacion = await recomputarEstadoFacturacionServicio(
-      previo.id_servicio,
-      req.user.id
-    );
-
-    // Si el servicio ya está en post-ejecución, sincronizar su estado contable.
-    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
-      where: { id: previo.id_servicio }, include: { cobro: true }
-    });
-    if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
-      const cobro = servicio.cobro;
-      const nuevoEstadoServ = estadoServicioDesdeCobro({
-        estado_cobro: cobro?.estado_cobro,
-        total_abonado: cobro?.total_abonado,
-        saldo_pendiente: cobro?.saldo_pendiente,
-        facturado: esFacturado(estadoFacturacion)
-      });
-      await cambiarEstadoServicio(
+    // Facturas de servicio: recalcular estado_facturacion agregado y sincronizar
+    // el estado contable del servicio. Las facturas de PLAN no tienen servicio.
+    if (previo.id_servicio) {
+      const estadoFacturacion = await recomputarEstadoFacturacionServicio(
         previo.id_servicio,
-        nuevoEstadoServ,
-        req.user.id,
-        `Factura ${previo.numero_factura} pasó a ${estado_factura}`
+        req.user.id
       );
+      const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+        where: { id: previo.id_servicio }, include: { cobro: true }
+      });
+      if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
+        const cobro = servicio.cobro;
+        const nuevoEstadoServ = estadoServicioDesdeCobro({
+          estado_cobro: cobro?.estado_cobro,
+          total_abonado: cobro?.total_abonado,
+          saldo_pendiente: cobro?.saldo_pendiente,
+          facturado: esFacturado(estadoFacturacion)
+        });
+        await cambiarEstadoServicio(
+          previo.id_servicio,
+          nuevoEstadoServ,
+          req.user.id,
+          `Factura ${previo.numero_factura} pasó a ${estado_factura}`
+        );
+      }
     }
 
     await registrarAuditoria({
@@ -319,22 +393,23 @@ const eliminar = async (req, res) => {
 
     await purgarObjetosWasabi(wasabiKeys);
 
-    // Recalcular estado_facturacion agregado del servicio (centralizado).
-    const estadoFacturacion = await recomputarEstadoFacturacionServicio(idServicio, req.user.id);
-
-    // Si el servicio ya está en post-ejecución, resincronizar su estado contable.
-    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
-      where: { id: idServicio }, include: { cobro: true }
-    });
-    if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
-      const cobro = servicio.cobro;
-      const nuevoEstadoServ = estadoServicioDesdeCobro({
-        estado_cobro: cobro?.estado_cobro,
-        total_abonado: cobro?.total_abonado,
-        saldo_pendiente: cobro?.saldo_pendiente,
-        facturado: esFacturado(estadoFacturacion)
+    // Facturas de servicio: recalcular estado_facturacion y resincronizar estado.
+    // Las facturas de PLAN no tienen servicio que recalcular.
+    if (idServicio) {
+      const estadoFacturacion = await recomputarEstadoFacturacionServicio(idServicio, req.user.id);
+      const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+        where: { id: idServicio }, include: { cobro: true }
       });
-      await cambiarEstadoServicio(idServicio, nuevoEstadoServ, req.user.id, `Factura ${previo.numero_factura} eliminada`);
+      if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
+        const cobro = servicio.cobro;
+        const nuevoEstadoServ = estadoServicioDesdeCobro({
+          estado_cobro: cobro?.estado_cobro,
+          total_abonado: cobro?.total_abonado,
+          saldo_pendiente: cobro?.saldo_pendiente,
+          facturado: esFacturado(estadoFacturacion)
+        });
+        await cambiarEstadoServicio(idServicio, nuevoEstadoServ, req.user.id, `Factura ${previo.numero_factura} eliminada`);
+      }
     }
 
     res.json({ ok: true });

@@ -6,6 +6,8 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { esAtencionRapidaConvertida } = require('../utils/estadoServicio');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
+const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const listar = async (req, res) => {
   try {
@@ -25,6 +27,13 @@ const listar = async (req, res) => {
       { ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } },
       { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } }
     ];
+    // Oculta a roles distintos de super_admin las atenciones de edificios inactivos
+    // (solo si están vinculadas a un ascensor; las libres no se ocultan). El FK
+    // id_ascensor es OPCIONAL aquí, así que se habilita la rama "sin ascensor".
+    aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(req.user, { permitirSinAscensor: true }));
+    // Alcance por tipo de edificio (Administrador): igual criterio, las atenciones
+    // sin ascensor (libres) no se ocultan.
+    conAlcance(where, porAscensorEdificioWhere(req.user, { permitirSinAscensor: true }));
     const result = await paginar(
       prisma.tbl_atenciones_rapidas,
       { where, orderBy: { id: 'desc' }, include: { cliente: true, ascensor: true } },
