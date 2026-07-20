@@ -39,15 +39,23 @@ const includeRel = {
  */
 function whereVisible(user) {
   const tipos = tiposRecordatorioPermitidos(user.rol_codigo);
-  const where = { tipo: { in: tipos } };
+  const clauses = [{ tipo: { in: tipos } }];
+  // Los recordatorios manuales son PRIVADOS: cada usuario ve únicamente los que
+  // él creó. Los demás tipos (auto: servicio, cobro, etc.) se comparten según
+  // la matriz de roles.
+  if (tipos.includes('manual')) {
+    clauses.push({ OR: [{ tipo: { not: 'manual' } }, { user_id_registration: user.id }] });
+  }
   if (soloOperativosAsignados(user.rol_codigo)) {
     const idTec = user.id_tecnico || -1;
-    where.OR = [
-      { servicio:   { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } },
-      { emergencia: { servicio: { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } } }
-    ];
+    clauses.push({
+      OR: [
+        { servicio:   { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } },
+        { emergencia: { servicio: { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } } }
+      ]
+    });
   }
-  return where;
+  return clauses.length === 1 ? clauses[0] : { AND: clauses };
 }
 
 /**
@@ -82,6 +90,8 @@ function fechaEnPasado(valor) {
 function puedeAcceder(rec, user) {
   const tipos = tiposRecordatorioPermitidos(user.rol_codigo);
   if (!tipos.includes(rec.tipo)) return false;
+  // Un recordatorio manual solo lo puede ver/operar su creador (privado).
+  if (rec.tipo === 'manual' && rec.user_id_registration !== user.id) return false;
   if (!soloOperativosAsignados(user.rol_codigo)) return true;
   const idTec = user.id_tecnico;
   if (!idTec) return false;
@@ -216,6 +226,10 @@ const actualizar = async (req, res) => {
       return res.status(400).json({ error: 'La fecha no puede ser anterior al momento actual' });
     }
 
+    // El proceso vinculado solo se puede cambiar en recordatorios manuales; los
+    // 'auto' derivan su vínculo del proceso que los generó y no debe tocarse.
+    const puedeVincular = previo.origen === 'manual';
+
     const r = await prisma.tbl_recordatorios.update({
       where: { id },
       data: {
@@ -225,6 +239,10 @@ const actualizar = async (req, res) => {
         ...(d.prioridad !== undefined && { prioridad: d.prioridad }),
         ...(d.color !== undefined && { color: d.color }),
         ...(d.notas_seguimiento !== undefined && { notas_seguimiento: d.notas_seguimiento }),
+        ...(puedeVincular && d.id_servicio !== undefined && { id_servicio: d.id_servicio ? Number(d.id_servicio) : null }),
+        ...(puedeVincular && d.id_mantenimiento_plan !== undefined && { id_mantenimiento_plan: d.id_mantenimiento_plan ? Number(d.id_mantenimiento_plan) : null }),
+        ...(puedeVincular && d.id_emergencia !== undefined && { id_emergencia: d.id_emergencia ? Number(d.id_emergencia) : null }),
+        ...(puedeVincular && d.id_cobro !== undefined && { id_cobro: d.id_cobro ? Number(d.id_cobro) : null }),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       },

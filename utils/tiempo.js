@@ -93,6 +93,20 @@ function ymdDeFecha(fecha) {
   return ymdLima(fecha);
 }
 
+/**
+ * Medianoche UTC de un "YYYY-MM-DD". Úsalo para filtrar rangos sobre columnas
+ * `@db.Date` (que Prisma lee/almacena como 00:00:00.000Z): los límites del rango
+ * deben alinearse a ese mismo instante. Con límites en Lima el borde superior se
+ * corre un día (fin-de-día Lima cae en el día UTC siguiente y Prisma extrae la
+ * fecha del límite en UTC), incluyendo registros del día posterior.
+ */
+function parseYMDUTC(ymd) {
+  if (!ymd) return null;
+  const s = String(ymd).substring(0, 10);
+  const d = new Date(`${s}T00:00:00.000Z`);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function combinarFechaHoraLima(fecha, hora) {
   const ymd = ymdDeFecha(fecha);
   const hm = (hora && /^\d{2}:\d{2}/.test(hora)) ? hora.substring(0, 5) : '09:00';
@@ -134,7 +148,7 @@ module.exports = {
   ymdLima, hmLima, hmsLima, ymdDeFecha,
   inicioDelDiaLima, finDelDiaLima,
   inicioMesLima, finMesLima,
-  parseYMDLima, parseYMDFinDiaLima,
+  parseYMDLima, parseYMDFinDiaLima, parseYMDUTC,
   combinarFechaHoraLima,
   parseDateTimeLocalLima,
   inicioDelMinutoActual,

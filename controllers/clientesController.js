@@ -5,16 +5,14 @@ const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
 const {
-  aplicaAlcanceClientes,
+  aplicaAlcance,
   tiposRegistroPermitidos,
+  puedeVerTipoRegistro,
   clienteAlcanceWhere,
-  edificioAlcanceWhere,
-  porJunctionAscensorEdificioWhere,
-  porAscensorEdificioWhere,
-  porServicioOPlanAscensorEdificioWhere,
-  conAlcance,
 } = require('../utils/alcanceUsuario');
-const { visibilidadPorJunctionWhere, visibilidadPorAscensorWhere, aplicarVisibilidadWhere, veTodoPorEdificio } = require('../utils/visibilidadEdificio');
+
+// Áreas de clasificación de los adjuntos del cliente (mapea 1:1 al ámbito).
+const AREAS_ARCHIVO = ['servicio', 'proyecto'];
 
 const normalizarClasificacion = (v) => {
   if (v === undefined || v === null || v === '') return null;
@@ -44,43 +42,61 @@ const trimOrNull = (v) => {
 };
 
 /**
- * Toma `data.archivos: [{ id_archivo, descripcion?, orden? }]` y reemplaza
- * los adjuntos del cliente. Idempotente: si no se envía el campo no toca nada.
+ * Reemplaza los adjuntos del cliente POR ÁREA. Recibe, por cada área,
+ * `data.archivos_servicio` / `data.archivos_proyecto` (arrays de
+ * { id_archivo, descripcion?, orden? }). Solo toca las áreas presentes en el
+ * payload Y que el usuario tenga permitido gestionar según su ámbito: así un
+ * usuario acotado a un área no borra los documentos de la otra (que ni ve).
+ * Compatibilidad: `data.archivos` (legacy, sin área) se trata como 'servicio'.
  */
-async function reemplazarArchivosCliente(tx, idCliente, payload, idUsuario) {
-  if (!Array.isArray(payload)) return;
-  await tx.tbl_clientes_archivos.deleteMany({ where: { id_cliente: idCliente } });
-  const limpios = payload
-    .map((a, i) => ({
-      id_archivo: a && a.id_archivo ? Number(a.id_archivo) : null,
-      descripcion: trimOrNull(a?.descripcion),
-      orden: Number.isFinite(Number(a?.orden)) ? Number(a.orden) : i + 1
-    }))
-    .filter(a => a.id_archivo);
-  for (const a of limpios) {
-    await tx.tbl_clientes_archivos.create({
-      data: {
-        id_cliente: idCliente,
-        id_archivo: a.id_archivo,
-        descripcion: a.descripcion,
-        orden: a.orden,
-        user_id_registration: idUsuario
-      }
-    });
+async function reemplazarArchivosCliente(tx, idCliente, data, idUsuario, user) {
+  const porArea = {
+    servicio: Array.isArray(data.archivos_servicio) ? data.archivos_servicio
+      : (Array.isArray(data.archivos) ? data.archivos : undefined),
+    proyecto: Array.isArray(data.archivos_proyecto) ? data.archivos_proyecto : undefined
+  };
+  for (const area of AREAS_ARCHIVO) {
+    const payload = porArea[area];
+    if (!Array.isArray(payload)) continue;                     // área no enviada → intacta
+    if (user && !puedeVerTipoRegistro(user, area)) continue;   // sin permiso sobre el área → intacta
+    await tx.tbl_clientes_archivos.deleteMany({ where: { id_cliente: idCliente, area } });
+    const limpios = payload
+      .map((a, i) => ({
+        id_archivo: a && a.id_archivo ? Number(a.id_archivo) : null,
+        descripcion: trimOrNull(a?.descripcion),
+        orden: Number.isFinite(Number(a?.orden)) ? Number(a.orden) : i + 1
+      }))
+      .filter(a => a.id_archivo);
+    for (const a of limpios) {
+      await tx.tbl_clientes_archivos.create({
+        data: {
+          id_cliente: idCliente,
+          id_archivo: a.id_archivo,
+          area,
+          descripcion: a.descripcion,
+          orden: a.orden,
+          user_id_registration: idUsuario
+        }
+      });
+    }
   }
 }
 
-const INCLUDE_ARCHIVOS = {
-  where: { estado: 1 },
-  orderBy: { orden: 'asc' },
-  include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, tamano_bytes: true, fecha_subida: true } } }
-};
-
-const INCLUDE_PRECIOS = {
-  where: { estado: 1 },
-  include: { tipo_servicio: { select: { id: true, nombre: true } } },
-  orderBy: { id: 'asc' }
-};
+/**
+ * Include de adjuntos del cliente filtrado por el ÁMBITO del usuario: un usuario
+ * acotado a un área solo ve los documentos de esa área. Roles sin ámbito
+ * (super_admin, contabilidad…) ven todos.
+ */
+function includeArchivos(user) {
+  const tipos = tiposRegistroPermitidos(user); // null = sin restricción
+  const where = { estado: 1 };
+  if (tipos) where.area = { in: tipos.length ? tipos : ['__sin_ambito__'] };
+  return {
+    where,
+    orderBy: { orden: 'asc' },
+    include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, tamano_bytes: true, fecha_subida: true } } }
+  };
+}
 
 // Edificios activos del cliente (con su conteo de ascensores). Reemplaza la
 // antigua relación directa cliente→ascensores en el detalle y la vista 360.
@@ -93,49 +109,16 @@ const INCLUDE_EDIFICIOS = {
   }
 };
 
-/**
- * `payload` = `[{ id_tipo_servicio, precio, moneda }]`. Upsert por par
- * (id_cliente, id_tipo_servicio). Soft-delete (estado=0) las filas que ya no
- * vienen en el payload. Idempotente.
- */
-async function reemplazarPreciosCliente(tx, idCliente, payload, idUsuario) {
-  if (!Array.isArray(payload)) return;
-  const limpios = [];
-  for (const p of payload) {
-    const idTipo = p && p.id_tipo_servicio ? Number(p.id_tipo_servicio) : null;
-    const rawPrecio = p && p.precio !== undefined && p.precio !== null && p.precio !== '' ? Number(p.precio) : null;
-    if (!idTipo || !Number.isFinite(rawPrecio) || rawPrecio < 0) continue;
-    limpios.push({ id_tipo_servicio: idTipo, precio: rawPrecio, moneda: p.moneda || 'PEN' });
+// Igual que INCLUDE_EDIFICIOS pero sin filtrar por estado: la vista 360 es el
+// único lugar donde se ven los edificios y ascensores dados de baja, para poder
+// reactivarlos. Los activos van primero (tanto edificios como ascensores).
+const INCLUDE_EDIFICIOS_360 = {
+  orderBy: [{ estado: 'desc' }, { id: 'desc' }],
+  include: {
+    ascensores: { orderBy: [{ estado: 'desc' }, { id: 'asc' }] },
+    _count: { select: { ascensores: true } }
   }
-  const tiposActuales = limpios.map(l => l.id_tipo_servicio);
-  await tx.tbl_clientes_precios.updateMany({
-    where: {
-      id_cliente: idCliente,
-      estado: 1,
-      ...(tiposActuales.length > 0 ? { id_tipo_servicio: { notIn: tiposActuales } } : {})
-    },
-    data: { estado: 0, user_id_modification: idUsuario, date_time_modification: new Date() }
-  });
-  for (const l of limpios) {
-    await tx.tbl_clientes_precios.upsert({
-      where: { id_cliente_id_tipo_servicio: { id_cliente: idCliente, id_tipo_servicio: l.id_tipo_servicio } },
-      create: {
-        id_cliente: idCliente,
-        id_tipo_servicio: l.id_tipo_servicio,
-        precio: l.precio,
-        moneda: l.moneda,
-        user_id_registration: idUsuario
-      },
-      update: {
-        precio: l.precio,
-        moneda: l.moneda,
-        estado: 1,
-        user_id_modification: idUsuario,
-        date_time_modification: new Date()
-      }
-    });
-  }
-}
+};
 
 /**
  * Construye el `where` Prisma para tbl_clientes a partir de los filtros de querystring.
@@ -146,7 +129,8 @@ async function reemplazarPreciosCliente(tx, idCliente, payload, idUsuario) {
  * relación `edificios`.
  *
  * Filtros soportados:
- *   q                — texto libre sobre nombre / nº documento / teléfono / nombre de edificio
+ *   q                — texto libre sobre nombre / nº documento / teléfono (del cliente o
+ *                      de su contacto principal) / nombre de edificio
  *   distrito         — clientes con algún edificio en ese distrito
  *   tipo_ascensor    — clientes con algún edificio que tenga un ascensor de ese tipo
  *   clasificacion    — match exacto
@@ -165,6 +149,7 @@ async function construirWhereClientes(query, user) {
       { nombre: { contains: q, mode: 'insensitive' } },
       { numero_documento: { contains: q, mode: 'insensitive' } },
       { telefono: { contains: q, mode: 'insensitive' } },
+      { contacto_principal_telefono: { contains: q, mode: 'insensitive' } },
       { edificios: { some: { estado: 1, nombre: { contains: q, mode: 'insensitive' } } } }
     ];
   }
@@ -179,26 +164,36 @@ async function construirWhereClientes(query, user) {
   }
   if (estado === '0' || estado === '1') where.estado = Number(estado);
 
+  // Estado de contrato POR ÁREA: se evalúa sobre las áreas que el usuario puede
+  // ver (según su ámbito). Si ve ambas, un cliente coincide si CUALQUIERA cumple.
+  // Se usa where.AND para no pisar el where.OR del buscador `q`.
+  const tiposContrato = tiposRegistroPermitidos(user);
+  const areasContrato = (tiposContrato && tiposContrato.length) ? tiposContrato : ['servicio', 'proyecto'];
+  const colInicio = (a) => a === 'servicio' ? 'contrato_servicio_inicio' : 'contrato_proyecto_inicio';
+  const colFin = (a) => a === 'servicio' ? 'contrato_servicio_fin' : 'contrato_proyecto_fin';
+  const colArch = (a) => a === 'servicio' ? 'id_archivo_contrato_servicio' : 'id_archivo_contrato_proyecto';
+  const pushAnd = (cond) => { (where.AND = where.AND || []).push(cond); };
+
   if (estado_contrato) {
     const diasAviso = await configuracion.obtener('CLIENTES_DIAS_AVISO_VENCIMIENTO_CONTRATO');
     const hoy = inicioDelDiaLima();
     const proximo = new Date(hoy.getTime() + Number(diasAviso || 30) * 86400000);
-    if (estado_contrato === 'vigente') {
-      where.contrato_inicio = { lte: hoy };
-      where.contrato_fin = { gte: hoy };
-    } else if (estado_contrato === 'por_vencer') {
-      where.contrato_fin = { gte: hoy, lte: proximo };
-    } else if (estado_contrato === 'vencido') {
-      where.contrato_fin = { lt: hoy };
-    } else if (estado_contrato === 'sin_contrato') {
-      where.OR = [...(where.OR || []), { contrato_inicio: null }, { contrato_fin: null }];
-    }
+    const condArea = (a) => {
+      if (estado_contrato === 'vigente') return { [colInicio(a)]: { lte: hoy }, [colFin(a)]: { gte: hoy } };
+      if (estado_contrato === 'por_vencer') return { [colFin(a)]: { gte: hoy, lte: proximo } };
+      if (estado_contrato === 'vencido') return { [colFin(a)]: { lt: hoy } };
+      if (estado_contrato === 'sin_contrato') return { OR: [{ [colInicio(a)]: null }, { [colFin(a)]: null }] };
+      return {};
+    };
+    pushAnd({ OR: areasContrato.map(condArea) });
   }
-  if (con_contrato === '1') where.id_archivo_contrato = { not: null };
-  else if (con_contrato === '0') where.id_archivo_contrato = null;
+  if (con_contrato === '1') pushAnd({ OR: areasContrato.map(a => ({ [colArch(a)]: { not: null } })) });
+  else if (con_contrato === '0') pushAnd({ AND: areasContrato.map(a => ({ [colArch(a)]: null })) });
 
-  // Ámbito del usuario: limita a clientes con registros del/los tipo(s) permitido(s).
-  Object.assign(where, clienteAlcanceWhere(user));
+  // Ámbito del usuario: limita a clientes de su(s) área(s). Se agrega como una
+  // cláusula AND (no con Object.assign) para no pisar el where.OR del buscador `q`.
+  const alcance = clienteAlcanceWhere(user);
+  if (Object.keys(alcance).length) pushAnd(alcance);
 
   return where;
 }
@@ -253,18 +248,35 @@ const listar = async (req, res) => {
   try {
     const where = await construirWhereClientes(req.query, req.user);
 
+    // Cuando hay búsqueda libre, además del contador traemos los edificios cuyo
+    // nombre coincide con el término, para que el listado pueda señalar de forma
+    // discreta que la coincidencia provino del nombre de un edificio.
+    const q = (req.query.q || '').trim();
+    const include = {
+      _count: { select: { edificios: true, servicios: true, archivos: true } },
+      archivo_contrato_servicio: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
+      archivo_contrato_proyecto: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
+    };
+    if (q) {
+      include.edificios = {
+        where: { estado: 1, nombre: { contains: q, mode: 'insensitive' } },
+        select: { id: true, nombre: true },
+        orderBy: { nombre: 'asc' }
+      };
+    }
+
     const result = await paginar(
       prisma.tbl_clientes,
-      {
-        where,
-        orderBy: { id: 'desc' },
-        include: {
-          _count: { select: { edificios: true, servicios: true, archivos: true } },
-          archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
-        }
-      },
+      { where, orderBy: { id: 'desc' }, include },
       req.query
     );
+
+    if (q) {
+      result.data = result.data.map(c => {
+        const { edificios, ...resto } = c;
+        return { ...resto, edificios_coincidentes: edificios || [] };
+      });
+    }
 
     const userIds = [...new Set(result.data.map(c => c.user_id_registration).filter(Boolean))];
     if (userIds.length > 0) {
@@ -304,7 +316,8 @@ const exportar = async (req, res) => {
       include: {
         _count: { select: { edificios: true, servicios: true, archivos: true } },
         edificios: { where: { estado: 1 }, select: { nombre: true, distrito: true, tipo: true, _count: { select: { ascensores: true } } } },
-        archivo_contrato: { select: { nombre_original: true } }
+        archivo_contrato_servicio: { select: { nombre_original: true } },
+        archivo_contrato_proyecto: { select: { nombre_original: true } }
       }
     });
 
@@ -331,7 +344,7 @@ const exportar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (aplicaAlcanceClientes(req.user)) {
+    if (aplicaAlcance(req.user)) {
       const enAmbito = await prisma.tbl_clientes.findFirst({
         where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
       });
@@ -341,9 +354,8 @@ const obtener = async (req, res) => {
       where: { id },
       include: {
         edificios: INCLUDE_EDIFICIOS,
-        archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
-        archivos: INCLUDE_ARCHIVOS,
-        precios: INCLUDE_PRECIOS
+        ...INCLUDE_CONTRATOS,
+        archivos: includeArchivos(req.user)
       }
     });
     if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
@@ -366,68 +378,48 @@ const vista360 = async (req, res) => {
     const filtroCategoria = tipos
       ? { categoria_funcional: { in: tipos.length ? tipos.map(t => (t === 'proyecto' ? 'PROYECTOS' : 'SERVICIOS')) : ['__sin_ambito__'] } }
       : {};
-    if (aplicaAlcanceClientes(req.user)) {
+    if (aplicaAlcance(req.user)) {
       const enAmbito = await prisma.tbl_clientes.findFirst({
         where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
       });
       if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    // Visibilidad por estado de edificio: a los roles distintos de super_admin se
-    // les ocultan los registros de edificios inactivos también dentro del 360.
-    const whereServicios360 = aplicarVisibilidadWhere({ estado: 1, ...filtroServicio }, visibilidadPorJunctionWhere(req.user));
-    const whereEmergencias360 = aplicarVisibilidadWhere({ estado: 1 }, visibilidadPorAscensorWhere(req.user));
-    const whereMantenimientos360 = aplicarVisibilidadWhere({ estado: 1 }, visibilidadPorJunctionWhere(req.user));
-    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras):
-    // se filtra cada colección del 360 por el mismo criterio que en sus módulos.
-    conAlcance(whereServicios360, porJunctionAscensorEdificioWhere(req.user));
-    conAlcance(whereEmergencias360, porAscensorEdificioWhere(req.user));
-    conAlcance(whereMantenimientos360, porJunctionAscensorEdificioWhere(req.user));
-    const whereCobros360 = conAlcance({ estado: 1, ...filtroServicioRel }, porServicioOPlanAscensorEdificioWhere(req.user));
-    const whereFacturas360 = conAlcance({ estado: 1, ...filtroServicioRel }, porServicioOPlanAscensorEdificioWhere(req.user));
-    // El Super Admin ve también los edificios inactivos del cliente (para poder
-    // reactivarlos desde el 360); los demás roles solo los activos. Un Administrador
-    // acotado por tipo solo ve los edificios de su(s) tipo(s) permitido(s).
-    const includeEdificios360 = veTodoPorEdificio(req.user)
-      ? { orderBy: { id: 'desc' }, include: { ascensores: { where: { estado: 1 } }, _count: { select: { ascensores: true } } } }
-      : { ...INCLUDE_EDIFICIOS, where: { ...INCLUDE_EDIFICIOS.where, ...edificioAlcanceWhere(req.user) } };
-
     const cliente = await prisma.tbl_clientes.findUnique({
       where: { id },
       include: {
-        edificios: includeEdificios360,
-        archivos: INCLUDE_ARCHIVOS,
-        precios: INCLUDE_PRECIOS,
-        archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
+        edificios: INCLUDE_EDIFICIOS_360,
+        archivos: includeArchivos(req.user),
+        ...INCLUDE_CONTRATOS,
         servicios: {
-          where: whereServicios360,
+          where: { estado: 1, ...filtroServicio },
           orderBy: { id: 'desc' },
           take: 100,
           include: {
             tipo_servicio: true,
-            ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true, ubicacion: true } } } },
+            ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true, ubicacion: true, edificio: { select: { nombre: true } } } } } },
             asignaciones: { include: { tecnico: true }, where: { estado: 1 } }
           }
         },
         emergencias: {
           orderBy: { fecha_reporte: 'desc' },
           take: 50,
-          where: whereEmergencias360,
+          where: { estado: 1 },
           include: { ascensor: { select: { codigo: true } } }
         },
         mantenimientos: {
-          where: whereMantenimientos360,
+          where: { estado: 1 },
           include: { ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } }, tipo_servicio: true }
         },
-        cobros: { where: whereCobros360, orderBy: { id: 'desc' } },
+        cobros: { where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' } },
         facturas: {
-          where: whereFacturas360, orderBy: { id: 'desc' }, take: 50,
+          where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' }, take: 50,
           include: { archivo: true, servicio: { select: { codigo: true } } }
         },
         cotizaciones: {
           where: { estado: 1, ...(tipos ? { tipo_servicio: filtroCategoria } : {}) }, orderBy: { id: 'desc' }, take: 50,
           include: {
-            tipo_servicio: { select: { nombre: true } },
+            tipo_servicio: { select: { nombre: true, categoria_funcional: true } },
             versiones: {
               where: { estado: 1 },
               orderBy: { numero_version: 'desc' },
@@ -478,23 +470,76 @@ const vista360 = async (req, res) => {
   }
 };
 
+// Columnas del contrato por área y etiqueta legible.
+const CAMPOS_CONTRATO = {
+  servicio: { inicio: 'contrato_servicio_inicio', fin: 'contrato_servicio_fin', archivo: 'id_archivo_contrato_servicio' },
+  proyecto: { inicio: 'contrato_proyecto_inicio', fin: 'contrato_proyecto_fin', archivo: 'id_archivo_contrato_proyecto' }
+};
+const ETIQUETA_AREA = { servicio: 'Servicios', proyecto: 'Proyectos' };
+
+// Include de los documentos de contrato de ambas áreas.
+const INCLUDE_CONTRATOS = {
+  archivo_contrato_servicio: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
+  archivo_contrato_proyecto: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } }
+};
+
+/**
+ * Resuelve y valida el contrato de servicio POR ÁREA (Servicios / Proyectos).
+ * Reglas: si un área trae una fecha, debe traer ambas (y fin >= inicio); debe
+ * existir contrato completo en AL MENOS un área. Respeta el ámbito: un usuario
+ * acotado solo modifica sus áreas (las demás conservan lo previo). `previo` = el
+ * cliente actual (o {} al crear). Devuelve { ok, error?, valores }.
+ */
+function resolverContratosPorArea(data, previo, user) {
+  const valores = {};
+  const completos = {};
+  for (const area of AREAS_ARCHIVO) {
+    const c = CAMPOS_CONTRATO[area];
+    const gestiona = !user || puedeVerTipoRegistro(user, area);
+    let inicio = previo[c.inicio] ?? null;
+    let fin = previo[c.fin] ?? null;
+    let archivo = previo[c.archivo] ?? null;
+    if (gestiona) {
+      if (Object.prototype.hasOwnProperty.call(data, c.inicio)) {
+        const v = parseFechaContrato(data[c.inicio]);
+        if (v === undefined) return { ok: false, error: `Fecha de inicio de contrato de ${ETIQUETA_AREA[area]} inválida` };
+        inicio = v;
+      }
+      if (Object.prototype.hasOwnProperty.call(data, c.fin)) {
+        const v = parseFechaContrato(data[c.fin]);
+        if (v === undefined) return { ok: false, error: `Fecha de fin de contrato de ${ETIQUETA_AREA[area]} inválida` };
+        fin = v;
+      }
+      if (Object.prototype.hasOwnProperty.call(data, c.archivo)) {
+        const raw = data[c.archivo];
+        archivo = (raw === null || raw === '' || raw === undefined) ? null : Number(raw);
+      }
+    }
+    if ((inicio && !fin) || (!inicio && fin)) {
+      return { ok: false, error: `Complete inicio y fin del contrato de ${ETIQUETA_AREA[area]}` };
+    }
+    if (inicio && fin && fin < inicio) {
+      return { ok: false, error: `La fecha fin del contrato de ${ETIQUETA_AREA[area]} no puede ser anterior al inicio` };
+    }
+    valores[c.inicio] = inicio;
+    valores[c.fin] = fin;
+    valores[c.archivo] = archivo;
+    completos[area] = !!(inicio && fin);
+  }
+  if (!completos.servicio && !completos.proyecto) {
+    return { ok: false, error: 'Registre el contrato (inicio y fin) de al menos un área: Servicios o Proyectos' };
+  }
+  return { ok: true, valores };
+}
+
 const crear = async (req, res) => {
   try {
     const data = req.body;
     if (!data.nombre) {
       return res.status(400).json({ error: 'La razón social / nombre es obligatorio' });
     }
-    if (!data.contrato_inicio || !data.contrato_fin) {
-      return res.status(400).json({ error: 'Inicio y fin del contrato de servicio son obligatorios' });
-    }
-    const contratoInicio = parseFechaContrato(data.contrato_inicio);
-    const contratoFin = parseFechaContrato(data.contrato_fin);
-    if (!contratoInicio || !contratoFin) {
-      return res.status(400).json({ error: 'Fechas de contrato inválidas' });
-    }
-    if (contratoFin < contratoInicio) {
-      return res.status(400).json({ error: 'La fecha fin del contrato no puede ser anterior al inicio' });
-    }
+    const contratos = resolverContratosPorArea(data, {}, req.user);
+    if (!contratos.ok) return res.status(400).json({ error: contratos.error });
     if (data.numero_documento) {
       const duplicado = await prisma.tbl_clientes.findFirst({
         where: {
@@ -519,21 +564,17 @@ const crear = async (req, res) => {
           correo: trimOrNull(data.correo),
           ...contactos,
           observaciones: data.observaciones || null,
-          contrato_inicio: contratoInicio,
-          contrato_fin: contratoFin,
-          id_archivo_contrato: data.id_archivo_contrato ? Number(data.id_archivo_contrato) : null,
+          ...contratos.valores,
           clasificacion: normalizarClasificacion(data.clasificacion),
           user_id_registration: req.user.id
         }
       });
-      await reemplazarArchivosCliente(tx, creado.id, data.archivos, req.user.id);
-      await reemplazarPreciosCliente(tx, creado.id, data.precios, req.user.id);
+      await reemplazarArchivosCliente(tx, creado.id, data, req.user.id, req.user);
       return tx.tbl_clientes.findUnique({
         where: { id: creado.id },
         include: {
-          archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
-          archivos: INCLUDE_ARCHIVOS,
-          precios: INCLUDE_PRECIOS
+          ...INCLUDE_CONTRATOS,
+          archivos: includeArchivos(req.user)
         }
       });
     });
@@ -570,29 +611,8 @@ const actualizar = async (req, res) => {
       }
     }
 
-    let contratoInicio = previo.contrato_inicio;
-    let contratoFin = previo.contrato_fin;
-    if (data.contrato_inicio !== undefined) {
-      contratoInicio = parseFechaContrato(data.contrato_inicio);
-      if (contratoInicio === undefined) {
-        return res.status(400).json({ error: 'Fecha de inicio de contrato inválida' });
-      }
-    }
-    if (data.contrato_fin !== undefined) {
-      contratoFin = parseFechaContrato(data.contrato_fin);
-      if (contratoFin === undefined) {
-        return res.status(400).json({ error: 'Fecha de fin de contrato inválida' });
-      }
-    }
-    if (contratoInicio && contratoFin && contratoFin < contratoInicio) {
-      return res.status(400).json({ error: 'La fecha fin del contrato no puede ser anterior al inicio' });
-    }
-
-    let idArchivoContrato = previo.id_archivo_contrato;
-    if (Object.prototype.hasOwnProperty.call(data, 'id_archivo_contrato')) {
-      const valor = data.id_archivo_contrato;
-      idArchivoContrato = (valor === null || valor === '' || valor === undefined) ? null : Number(valor);
-    }
+    const contratos = resolverContratosPorArea(data, previo, req.user);
+    if (!contratos.ok) return res.status(400).json({ error: contratos.error });
 
     const dataContactos = {};
     for (const k of CAMPOS_CONTACTOS) {
@@ -610,9 +630,7 @@ const actualizar = async (req, res) => {
           correo: data.correo ?? previo.correo,
           ...dataContactos,
           observaciones: data.observaciones ?? previo.observaciones,
-          contrato_inicio: contratoInicio,
-          contrato_fin: contratoFin,
-          id_archivo_contrato: idArchivoContrato,
+          ...contratos.valores,
           clasificacion: Object.prototype.hasOwnProperty.call(data, 'clasificacion')
             ? normalizarClasificacion(data.clasificacion)
             : previo.clasificacion,
@@ -620,14 +638,12 @@ const actualizar = async (req, res) => {
           date_time_modification: new Date()
         }
       });
-      await reemplazarArchivosCliente(tx, id, data.archivos, req.user.id);
-      await reemplazarPreciosCliente(tx, id, data.precios, req.user.id);
+      await reemplazarArchivosCliente(tx, id, data, req.user.id, req.user);
       return tx.tbl_clientes.findUnique({
         where: { id },
         include: {
-          archivo_contrato: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
-          archivos: INCLUDE_ARCHIVOS,
-          precios: INCLUDE_PRECIOS
+          ...INCLUDE_CONTRATOS,
+          archivos: includeArchivos(req.user)
         }
       });
     });

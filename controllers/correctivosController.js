@@ -10,14 +10,16 @@
  *   - estado_correctivo default = 'Reportado'
  *   - El tipo de servicio se busca/crea por categoría = 'Correctivo'
  *   - color del calendario = ámbar (#f59e0b)
- *   - No requiere fecha programada explícita: se programa para hoy y la
- *     coordinación puede reprogramarlo desde el detalle del servicio.
+ *   - La fecha programada se elige al crear (por defecto hoy) y admite una
+ *     fecha estimada de término opcional para ocupar varios días en agenda.
  */
 
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { hmLima, inicioDelDiaLima } = require('../utils/tiempo');
+const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
+const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
@@ -29,6 +31,34 @@ const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../uti
 const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
+
+// Devuelve un correctivo por id con la misma forma que una fila del listado
+// (incluye servicio + ejecución). Lo consume el frontend para abrir el modal de
+// edición desde la página del servicio (ServicioDetalle → /correctivos?edit=ID).
+const obtener = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const c = await prisma.tbl_correctivos.findFirst({
+      where: { id, estado: 1 },
+      include: {
+        cliente: true,
+        ascensor: { include: { edificio: true } },
+        servicio: {
+          include: {
+            asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+            historial_estados: true,
+            servicio_realizado: true
+          }
+        }
+      }
+    });
+    if (!c) return res.status(404).json({ error: 'Correctivo no encontrado' });
+    res.json({ data: { ...c, ejecucion: derivarEjecucion(c.servicio) } });
+  } catch (err) {
+    console.error('[correctivos.obtener]', err);
+    res.status(500).json({ error: 'Error al obtener correctivo' });
+  }
+};
 
 const listar = async (req, res) => {
   try {
@@ -61,11 +91,20 @@ const listar = async (req, res) => {
         include: {
           cliente: true,
           ascensor: { include: { edificio: true } },
-          servicio: { include: { asignaciones: { include: { tecnico: true }, where: { estado: 1 } } } }
+          servicio: {
+            include: {
+              asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+              historial_estados: true,
+              servicio_realizado: true
+            }
+          }
         }
       },
       req.query
     );
+    // Fechas de ejecución (inicio/fin de trabajo derivados del historial de
+    // estados del servicio) para las columnas del listado.
+    result.data = result.data.map(c => ({ ...c, ejecucion: derivarEjecucion(c.servicio) }));
     res.json(result);
   } catch (err) {
     console.error('[correctivos.listar]', err);
@@ -79,17 +118,36 @@ const crear = async (req, res) => {
     if (!d.id_cliente || !d.id_ascensor || !d.falla) {
       return res.status(400).json({ error: 'Cliente, ascensor y descripción de la falla son obligatorios' });
     }
+    // Un ascensor con la instalación cancelada no admite servicios.
+    const ascSel = await prisma.tbl_ascensores.findUnique({ where: { id: Number(d.id_ascensor) }, select: { estado_operativo: true } });
+    if (ascSel?.estado_operativo === 'Instalación cancelada') {
+      return res.status(400).json({ error: 'Este ascensor tiene la instalación cancelada y no admite servicios.' });
+    }
     const sinCobro = d.sin_cobro === true || d.sin_cobro === 1 || d.sin_cobro === '1';
     if (!sinCobro && (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')) {
       return res.status(400).json({ error: 'Precio obligatorio' });
     }
     const precioFinal = sinCobro ? 0 : d.precio_interno;
+    // Bandera persistida "requiere factura": default del módulo Correctivos = 1
+    // (con factura). Editable desde el formulario de creación.
+    const requiereFactura = d.requiere_factura === undefined
+      ? 1
+      : (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0);
 
     const tecnicos = Array.isArray(d.tecnicos) ? d.tecnicos : [];
     const items_checklist = Array.isArray(d.items_checklist) ? d.items_checklist : [];
 
     const consistencia = validarConsistenciaAsignaciones(tecnicos);
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
+
+    // Fechas de agenda: fecha programada elegible (por defecto hoy) y fecha
+    // estimada de término opcional para ocupar varios días en el calendario.
+    const fechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima();
+    const horaProgramada = d.hora_programada || hmLima();
+    const fechaEstimadaEntrega = d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null;
+    if (fechaEstimadaEntrega && fechaEstimadaEntrega < fechaProgramada) {
+      return res.status(400).json({ error: 'La fecha estimada de término no puede ser anterior a la fecha programada.' });
+    }
 
     const codigo = await generarCodigoServicio();
     // Subtipo vinculado al módulo Correctivos (SSoT).
@@ -109,8 +167,9 @@ const crear = async (req, res) => {
         origen: 'correctivo',
         titulo: `Correctivo – ${d.falla.substring(0, 80)}`,
         descripcion: d.falla,
-        fecha_programada: inicioDelDiaLima(),
-        hora_programada: hmLima(),
+        fecha_programada: fechaProgramada,
+        hora_programada: horaProgramada,
+        fecha_estimada_entrega: fechaEstimadaEntrega,
         prioridad: nivelUrgencia,
         estado_servicio: tecnicos.length > 0
           ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado')
@@ -118,6 +177,7 @@ const crear = async (req, res) => {
         precio_interno: precioFinal,
         moneda: d.moneda || 'PEN',
         sin_cobro: sinCobro ? 1 : 0,
+        requiere_factura: requiereFactura,
         observaciones: d.observaciones || null,
         user_id_registration: req.user.id,
         ascensores: {
@@ -149,8 +209,9 @@ const crear = async (req, res) => {
         id_servicio: servicio.id,
         titulo: `CORRECTIVO ${servicio.codigo}`,
         tipo_evento: 'correctivo',
-        fecha_inicio: new Date(),
-        estado_evento: 'programado',
+        fecha_inicio: combinarFechaHoraLima(fechaProgramada, horaProgramada),
+        fecha_fin: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null,
+        estado_evento: ESTADO_EVENTO_PROGRAMADO,
         color: '#f59e0b'
       }
     });
@@ -233,7 +294,8 @@ const actualizar = async (req, res) => {
       d.sin_cobro !== undefined ||
       d.falla !== undefined ||
       d.nivel_urgencia !== undefined ||
-      d.moneda !== undefined
+      d.moneda !== undefined ||
+      d.requiere_factura !== undefined
     );
     if (cambiaServicio && servicioPrevio && !esServicioEditable(servicioPrevio.estado_servicio)) {
       return res.status(409).json({
@@ -247,11 +309,28 @@ const actualizar = async (req, res) => {
       : servicioPrevio?.sin_cobro;
     const precioRecibido = d.precio_interno !== undefined ? Number(d.precio_interno) : null;
     const precioFinal = sinCobroNuevo === 1 ? 0 : (puedeCambiarPrecio && precioRecibido !== null ? precioRecibido : Number(servicioPrevio?.precio_interno || 0));
+    const requiereFacturaNuevo = d.requiere_factura !== undefined
+      ? (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0)
+      : servicioPrevio?.requiere_factura;
     const nuevaFalla = d.falla ?? previo.falla;
     const nuevoNivel = d.nivel_urgencia ?? previo.nivel_urgencia;
     const nuevaMoneda = d.moneda ?? servicioPrevio?.moneda ?? 'PEN';
     const nuevoIdCliente = d.id_cliente ? Number(d.id_cliente) : (servicioPrevio?.id_cliente ?? previo.id_cliente);
     const nuevoIdAscensor = d.id_ascensor ? Number(d.id_ascensor) : (servicioPrevio?.id_ascensor ?? previo.id_ascensor);
+
+    // Fechas de agenda (opcionales en el payload: si no vienen, se conservan).
+    const nuevaFechaProgramada = d.fecha_programada !== undefined
+      ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
+      : servicioPrevio?.fecha_programada;
+    const nuevaHoraProgramada = d.hora_programada !== undefined
+      ? (d.hora_programada || null)
+      : servicioPrevio?.hora_programada;
+    const nuevaFechaEstimada = d.fecha_estimada_entrega !== undefined
+      ? (d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null)
+      : servicioPrevio?.fecha_estimada_entrega;
+    if (nuevaFechaProgramada && nuevaFechaEstimada && nuevaFechaEstimada < nuevaFechaProgramada) {
+      return res.status(400).json({ error: 'La fecha estimada de término no puede ser anterior a la fecha programada.' });
+    }
 
     if (cambiaServicio) {
       const ascBD = await prisma.tbl_ascensores.findUnique({ where: { id: nuevoIdAscensor }, include: { edificio: { select: { id_cliente: true } } } });
@@ -289,6 +368,10 @@ const actualizar = async (req, res) => {
             precio_interno: precioFinal,
             moneda: nuevaMoneda,
             sin_cobro: sinCobroNuevo,
+            requiere_factura: requiereFacturaNuevo,
+            fecha_programada: nuevaFechaProgramada,
+            hora_programada: nuevaHoraProgramada,
+            fecha_estimada_entrega: nuevaFechaEstimada,
             observaciones: d.observaciones ?? servicioPrevio.observaciones,
             user_id_modification: req.user.id, date_time_modification: new Date()
           }
@@ -306,7 +389,12 @@ const actualizar = async (req, res) => {
 
         await tx.tbl_calendario_eventos.updateMany({
           where: { id_servicio: servicioPrevio.id, estado: 1 },
-          data: { titulo: `CORRECTIVO ${servicioPrevio.codigo}`, user_id_modification: req.user.id, date_time_modification: new Date() }
+          data: {
+            titulo: `CORRECTIVO ${servicioPrevio.codigo}`,
+            ...(nuevaFechaProgramada ? { fecha_inicio: combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada) } : {}),
+            fecha_fin: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null,
+            user_id_modification: req.user.id, date_time_modification: new Date()
+          }
         });
       }
       return c;
@@ -374,4 +462,4 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar, eliminar };
+module.exports = { listar, obtener, crear, actualizar, eliminar };

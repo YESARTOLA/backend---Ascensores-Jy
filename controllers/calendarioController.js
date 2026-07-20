@@ -6,7 +6,7 @@ const {
   tiposRecordatorioPermitidos,
   colorPorTipo
 } = require('../utils/visibilidadCalendario');
-const { tiposRegistroPermitidos, calendarioEventoEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 
 const listar = async (req, res) => {
   try {
@@ -29,27 +29,15 @@ const listar = async (req, res) => {
           asignaciones: { some: { id_tecnico: req.user.id_tecnico || -1, estado: 1 } }
         };
       }
-      // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
-      conAlcance(whereEv, calendarioEventoEdificioWhere(req.user));
       eventos = await prisma.tbl_calendario_eventos.findMany({
         where: whereEv, orderBy: { fecha_inicio: 'asc' },
         include: {
-          // El edificio (vía ascensor) es lo que el calendario muestra como
-          // ubicación del evento: "Módulo - Edificio NOMBRE".
-          servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } }, tipo_servicio: true, asignaciones: { where: { estado: 1 } } } },
-          // Día del servicio (servicios multidía): orden + evidencias para que la
-          // agenda muestre "Día k/N" y marque el día como completado/pendiente.
-          dia: { select: { id: true, orden: true, evidencias: { where: { estado: 1 }, select: { id: true } } } },
-          emergencia: { include: { cliente: { select: { id: true, nombre: true } }, ascensor: { include: { edificio: true } } } },
+          servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } }, tipo_servicio: true, asignaciones: { where: { estado: 1 } } } },
+          emergencia: { include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } },
           mantenimiento_plan: {
             include: {
-              cliente: {
-                select: {
-                  id: true, nombre: true,
-                  precios: { where: { estado: 1 }, select: { id_tipo_servicio: true, precio: true, moneda: true } }
-                }
-              },
-              ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
+              cliente: { select: { id: true, nombre: true } },
+              ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } },
               tipo_servicio: true
             }
           }
@@ -69,6 +57,11 @@ const listar = async (req, res) => {
           estado_recordatorio: 'pendiente',
           tipo: { in: tiposPermitidos }
         };
+        // Los recordatorios manuales son privados: en el calendario cada usuario
+        // solo ve los manuales que él creó (el resto de tipos se comparte).
+        if (tiposPermitidos.includes('manual')) {
+          whereRec.OR = [{ tipo: { not: 'manual' } }, { user_id_registration: req.user.id }];
+        }
         if (desde || hasta) {
           whereRec.fecha_recordatorio = {};
           if (desde) whereRec.fecha_recordatorio.gte = parseYMDLima(desde);
@@ -77,9 +70,9 @@ const listar = async (req, res) => {
         const recsRaw = await prisma.tbl_recordatorios.findMany({
           where: whereRec,
           include: {
-            servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } }, asignaciones: { where: { estado: 1 } } } },
-            mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } } } },
-            emergencia: { include: { cliente: true, ascensor: true } },
+            servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } }, asignaciones: { where: { estado: 1 } } } },
+            mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } } } },
+            emergencia: { include: { cliente: true, ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } },
             cobro: { include: { cliente: true, servicio: true } }
           }
         });
@@ -145,13 +138,8 @@ const listar = async (req, res) => {
     const eventosNormalizados = eventos.map(e => {
       const esProyecto = e.servicio?.tipo_registro === 'proyecto';
       const tipoFinal = esProyecto ? 'proyecto' : e.tipo_evento;
-      // Día del servicio: forma limpia para la agenda (orden, total, completado).
-      const dia = e.dia
-        ? { id: e.dia.id, orden: e.dia.orden, total: e.servicio?.duracion_dias || 1, completado: e.dia.evidencias.length > 0 }
-        : null;
       return {
         ...e,
-        dia,
         tipo_evento: tipoFinal,
         color: colorPorTipo(tipoFinal),
         es_recordatorio: false

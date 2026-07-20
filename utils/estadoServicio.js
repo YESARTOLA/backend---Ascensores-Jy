@@ -6,6 +6,7 @@ const { sincronizarRecordatorioServicio } = require('./recordatoriosAuto');
 // estos textos debe pasar por aquí.
 const ESTADO_SERVICIO_FINALIZADO_TECNICO = 'Finalizado por técnico';
 const ESTADO_SERVICIO_FINALIZADO_OBSERVADO = 'Finalizado observado';
+const ESTADO_SERVICIO_CANCELADO = 'Cancelado';
 
 /**
  * Catálogo único de `tbl_servicios_realizados.estado_administrativo` — la etapa
@@ -221,6 +222,7 @@ module.exports = {
   esAtencionRapidaConvertida,
   ESTADO_SERVICIO_FINALIZADO_TECNICO,
   ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
+  ESTADO_SERVICIO_CANCELADO,
   ESTADOS_SERVICIO,
   ESTADOS_SERVICIO_EDITABLES,
   ESTADOS_SERVICIO_EN_GESTION,

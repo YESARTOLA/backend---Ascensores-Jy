@@ -20,6 +20,7 @@
  */
 
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 const { keyDesdeRuta, eliminarObjeto } = require('./storage');
 
 const ESTADOS_EN_CAMPO = ['En camino', 'En curso'];
@@ -104,6 +105,14 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   }
 
   // --- Hijos directos del servicio ---
+  // Ascensores vinculados: se capturan ANTES de dar de baja la fila puente para
+  // poder detectar, al final, los que quedaron "Por instalar" y sin otro proyecto
+  // que los instale (ver marcado 'Instalación cancelada' más abajo).
+  const idsAscensoresVinculados = (
+    await tx.tbl_servicios_ascensores.findMany({
+      where: { id_servicio: idServicio, estado: 1 }, select: { id_ascensor: true }
+    })
+  ).map(b => b.id_ascensor).filter(Boolean);
   await tx.tbl_servicios_ascensores.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_asignaciones.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
@@ -139,7 +148,7 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   // --- Calendario y recordatorios ---
   await tx.tbl_calendario_eventos.updateMany({
     where: { id_servicio: idServicio, estado: 1 },
-    data: { estado: 0, estado_evento: 'cancelado', ...stamp }
+    data: { estado: 0, estado_evento: ESTADO_EVENTO_CANCELADO, ...stamp }
   });
   await tx.tbl_recordatorios.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
@@ -151,6 +160,36 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
 
   // --- El servicio en sí ---
   await tx.tbl_servicios_proyectos.updateMany({ where: { id: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+
+  // --- Ascensores "Por instalar" que quedan huérfanos ---
+  // Un ascensor nuevo creado al aprobar una cotización nace 'Por instalar'. Si se
+  // cancela/elimina el proyecto que lo iba a instalar y NINGÚN otro proyecto activo
+  // lo referencia, se marca 'Instalación cancelada' (se mantiene visible, estado=1)
+  // para que quede claro que su instalación no se concretó. Guardas:
+  //   - solo si sigue 'Por instalar' (nunca se instaló) y activo (estado=1);
+  //   - solo si no queda otro servicio/proyecto activo que lo use.
+  // Un ascensor ya operativo o pre-existente nunca se toca.
+  for (const idAsc of idsAscensoresVinculados) {
+    const asc = await tx.tbl_ascensores.findUnique({ where: { id: idAsc } });
+    if (!asc || asc.estado !== 1 || asc.estado_operativo !== 'Por instalar') continue;
+    const otrosProyectosActivos = await tx.tbl_servicios_ascensores.count({
+      where: { id_ascensor: idAsc, estado: 1, id_servicio: { not: idServicio } }
+    });
+    if (otrosProyectosActivos > 0) continue;
+    await tx.tbl_ascensores.update({
+      where: { id: idAsc },
+      data: { estado_operativo: 'Instalación cancelada', ...stamp }
+    });
+    await tx.tbl_ascensores_historial.create({
+      data: {
+        id_ascensor: idAsc,
+        id_servicio: idServicio,
+        tipo_evento: 'instalacion_cancelada',
+        descripcion: `Instalación cancelada: se anuló el proyecto ${servicio.codigo} que instalaría este ascensor`,
+        creado_por: userId
+      }
+    });
+  }
 
   return { wasabiKeys, tecnicoIds };
 }

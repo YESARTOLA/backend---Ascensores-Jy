@@ -6,6 +6,7 @@ const {
 } = require('../utils/estadoFactura');
 const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 const { whereElegibleContable } = require('../utils/elegibilidadContable');
+const { ESTADO_PLAN_ACTIVO } = require('../utils/estadoPlanMantenimiento');
 
 const resumen = async (req, res) => {
   try {
@@ -39,7 +40,7 @@ const resumen = async (req, res) => {
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, ...ESTADOS_FINALIZADO } }),
       prisma.tbl_emergencias.count({ where: { estado_emergencia: { in: ['Reportada', 'En atención'] }, estado: 1 } }),
       prisma.tbl_tecnicos.count({ where: { estado_operativo: 'Disponible', estado: 1 } }),
-      prisma.tbl_mantenimientos_planes.count({ where: { estado_plan: 'activo', estado: 1 } }),
+      prisma.tbl_mantenimientos_planes.count({ where: { estado_plan: ESTADO_PLAN_ACTIVO, estado: 1 } }),
       prisma.tbl_leads.count({ where: { date_time_registration: { gte: inicioMes, lte: finMes }, estado: 1 } }),
       prisma.tbl_cobros.count({ where: { fecha_proximo_abono: { lt: hoy }, saldo_pendiente: { gt: 0 }, estado: 1 } }),
       prisma.tbl_cobros.count({ where: { fecha_proximo_abono: { lt: hoy }, saldo_pendiente: { gt: 0 }, estado: 1 } }),
@@ -107,7 +108,8 @@ const resumen = async (req, res) => {
           _sum: { monto: true },
           where: { fecha_pago: { gte: inicioMes, lte: finMes }, estado: 1 }
         }),
-        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: ESTADO_FACTURACION_SIN, estado: 1, ...whereElegibleContable() } }),
+        // "Sin facturar" = pendientes por facturar: excluye los marcados "Sin factura" (requiere_factura = 0).
+        prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: ESTADO_FACTURACION_SIN, estado: 1, ...whereElegibleContable(), AND: [{ servicio: { is: { requiere_factura: 1 } } }] } }),
         prisma.tbl_servicios_realizados.count({ where: { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA }, estado: 1, ...whereElegibleContable() } })
       ]);
       data.totalAbonadoMes = Number(totalAbonadoMes._sum.monto || 0);

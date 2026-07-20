@@ -48,7 +48,7 @@ const COLORES = {
 const ESTADOS_TERMINALES_SERVICIO = ['Cerrado', 'Cancelado', 'Cobrado total', 'Facturado'];
 const ESTADOS_TERMINALES_EMERGENCIA = ['Atendida', 'Cerrada'];
 const ESTADOS_TERMINALES_COBRO = ['Pagado', 'Cerrado', 'Incobrable'];
-const ESTADOS_TERMINALES_PLAN = ['inactivo', 'cancelado'];
+const { ESTADOS_PLAN_TERMINALES } = require('./estadoPlanMantenimiento');
 
 async function upsertAuto({ filtro, datos }) {
   const existente = await prisma.tbl_recordatorios.findFirst({ where: { ...filtro, origen: 'auto' } });
@@ -125,7 +125,7 @@ async function sincronizarRecordatorioMantenimientoPlan(planId) {
       ascensores: { where: { estado: 1 }, include: { ascensor: { select: { codigo: true } } } }
     }
   });
-  if (!p || p.estado !== 1 || ESTADOS_TERMINALES_PLAN.includes(p.estado_plan)) {
+  if (!p || p.estado !== 1 || ESTADOS_PLAN_TERMINALES.includes(p.estado_plan)) {
     return descartarAuto({ tipo: 'mantenimiento', id_mantenimiento_plan: planId });
   }
   const fechaRecordatorio = combinarFechaHoraLima(p.fecha_inicio, p.hora_programada);

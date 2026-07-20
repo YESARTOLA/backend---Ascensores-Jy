@@ -1,11 +1,16 @@
 /**
  * SSoT de VISIBILIDAD por estado de EDIFICIO.
  *
- * Cuando un edificio se inactiva (tbl_edificios.estado = 0), sus servicios,
+ * Cuando un edificio se elimina (tbl_edificios.estado = 0), sus servicios,
  * proyectos y registros operativos (emergencias, correctivos, mantenimientos,
  * atención rápida) deben dejar de verse para TODOS los roles excepto el
- * Super Admin, que sigue viendo absolutamente todo. La inactivación solo oculta:
- * no borra ni desactiva los registros relacionados.
+ * Super Admin, que sigue viendo absolutamente todo.
+ *
+ * Ojo: este módulo NO da de baja nada, solo OCULTA. La baja en cascada la
+ * ejecuta utils/bajaEdificioCascada.js. Ambos son necesarios y complementarios:
+ * la cascada no puede arrastrar los servicios que además cubren ascensores de
+ * otro edificio, y esta capa se encarga de que esos no se filtren en las
+ * pantallas de un edificio ya eliminado.
  *
  * Regla de ocultamiento (para roles distintos de super_admin):
  *   Un registro se oculta SOLO si tiene ascensores asociados Y ninguno de ellos

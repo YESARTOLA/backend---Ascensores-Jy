@@ -206,6 +206,11 @@ const crear = async (req, res) => {
     if (!elegibilidad.habilitado) {
       return res.status(400).json({ error: elegibilidad.motivo || 'El servicio no está habilitado para facturación' });
     }
+    // Bandera persistida "requiere factura": si el servicio está marcado como
+    // "Sin factura" (requiere_factura = 0), no admite emisión de comprobante.
+    if (servicio.requiere_factura === 0) {
+      return res.status(400).json({ error: 'El servicio está marcado como "Sin factura"; no admite emisión de comprobantes.' });
+    }
 
     // Modo: general (id_cuota null) vs por-cuota (id_cuota set).
     // Mutuamente excluyentes a nivel servicio.

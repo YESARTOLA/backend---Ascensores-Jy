@@ -92,6 +92,7 @@ model tbl_usuarios {
   leads_registrados      tbl_leads[]   @relation("LeadRegistrador")
   leads_como_vendedor    tbl_leads[]   @relation("LeadVendedor")
   leads_cotizaciones_subidas tbl_leads_cotizaciones[] @relation("LeadCotizacionRegistrador")
+  atenciones_responsable tbl_atenciones_rapidas[] @relation("AtencionResponsable")
 }
 
 // ---------------------------------------------------------------------
@@ -116,9 +117,16 @@ model tbl_clientes {
   contacto_admin_correo         String?                     @db.VarChar(150)
   contacto_admin_telefono       String?                     @db.VarChar(30)
   observaciones                 String?
-  contrato_inicio               DateTime?                   @db.Date
-  contrato_fin                  DateTime?                   @db.Date
-  id_archivo_contrato           Int?
+  // Contrato de servicio por ÁREA: cada área (Servicios / Proyectos) tiene sus
+  // propias fechas de vigencia y su propio documento de contrato. Al crear/editar
+  // debe llenarse al menos un área. Los datos previos (área única) se migraron al
+  // área de Servicios.
+  contrato_servicio_inicio      DateTime?                   @db.Date
+  contrato_servicio_fin         DateTime?                   @db.Date
+  id_archivo_contrato_servicio  Int?
+  contrato_proyecto_inicio      DateTime?                   @db.Date
+  contrato_proyecto_fin         DateTime?                   @db.Date
+  id_archivo_contrato_proyecto  Int?
   clasificacion                 String?                     @db.VarChar(20)
   estado                        Int                         @default(1)
   user_id_registration          Int?
@@ -137,8 +145,8 @@ model tbl_clientes {
   correctivos                   tbl_correctivos[]
   cotizaciones                  tbl_cotizaciones[]
   archivos                      tbl_clientes_archivos[]
-  precios                       tbl_clientes_precios[]
-  archivo_contrato              tbl_archivos?               @relation("ClienteContrato", fields: [id_archivo_contrato], references: [id])
+  archivo_contrato_servicio     tbl_archivos?               @relation("ClienteContratoServicio", fields: [id_archivo_contrato_servicio], references: [id])
+  archivo_contrato_proyecto     tbl_archivos?               @relation("ClienteContratoProyecto", fields: [id_archivo_contrato_proyecto], references: [id])
 }
 
 // Edificio u obra de un cliente: la ubicación física que agrupa ascensores.
@@ -163,12 +171,13 @@ model tbl_edificios {
   ascensores             tbl_ascensores[]
 }
 
-// Precio configurado por (cliente, tipo de servicio). Se usa como default
-// editable al materializar un mantenimiento del calendario. Permite que el
-// mismo cliente tenga distintos costos según el tipo de servicio.
-model tbl_clientes_precios {
+// Precio configurado por (ascensor, tipo de servicio). Se usa como default al
+// crear un plan de mantenimiento o un servicio: el mismo servicio puede costar
+// distinto según el ascensor. El ascensor ya conoce su edificio y su cliente, así
+// que este catálogo reemplaza al antiguo precio a nivel de cliente.
+model tbl_ascensores_precios {
   id                     Int                @id @default(autoincrement())
-  id_cliente             Int
+  id_ascensor            Int
   id_tipo_servicio       Int
   precio                 Decimal            @db.Decimal(12, 2)
   moneda                 String             @default("PEN") @db.VarChar(10)
@@ -177,21 +186,27 @@ model tbl_clientes_precios {
   date_time_registration DateTime?          @default(now()) @db.Timestamptz(6)
   user_id_modification   Int?
   date_time_modification DateTime?          @db.Timestamptz(6)
-  cliente                tbl_clientes       @relation(fields: [id_cliente], references: [id], onDelete: Cascade)
+  ascensor               tbl_ascensores     @relation(fields: [id_ascensor], references: [id], onDelete: Cascade)
   tipo_servicio          tbl_tipos_servicio @relation(fields: [id_tipo_servicio], references: [id])
 
-  @@unique([id_cliente, id_tipo_servicio])
-  @@index([id_cliente])
+  @@unique([id_ascensor, id_tipo_servicio])
+  @@index([id_ascensor])
 }
 
-// Adjuntos libres de un cliente (PDFs, imágenes, documentos varios). El contrato
-// firmado se sigue almacenando en tbl_clientes.id_archivo_contrato porque tiene
-// semántica especial (filtros por vencimiento); esta tabla cubre los anexos N
-// que el usuario quiera mantener: planos, actas, fichas técnicas, etc.
+
+// Adjuntos libres de un cliente (PDFs, imágenes, documentos varios), clasificados
+// por área (columna `area`). El contrato firmado se almacena aparte, por área, en
+// tbl_clientes.id_archivo_contrato_servicio / _proyecto (tiene semántica especial:
+// filtros por vencimiento); esta tabla cubre los anexos N que el usuario quiera
+// mantener: planos, actas, fichas técnicas, etc.
 model tbl_clientes_archivos {
   id                     Int           @id @default(autoincrement())
   id_cliente             Int
   id_archivo             Int
+  // Área a la que pertenece el documento: 'servicio' | 'proyecto'. Clasifica los
+  // adjuntos por área para que una no vea los de la otra (mapea al ámbito del
+  // usuario, tbl_usuarios.acceso_servicios / acceso_proyectos).
+  area                   String        @default("servicio") @db.VarChar(20)
   descripcion            String?       @db.VarChar(200)
   orden                  Int           @default(0)
   estado                 Int           @default(1)
@@ -234,6 +249,7 @@ model tbl_ascensores {
   emergencias            tbl_emergencias[]
   mantenimientos_planes_ascensores tbl_mantenimientos_planes_ascensores[]
   historial              tbl_ascensores_historial[]
+  precios                tbl_ascensores_precios[]
   atenciones_rapidas     tbl_atenciones_rapidas[]
   correctivos            tbl_correctivos[]
   cotizaciones_ascensores tbl_cotizaciones_ascensores[]
@@ -334,7 +350,7 @@ model tbl_tipos_servicio {
   leads                  tbl_leads[]
   cotizaciones           tbl_cotizaciones[]            @relation("CotizacionPadre")
   cotizaciones_subtipo   tbl_cotizaciones[]            @relation("CotizacionSubtipo")
-  precios_clientes       tbl_clientes_precios[]
+  precios_ascensores     tbl_ascensores_precios[]
 
   @@index([id_padre])
   @@index([categoria_funcional])
@@ -382,6 +398,10 @@ model tbl_servicios_proyectos {
   moneda                    String                            @default("PEN") @db.VarChar(10)
   sin_cobro                 Int                               @default(0)
   es_mantenimiento_gratuito Int                               @default(0)
+  // 1 = el servicio se facturará; 0 = "Sin factura" (excluido de pendientes por
+  // facturar y no admite emisión de comprobante). Default por módulo al crear:
+  // correctivo → 1, emergencia → 0. Editable desde el formulario de creación.
+  requiere_factura          Int                               @default(1)
   observaciones             String?
   estado                    Int                               @default(1)
   user_id_registration      Int?
@@ -727,6 +747,36 @@ model tbl_emergencias {
   ascensor               tbl_ascensores           @relation(fields: [id_ascensor], references: [id])
   eventos_calendario     tbl_calendario_eventos[]
   recordatorios          tbl_recordatorios[]
+  archivos               tbl_emergencias_archivos[]
+}
+
+// Adjuntos de contexto de una emergencia (fotos / videos de la falla) que carga
+// quien la reporta —coordinación / administración— para que el TÉCNICO asignado
+// los revise antes de salir a campo.
+//
+// No confundir con tbl_servicios_evidencias: aquella es la evidencia probatoria
+// que sube el técnico DESPUÉS de intervenir (exige id_tecnico y captura GPS).
+// Esta va en el sentido contrario: material previo, cargado por quien reporta.
+//
+// El acoplamiento con el dominio es únicamente `id_emergencia`; toda la lógica
+// vive en utils/adjuntosEmergencia.js, de modo que extender esto al resto de
+// módulos (correctivos, mantenimientos…) sea repuntar la FK al servicio y no
+// reescribir el comportamiento.
+model tbl_emergencias_archivos {
+  id                     Int             @id @default(autoincrement())
+  id_emergencia          Int
+  id_archivo             Int
+  descripcion            String?         @db.VarChar(200)
+  orden                  Int             @default(0)
+  estado                 Int             @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?       @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?       @db.Timestamptz(6)
+  emergencia             tbl_emergencias @relation(fields: [id_emergencia], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos    @relation(fields: [id_archivo], references: [id])
+
+  @@index([id_emergencia])
 }
 
 // ---------------------------------------------------------------------
@@ -768,7 +818,11 @@ model tbl_atenciones_rapidas {
   telefono               String          @db.VarChar(30)
   mensaje_rapido         String?
   tipo_solicitud         String?         @db.VarChar(100)
+  // Responsable de la atención: debe ser un USUARIO del sistema (no texto libre).
+  // Se conserva `responsable` (texto) para registros antiguos; los nuevos usan
+  // id_responsable_usuario.
   responsable            String?         @db.VarChar(150)
+  id_responsable_usuario Int?
   nivel_urgencia         String          @default("media") @db.VarChar(20)
   estado_atencion        String          @default("nueva") @db.VarChar(30)
   id_cliente             Int?
@@ -783,6 +837,7 @@ model tbl_atenciones_rapidas {
   date_time_modification DateTime?       @db.Timestamptz(6)
   cliente                tbl_clientes?   @relation(fields: [id_cliente], references: [id])
   ascensor               tbl_ascensores? @relation(fields: [id_ascensor], references: [id])
+  responsable_usuario    tbl_usuarios?   @relation("AtencionResponsable", fields: [id_responsable_usuario], references: [id])
 }
 
 // ---------------------------------------------------------------------
@@ -1025,12 +1080,14 @@ model tbl_archivos {
   cotizaciones_respaldo   tbl_cotizaciones_versiones[] @relation("CotizacionVersionRespaldo")
   cotizaciones_archivos   tbl_cotizaciones_archivos[]
   servicios_realizados_ot tbl_servicios_realizados[]   @relation("ServicioRealizadoOt")
-  contratos_clientes      tbl_clientes[]               @relation("ClienteContrato")
+  contratos_clientes_servicio tbl_clientes[]           @relation("ClienteContratoServicio")
+  contratos_clientes_proyecto tbl_clientes[]           @relation("ClienteContratoProyecto")
   clientes_archivos       tbl_clientes_archivos[]
   servicios_observaciones tbl_servicios_observaciones[]
   finalizacion_informes   tbl_servicios_finalizacion_checklist[]
   leads_cotizaciones      tbl_leads_cotizaciones[]
-  cotizaciones_items      tbl_cotizaciones_items[]     @relation("ItemCotizacionArchivo")
+  cotizaciones_items      tbl_cotizaciones_items[]
+  emergencias_archivos    tbl_emergencias_archivos[]
 }
 
 // ---------------------------------------------------------------------
@@ -1259,7 +1316,9 @@ model tbl_cotizaciones_items {
   precio_unitario        Decimal                    @default(0) @db.Decimal(12, 2)
   descuento_porcentaje   Decimal                    @default(0) @db.Decimal(5, 2)
   importe                Decimal                    @default(0) @db.Decimal(12, 2)
-  // Foto opcional del ítem (p. ej. la copiada desde la observación de origen).
+  // Foto del ítem. Obligatoria en cotizaciones del módulo 'correctivo'; opcional
+  // en el resto. Se muestra luego en la página del servicio generado.
+  // (También puede provenir de la observación de origen que generó la cotización.)
   id_archivo             Int?
   estado                 Int                        @default(1)
   user_id_registration   Int?
@@ -1267,7 +1326,7 @@ model tbl_cotizaciones_items {
   user_id_modification   Int?
   date_time_modification DateTime?                  @db.Timestamptz(6)
   version                tbl_cotizaciones_versiones @relation(fields: [id_version], references: [id], onDelete: Cascade)
-  archivo                tbl_archivos?              @relation("ItemCotizacionArchivo", fields: [id_archivo], references: [id])
+  archivo                tbl_archivos?              @relation(fields: [id_archivo], references: [id])
 }
 
 // Tabla puente cotización ↔ ascensores. Cada cotización puede referir uno o más

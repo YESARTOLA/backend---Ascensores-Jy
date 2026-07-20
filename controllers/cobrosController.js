@@ -466,7 +466,7 @@ const registrarPago = async (req, res) => {
       where: { id }, include: {
         pagos: { where: { estado: 1 } },
         cuotas: { where: { estado: 1 } },
-        servicio: { include: { servicio_realizado: true } }
+        servicio: { include: { servicio_realizado: true, tipo_servicio: true } }
       }
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
@@ -480,6 +480,19 @@ const registrarPago = async (req, res) => {
       const elegibilidad = elegibilidadContable({ servicio: cobro.servicio, servicioRealizado: cobro.servicio?.servicio_realizado });
       if (!elegibilidad.habilitado) {
         return res.status(400).json({ error: elegibilidad.motivo || 'El servicio no está habilitado para cobro' });
+      }
+    }
+
+    // Un correctivo marcado "Con factura" (requiere_factura=1) no admite abonos
+    // hasta que exista una factura del servicio (primero facturar, luego cobrar).
+    // "Correctivo" se detecta por el módulo del tipo de servicio (cubre también
+    // los correctivos originados en una cotización, cuyo origen es 'cotizacion').
+    const esCorrectivoCobro = cobro.servicio?.tipo_servicio?.modulo_asociado === 'correctivo'
+      || cobro.servicio?.origen === 'correctivo';
+    if (esCorrectivoCobro && cobro.servicio?.requiere_factura === 1) {
+      const facturaExistente = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
+      if (!facturaExistente) {
+        return res.status(400).json({ error: 'Este correctivo requiere factura: agregue una factura al cobro antes de registrar abonos.' });
       }
     }
 

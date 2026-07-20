@@ -2,18 +2,10 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { TIPOS_EDIFICIO, normalizarTipoEdificio } = require('../utils/catalogosEdificios');
 const { TIPO_REGISTRO } = require('../utils/clasificacionServicio');
+const { bajaEdificioCascadaEnTx, calcularImpactoEdificio } = require('../utils/bajaEdificioCascada');
+const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { whereEstadoDesdeFiltro } = require('../utils/filtroEstadoRegistro');
 const { veTodoPorEdificio } = require('../utils/visibilidadEdificio');
-const { edificioAlcanceWhere, tiposEdificioPermitidos, conAlcance } = require('../utils/alcanceUsuario');
-
-// Filtro de estado para la lista de edificios. Solo el Super Admin puede ver los
-// inactivos; el resto de roles siempre se limita a los activos (estado=1).
-//   activos (default) | inactivos | todos
-const filtroEstadoEdificio = (user, estado) => {
-  if (!veTodoPorEdificio(user)) return { estado: 1 };
-  if (estado === 'inactivos') return { estado: 0 };
-  if (estado === 'todos') return {};
-  return { estado: 1 };
-};
 
 const trimOrNull = (v) => {
   if (v === undefined || v === null) return null;
@@ -66,14 +58,15 @@ const listarDistritos = async (_req, res) => {
 const listar = async (req, res) => {
   try {
     const { id_cliente, q, estado } = req.query;
-    const where = { ...filtroEstadoEdificio(req.user, estado) };
+    // El filtro por estado es exclusivo del Super Admin (es el único que ve los
+    // edificios eliminados, para poder reactivarlos). Para el resto de roles se
+    // ignora y siempre se devuelven los activos.
+    const where = whereEstadoDesdeFiltro(veTodoPorEdificio(req.user) ? estado : undefined);
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (q) where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
       { distrito: { contains: q, mode: 'insensitive' } }
     ];
-    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
-    conAlcance(where, edificioAlcanceWhere(req.user));
     const filas = await prisma.tbl_edificios.findMany({
       where,
       orderBy: { id: 'desc' },
@@ -126,15 +119,6 @@ const obtener = async (req, res) => {
       }
     });
     if (!edificio) return res.status(404).json({ error: 'Edificio no encontrado' });
-    // Un edificio inactivo solo es accesible por el Super Admin (ni siquiera por URL).
-    if (edificio.estado !== 1 && !veTodoPorEdificio(req.user)) {
-      return res.status(404).json({ error: 'Edificio no encontrado' });
-    }
-    // Alcance por tipo: un Administrador acotado no accede al tipo no permitido ni por URL.
-    const tiposEdif = tiposEdificioPermitidos(req.user);
-    if (tiposEdif && !tiposEdif.includes(edificio.tipo)) {
-      return res.status(404).json({ error: 'Edificio no encontrado' });
-    }
     res.json({ data: edificio });
   } catch (err) {
     console.error('[edificios.obtener]', err);
@@ -229,14 +213,39 @@ const actualizar = async (req, res) => {
   }
 };
 
-// Inactiva (estado=0) o reactiva (estado=1) un edificio. Exclusivo del Super
-// Admin (ver rutas). Modelo "ocultar, no borrar": inactivar solo cambia el
-// estado del edificio; sus ascensores, servicios y proyectos quedan intactos y
-// simplemente dejan de verse para los demás roles (utils/visibilidadEdificio).
 const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const estado = Number(req.body.estado) === 1 ? 1 : 0;
+    const estado = Number(req.body.estado);
+    // Baja/alta lógica: el registro nunca se borra, solo alterna `estado`.
+    if (estado !== 0 && estado !== 1) {
+      return res.status(400).json({ error: 'Estado inválido: use 0 (desactivar) o 1 (reactivar)' });
+    }
+    const previo = await prisma.tbl_edificios.findUnique({ where: { id }, select: { id: true } });
+    if (!previo) return res.status(404).json({ error: 'Edificio no encontrado' });
+
+    // Eliminar (baja lógica) arrastra en cascada ascensores, planes, servicios
+    // pendientes, emergencias, correctivos y atenciones rápidas abiertas,
+    // conservando todo el historial ejecutado o cobrado. La regla completa vive
+    // en utils/bajaEdificioCascada.js. Todo en una transacción.
+    if (estado === 0) {
+      const { wasabiKeys, tecnicoIds, resumen } = await prisma.$transaction(
+        tx => bajaEdificioCascadaEnTx(tx, id, req.user.id, req.ip),
+        { timeout: 30000 }
+      );
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_edificios', id_entidad: id,
+        accion: 'DELETE', valor_nuevo: { estado, impacto: resumen }, ip: req.ip
+      });
+      await purgarObjetosWasabi(wasabiKeys);
+      await liberarTecnicos(tecnicoIds, -1);
+      const edificio = await prisma.tbl_edificios.findUnique({ where: { id } });
+      return res.json({ data: edificio, impacto: resumen });
+    }
+
+    // Reactivar solo reabre el edificio: sus ascensores, planes y servicios
+    // dados de baja no se resucitan automáticamente (se reactivan uno a uno si
+    // se requiere), porque al reabrirlo no hay garantía de su estado real.
     const edificio = await prisma.tbl_edificios.update({
       where: { id },
       data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
@@ -252,10 +261,8 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-// Inactiva o reactiva TODOS los edificios de un cliente en una sola operación.
-// Exclusivo del Super Admin (ver rutas). Pensado para cuando un cliente deja de
-// recibir servicios: oculta todos sus edificios (y lo relacionado) a los demás
-// roles. Registra auditoría por cada edificio afectado para mantener trazabilidad.
+// [MERGE] Cambio de estado (activar/inactivar) masivo de todos los edificios de
+// un cliente. Endpoint traído del repo remoto; usado desde la ficha del cliente.
 const cambiarEstadoPorCliente = async (req, res) => {
   try {
     const idCliente = Number(req.params.idCliente);
@@ -271,6 +278,31 @@ const cambiarEstadoPorCliente = async (req, res) => {
     if (aCambiar.length === 0) return res.json({ data: { afectados: 0 } });
 
     const ids = aCambiar.map(e => e.id);
+
+    // Eliminar en masa usa exactamente la misma cascada que eliminar uno a uno:
+    // este endpoint no puede ser una puerta trasera que deje ascensores,
+    // servicios o emergencias vivos colgando de un edificio eliminado.
+    if (estado === 0) {
+      const wasabiKeys = [];
+      const tecnicoIds = [];
+      const resumenes = new Map();
+      await prisma.$transaction(async (tx) => {
+        for (const id of ids) {
+          const r = await bajaEdificioCascadaEnTx(tx, id, req.user.id, req.ip);
+          wasabiKeys.push(...r.wasabiKeys);
+          tecnicoIds.push(...r.tecnicoIds);
+          resumenes.set(id, r.resumen);
+        }
+      }, { timeout: 60000 });
+      await Promise.all(ids.map(id => registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_edificios', id_entidad: id,
+        accion: 'DELETE', valor_nuevo: { estado, impacto: resumenes.get(id) }, ip: req.ip
+      })));
+      await purgarObjetosWasabi(wasabiKeys);
+      await liberarTecnicos(tecnicoIds, -1);
+      return res.json({ data: { afectados: ids.length } });
+    }
+
     await prisma.tbl_edificios.updateMany({
       where: { id: { in: ids } },
       data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
@@ -286,4 +318,33 @@ const cambiarEstadoPorCliente = async (req, res) => {
   }
 };
 
-module.exports = { listarTipos, listarDistritos, listar, obtener, crear, actualizar, cambiarEstado, cambiarEstadoPorCliente };
+// Vista previa del impacto de eliminar un edificio: alimenta el modal de doble
+// confirmación para que el usuario vea exactamente qué se da de baja y qué se
+// conserva ANTES de escribir la palabra clave. Solo lee, no muta nada, y usa la
+// misma selección que ejecuta la cascada.
+const impactoEliminacion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const edificio = await prisma.tbl_edificios.findUnique({
+      where: { id }, select: { id: true, nombre: true, estado: true }
+    });
+    if (!edificio) return res.status(404).json({ error: 'Edificio no encontrado' });
+    const impacto = await calcularImpactoEdificio(prisma, id);
+    res.json({ data: { edificio, ...impacto } });
+  } catch (err) {
+    console.error('[edificios.impactoEliminacion]', err);
+    res.status(500).json({ error: 'Error al calcular el impacto de la eliminación' });
+  }
+};
+
+module.exports = {
+  listarTipos,
+  listarDistritos,
+  listar,
+  obtener,
+  crear,
+  actualizar,
+  cambiarEstado,
+  cambiarEstadoPorCliente,
+  impactoEliminacion
+};

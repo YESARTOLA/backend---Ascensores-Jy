@@ -23,6 +23,7 @@
 
 const { parseYMDLima } = require('./tiempo');
 const { clasificarTipoServicio, MODULOS_VALIDOS } = require('./clasificacionServicio');
+const { ESTADO_PLAN_ACTIVO } = require('./estadoPlanMantenimiento');
 
 function nivelUrgencia(valor, defaultValor) {
   return ['alta', 'media', 'baja'].includes(valor) ? valor : defaultValor;
@@ -138,7 +139,7 @@ async function replicarEnModulo(tx, args) {
         cantidad_mantenimientos_gratuitos: cantidadGratuitos,
         fecha_inicio: fechaInicioPlan,
         hora_programada: horaProgramada,
-        estado_plan: 'activo',
+        estado_plan: ESTADO_PLAN_ACTIVO,
         observaciones: obs,
         user_id_registration: usuarioId,
         ascensores: { create: filasAsc }

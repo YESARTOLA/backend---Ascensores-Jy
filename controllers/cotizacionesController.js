@@ -8,37 +8,37 @@ const { calcularTotalesVersion, normalizarPlanCuotas } = require('../utils/cotiz
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
-const { clonarArchivo } = require('../utils/clonarArchivo');
-const { clasificarTipoServicio, TIPO_REGISTRO } = require('../utils/clasificacionServicio');
+const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
-const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
+const { bajaArchivoEnTx, purgarObjetosWasabi, bajaServicioCascadaEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { tiposRegistroPermitidos, cotizacionAlcanceWhere, puedeVerTipoRegistro, conAlcance } = require('../utils/alcanceUsuario');
 const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
-const { cotizacionAlcanceWhere, puedeVerTipoRegistro, conAlcance } = require('../utils/alcanceUsuario');
 
+// Categoría funcional (del tipo padre) que corresponde a cada ámbito. Se usa para
+// acotar las cotizaciones que ve un usuario de área (servicios / proyectos).
+function categoriasFuncionalesDeAmbito(user) {
+  const tipos = tiposRegistroPermitidos(user); // null = sin restricción
+  if (!tipos) return null;
+  return tipos.map(t => (t === 'proyecto' ? 'PROYECTOS' : 'SERVICIOS'));
+}
+
+// El listado y el acceso por id se filtran por ámbito (un usuario acotado a un
+// área solo ve/gestiona las cotizaciones de esa área).
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
 
-// Estado de cada versión de cotización. Reducido a 3 valores: el flujo es
-// crear (Cotizado) → decidir (Aprobado | Rechazado). No hay "Enviada" ni
-// "Expirada" — la fecha_validez sigue como referencia, pero no muta el estado.
-const ESTADOS_VERSION = {
-  COTIZADO: 'Cotizado',
-  APROBADO: 'Aprobado',
-  RECHAZADO: 'Rechazado'
-};
-
-// Estado global de la cotización — derivado del ciclo operativo del servicio
-// asociado. Se recalcula con `sincronizarEstadoGlobal` siempre que cambie el
-// servicio, su cobro o sus facturas. Nunca se setea manualmente.
-const ESTADO_GLOBAL = {
-  COTIZADO: 'Cotizado',
-  ACEPTADO: 'Aceptado',
-  EJECUCION: 'Ejecución',
-  PENDIENTE: 'Pendiente',
-  TERMINADO: 'Terminado'
-};
+// Catálogos de estado: viven en utils/estadoCotizacion.js para que el listado
+// (y su filtro) los consuman del backend en vez de repetirlos a mano.
+//   - estado_version: crear (Cotizado) → decidir (Aprobado | Rechazado).
+//   - estado_global: derivado del servicio asociado; nunca se setea a mano.
+const {
+  ESTADOS_VERSION,
+  ESTADO_GLOBAL,
+  ESTADOS_GLOBALES,
+  ESTADOS_VERSION_LISTA
+} = require('../utils/estadoCotizacion');
 
 function puedeVer(req) {
   return ROLES_VER.includes(req.user?.rol_codigo);
@@ -145,6 +145,8 @@ async function sincronizarEstadoGlobal(idCotizacion, tx = prisma) {
     select: { id: true, estado_global: true, estado: true }
   });
   if (!cot || cot.estado !== 1) return null;
+  // 'Anulado' es terminal: no se recalcula (la cotización fue eliminada).
+  if (cot.estado_global === ESTADO_GLOBAL.ANULADO) return cot.estado_global;
   const servicio = await tx.tbl_servicios_proyectos.findFirst({
     where: { id_cotizacion: Number(idCotizacion), estado: 1 },
     select: { id: true, estado_servicio: true }
@@ -173,141 +175,83 @@ async function cargarVersionActiva(idCotizacion) {
   return { cotizacion: cot, version: ver };
 }
 
-// Include compartido por listar() y exportar() para que ambos devuelvan los
-// mismos datos (cliente, ascensores/edificio, tipos, versión vigente, servicio
-// generado).
-const INCLUDE_LISTA = {
-  cliente: { select: { id: true, nombre: true, telefono: true } },
-  ascensores: {
-    where: { estado: 1 },
-    orderBy: { orden: 'asc' },
-    include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
-  },
-  tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
-  subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
-  versiones: {
-    where: { estado: 1 },
-    orderBy: { numero_version: 'desc' },
-    take: 1,
-    select: {
-      id: true, numero_version: true, estado_version: true,
-      monto_total: true, moneda: true, fecha_validez: true
-    }
-  },
-  servicios: {
-    where: { estado: 1 },
-    orderBy: { id: 'asc' },
-    select: { id: true, codigo: true, estado_servicio: true }
-  }
-};
-
-/**
- * Construye el `where` Prisma de tbl_cotizaciones a partir de los filtros de
- * querystring. Centralizado para que listar() y exportar() apliquen exactamente
- * los mismos criterios (q, estado_global, cliente, tipo, rango de fechas).
- */
-function construirWhereCotizaciones(query) {
-  const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = query;
-  const where = { estado: 1 };
-  if (q) where.OR = [
-    // Código de la cotización
-    { codigo: { contains: q, mode: 'insensitive' } },
-    // Nombre del cliente
-    { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
-    // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
-    // los ascensores existentes vinculados a la cotización
-    { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
-    // Nombre del edificio / obra donde están los ascensores de la cotización
-    { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
-    // Código de servicio generado por la cotización (cuando ya fue aprobada)
-    { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
-  ];
-  if (estado_global === 'Aprobadas') {
-    // Filtro agregado del frontend: todas las cotizaciones que el cliente
-    // aprobó alguna vez. No es un estado real — engloba todas las etapas con
-    // servicio en marcha, incluidas las ya facturadas/cobradas, que avanzaron
-    // más allá de 'Aceptado'.
-    where.estado_global = { in: [ESTADO_GLOBAL.ACEPTADO, ESTADO_GLOBAL.EJECUCION, ESTADO_GLOBAL.PENDIENTE, ESTADO_GLOBAL.TERMINADO] };
-  } else if (estado_global) {
-    where.estado_global = estado_global;
-  }
-  if (id_cliente) where.id_cliente = Number(id_cliente);
-  if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
-  if (desde || hasta) {
-    where.date_time_registration = {};
-    if (desde) where.date_time_registration.gte = parseYMDLima(desde);
-    if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
-  }
-  return where;
-}
-
-// Hidrata cada cotización con `creado_por` (usuario que la registró). La columna
-// user_id_registration no tiene relación FK en Prisma, así que se resuelve con
-// una consulta por lote. Muta y devuelve el mismo arreglo recibido.
-async function adjuntarCreador(cotizaciones) {
-  const mapa = await mapaUsuariosPorId(cotizaciones.map(c => c.user_id_registration));
-  for (const c of cotizaciones) {
-    c.creado_por = c.user_id_registration ? (mapa[c.user_id_registration] || null) : null;
-  }
-  return cotizaciones;
-}
-
 const listar = async (req, res) => {
   try {
     if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const where = construirWhereCotizaciones(req.query);
-    conAlcance(where, cotizacionAlcanceWhere(req.user));
+    const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta, incluir_anuladas } = req.query;
+    const mostrarAnuladas = incluir_anuladas === '1' || incluir_anuladas === 'true';
+
+    const and = [];
+    // Visibilidad: activas (estado=1) siempre; anuladas (estado=0 + 'Anulado')
+    // solo si se pide explícitamente. Otros estado=0 (legacy) nunca se muestran.
+    and.push(mostrarAnuladas
+      ? { OR: [{ estado: 1 }, { estado: 0, estado_global: ESTADO_GLOBAL.ANULADO }] }
+      : { estado: 1 });
+    if (q) and.push({ OR: [
+      // Código de la cotización
+      { codigo: { contains: q, mode: 'insensitive' } },
+      // Nombre del cliente
+      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
+      // los ascensores existentes vinculados a la cotización
+      { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+      // Nombre del edificio / obra donde están los ascensores de la cotización
+      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
+      // Código de servicio generado por la cotización (cuando ya fue aprobada)
+      { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
+    ] });
+    if (estado_global) and.push({ estado_global });
+    if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
+    if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
+    if (desde || hasta) {
+      const rango = {};
+      if (desde) rango.gte = parseYMDLima(desde);
+      if (hasta) rango.lte = parseYMDFinDiaLima(hasta);
+      and.push({ date_time_registration: rango });
+    }
+    // Ámbito: un usuario de área (servicios/proyectos) solo ve las cotizaciones
+    // cuyo tipo de servicio pertenece a su categoría funcional.
+    const catsAmbito = categoriasFuncionalesDeAmbito(req.user);
+    if (catsAmbito) and.push({ tipo_servicio: { categoria_funcional: { in: catsAmbito.length ? catsAmbito : ['__sin_ambito__'] } } });
+    const where = { AND: and };
+
     const result = await paginar(
       prisma.tbl_cotizaciones,
-      { where, orderBy: { id: 'desc' }, include: INCLUDE_LISTA },
+      {
+        where,
+        orderBy: { id: 'desc' },
+        include: {
+          cliente: { select: { id: true, nombre: true, telefono: true } },
+          ascensores: {
+            where: { estado: 1 },
+            orderBy: { orden: 'asc' },
+            include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
+          },
+          tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+          subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
+          versiones: {
+            where: { estado: 1 },
+            orderBy: { numero_version: 'desc' },
+            take: 1,
+            select: {
+              id: true, numero_version: true, estado_version: true,
+              monto_total: true, moneda: true, fecha_validez: true
+            }
+          },
+          servicios: {
+            where: { estado: 1 },
+            orderBy: { id: 'asc' },
+            select: { id: true, codigo: true, estado_servicio: true }
+          }
+        }
+      },
       req.query
     );
-    await adjuntarCreador(result.data);
+
     res.json(result);
   } catch (err) {
     console.error('[cotizaciones.listar]', err);
     res.status(500).json({ error: 'Error al listar cotizaciones' });
-  }
-};
-
-/**
- * Exporta el listado de cotizaciones en XLSX o PDF según ?formato=excel|pdf.
- * Reusa exactamente el mismo `where` que listar() (sin paginar).
- */
-const exportar = async (req, res) => {
-  try {
-    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const formato = String(req.query.formato || 'excel').toLowerCase();
-    if (!['excel', 'pdf'].includes(formato)) {
-      return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
-    }
-
-    const where = construirWhereCotizaciones(req.query);
-    conAlcance(where, cotizacionAlcanceWhere(req.user));
-    const cotizaciones = await prisma.tbl_cotizaciones.findMany({
-      where,
-      orderBy: { id: 'desc' },
-      include: INCLUDE_LISTA
-    });
-    await adjuntarCreador(cotizaciones);
-
-    const { generarExcelCotizaciones, generarPdfCotizaciones } = require('../utils/cotizacionesExport');
-    const stamp = ymdLima();
-
-    if (formato === 'excel') {
-      const buffer = await generarExcelCotizaciones(cotizaciones);
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.xlsx"`);
-      return res.end(buffer);
-    }
-
-    const buffer = await generarPdfCotizaciones(cotizaciones);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.pdf"`);
-    return res.end(buffer);
-  } catch (err) {
-    console.error('[cotizaciones.exportar]', err);
-    res.status(500).json({ error: 'Error al exportar cotizaciones: ' + err.message });
   }
 };
 
@@ -327,11 +271,7 @@ const obtener = async (req, res) => {
           where: { estado: 1 },
           orderBy: { numero_version: 'asc' },
           include: {
-            items: {
-              where: { estado: 1 },
-              orderBy: { orden: 'asc' },
-              include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } }
-            },
+            items: { where: { estado: 1 }, orderBy: { orden: 'asc' }, include: { archivo: true } },
             archivo_pdf: true,
             archivo_respaldo: true
           }
@@ -348,85 +288,16 @@ const obtener = async (req, res) => {
       }
     });
     if (!cotizacion) return res.status(404).json({ error: 'Cotización no encontrada' });
-
-    // Ámbito: si la cotización pertenece a un ámbito (Servicios/Proyectos) fuera
-    // del alcance del usuario, se oculta también por acceso directo vía URL.
-    const trCot = cotizacion.tipo_servicio?.categoria_funcional === 'PROYECTOS'
-      ? TIPO_REGISTRO.PROYECTO : TIPO_REGISTRO.SERVICIO;
-    if (!puedeVerTipoRegistro(req.user, trCot)) {
+    // Ámbito: un usuario de área no accede (ni por URL) a cotizaciones de la otra.
+    const catsAmbito = categoriasFuncionalesDeAmbito(req.user);
+    if (catsAmbito && !catsAmbito.includes(cotizacion.tipo_servicio?.categoria_funcional)) {
       return res.status(404).json({ error: 'Cotización no encontrada' });
-    }
-
-    // Hidrata los usuarios involucrados (creador de la cotización y, por cada
-    // versión, quién la creó / aprobó / rechazó) en una sola consulta. Estas
-    // columnas no tienen relación FK en Prisma, por eso se resuelven aparte.
-    const versiones = cotizacion.versiones || [];
-    const mapa = await mapaUsuariosPorId([
-      cotizacion.user_id_registration,
-      ...versiones.flatMap(v => [v.user_id_registration, v.aprobada_por, v.rechazada_por])
-    ]);
-    const usuario = (uid) => (uid ? (mapa[uid] || null) : null);
-    cotizacion.creado_por = usuario(cotizacion.user_id_registration);
-    for (const v of versiones) {
-      v.creado_por = usuario(v.user_id_registration);
-      v.aprobada_por_usuario = usuario(v.aprobada_por);
-      v.rechazada_por_usuario = usuario(v.rechazada_por);
     }
 
     res.json({ data: cotizacion });
   } catch (err) {
     console.error('[cotizaciones.obtener]', err);
     res.status(500).json({ error: 'Error al obtener cotización' });
-  }
-};
-
-// Línea de tiempo de la cotización: reúne los eventos auditados sobre la
-// cotización (CREATE/UPDATE/APPROVE/RE_APPROVE/REOPEN/DELETE) y sobre cada una
-// de sus versiones (NEW_VERSION/REJECT), resuelve el usuario y devuelve la
-// lista cronológica. La etiqueta legible de cada acción la pone el frontend.
-const historial = async (req, res) => {
-  try {
-    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const id = Number(req.params.id);
-    const cot = await prisma.tbl_cotizaciones.findUnique({
-      where: { id },
-      select: { id: true, versiones: { select: { id: true, numero_version: true } } }
-    });
-    if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
-
-    // numero_version por id de versión, para etiquetar los eventos de versión.
-    const numeroVersionPorId = Object.fromEntries(cot.versiones.map(v => [v.id, v.numero_version]));
-    const versionIds = cot.versiones.map(v => v.id);
-
-    const filtros = [{ entidad: 'tbl_cotizaciones', id_entidad: id }];
-    if (versionIds.length > 0) {
-      filtros.push({ entidad: 'tbl_cotizaciones_versiones', id_entidad: { in: versionIds } });
-    }
-    const eventos = await prisma.tbl_auditoria.findMany({
-      where: { OR: filtros },
-      orderBy: { fecha_evento: 'asc' }
-    });
-
-    const mapa = await mapaUsuariosPorId(eventos.map(e => e.id_usuario));
-    const data = eventos.map(e => ({
-      id: e.id,
-      accion: e.accion,
-      fecha_evento: e.fecha_evento,
-      ip: e.ip,
-      usuario: e.id_usuario ? (mapa[e.id_usuario] || null) : null,
-      // Número de versión afectada: directo si el evento es sobre una versión,
-      // o derivado del payload auditado (APPROVE/RE_APPROVE guardan `version`).
-      numero_version: e.entidad === 'tbl_cotizaciones_versiones'
-        ? (numeroVersionPorId[e.id_entidad] ?? null)
-        : (e.valor_nuevo?.version ?? e.valor_nuevo?.numero_version ?? null),
-      // Motivo asociado (rechazo / cambio / reapertura) cuando exista.
-      motivo: e.valor_nuevo?.motivo ?? e.valor_nuevo?.motivo_cambio ?? null
-    }));
-
-    res.json({ data });
-  } catch (err) {
-    console.error('[cotizaciones.historial]', err);
-    res.status(500).json({ error: 'Error al obtener historial de la cotización' });
   }
 };
 
@@ -444,6 +315,99 @@ async function normalizarCuentasPdf(payload) {
   const validos = new Set(activas.map(c => c.id));
   return ids.filter(id => validos.has(id));
 }
+
+/**
+ * Normaliza y valida un lote de ids de observación técnica que se quieren jalar
+ * a una cotización. Punto único de la verdad usado tanto por el prellenado
+ * (`desdeObservaciones`) como por `crear`, para que lo que se ofrece al admin y
+ * lo que se acepta al guardar no puedan divergir.
+ *
+ * Exige que todas: existan, estén activas, pertenezcan al MISMO servicio y no
+ * estén ya vinculadas a otra cotización.
+ *
+ * @param tx  cliente Prisma (o transacción) sobre el que consultar.
+ * @returns {{ error: string }} o {{ observaciones, servicio }}
+ */
+async function _resolverObservacionesCotizables(tx, idsCrudos) {
+  const ids = [...new Set(
+    (Array.isArray(idsCrudos) ? idsCrudos : String(idsCrudos || '').split(','))
+      .map(Number).filter(n => Number.isInteger(n) && n > 0)
+  )];
+  if (ids.length === 0) return { error: 'Debe indicar al menos una observación' };
+
+  const observaciones = await tx.tbl_servicios_observaciones.findMany({
+    where: { id: { in: ids }, estado: 1 },
+    include: {
+      archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } },
+      cotizacion: { select: { codigo: true } }
+    },
+    orderBy: { id: 'asc' }
+  });
+  if (observaciones.length !== ids.length) {
+    return { error: 'Una o más observaciones no existen o fueron eliminadas' };
+  }
+  const yaCotizada = observaciones.find(o => o.id_cotizacion);
+  if (yaCotizada) {
+    return { error: `La observación ya fue cotizada en ${yaCotizada.cotizacion?.codigo || 'otra cotización'}` };
+  }
+  const idsServicio = [...new Set(observaciones.map(o => o.id_servicio))];
+  if (idsServicio.length > 1) {
+    return { error: 'Las observaciones deben pertenecer al mismo servicio' };
+  }
+
+  const servicio = await tx.tbl_servicios_proyectos.findUnique({
+    where: { id: idsServicio[0] },
+    include: {
+      ascensores: {
+        where: { estado: 1 },
+        include: { ascensor: { select: { id: true, codigo: true, tipo: true } } }
+      }
+    }
+  });
+  if (!servicio || servicio.estado !== 1) return { error: 'El servicio de origen no existe o fue eliminado' };
+
+  return { observaciones, servicio };
+}
+
+/**
+ * Prellenado de una cotización a partir de observaciones técnicas.
+ *
+ * Devuelve lo que SÍ se puede deducir de las observaciones (cliente, un ítem por
+ * observación con su texto y su foto) más los ascensores del servicio origen.
+ * El subtipo de servicio y, si el servicio cubre varios ascensores, cuál se
+ * cotiza, los elige el administrador en el formulario: la observación no guarda
+ * esa información y adivinarla clasificaría mal la cotización.
+ *
+ * NO marca las observaciones: eso ocurre recién al guardar (ver `crear`), para
+ * que cancelar el formulario las deje libres.
+ */
+const desdeObservaciones = async (req, res) => {
+  try {
+    if (!puedeEditar(req)) return res.status(403).json({ error: 'No autorizado' });
+    const resultado = await _resolverObservacionesCotizables(prisma, req.query.ids);
+    if (resultado.error) return res.status(400).json({ error: resultado.error });
+    const { observaciones, servicio } = resultado;
+
+    res.json({
+      data: {
+        id_cliente: servicio.id_cliente,
+        id_servicio: servicio.id,
+        codigo_servicio: servicio.codigo,
+        ascensores: servicio.ascensores.map(sa => sa.ascensor).filter(Boolean),
+        items: observaciones.map((o, i) => ({
+          id_observacion: o.id,
+          orden: i + 1,
+          descripcion: o.texto,
+          id_archivo: o.id_archivo,
+          archivo: o.archivo
+        }))
+      }
+    });
+  } catch (err) {
+    console.error('[cotizaciones.desdeObservaciones]', err);
+    res.status(500).json({ error: 'Error al preparar la cotización: ' + err.message });
+  }
+};
 
 const crear = async (req, res) => {
   try {
@@ -465,14 +429,12 @@ const crear = async (req, res) => {
     if (d.id_tipo_servicio && Number(d.id_tipo_servicio) !== subtipoCot.id_padre) {
       return res.status(400).json({ error: 'El subtipo no pertenece al tipo de servicio padre seleccionado' });
     }
-    const idPadreCot = subtipoCot.id_padre;
-
-    // Ámbito: un usuario acotado no puede cotizar fuera de su ámbito (Servicios/Proyectos).
-    const trCotizacion = subtipoCot.padre?.categoria_funcional === 'PROYECTOS'
-      ? TIPO_REGISTRO.PROYECTO : TIPO_REGISTRO.SERVICIO;
-    if (!puedeVerTipoRegistro(req.user, trCotizacion)) {
-      return res.status(403).json({ error: 'No tiene acceso a ese ámbito (Servicios / Proyectos) según su configuración' });
+    // Ámbito: un usuario de área (servicios/proyectos) solo crea cotizaciones de su área.
+    const catsAmbitoCrear = categoriasFuncionalesDeAmbito(req.user);
+    if (catsAmbitoCrear && !catsAmbitoCrear.includes(subtipoCot.padre?.categoria_funcional)) {
+      return res.status(403).json({ error: 'No puede crear cotizaciones fuera de su área asignada.' });
     }
+    const idPadreCot = subtipoCot.id_padre;
 
     let ascensoresLimpios;
     try {
@@ -481,8 +443,21 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: e.message });
     }
 
+    // Los servicios operativos (correctivo, emergencia, mantenimiento, atención
+    // rápida) se cotizan para UN solo ascensor: cada uno es de un ascensor por
+    // naturaleza (el correctivo/emergencia enlaza un ascensor; el mantenimiento es
+    // un plan por ascensor). Solo los Proyectos (sin módulo) admiten multiascensor.
+    if (subtipoCot.modulo_asociado && ascensoresLimpios.length > 1) {
+      return res.status(400).json({ error: 'Un servicio (correctivo, emergencia o mantenimiento) se cotiza para un solo ascensor. Cree una cotización por cada ascensor.' });
+    }
+
     const items = Array.isArray(d.items) ? d.items : [];
     if (items.length === 0) return res.status(400).json({ error: 'Debe agregar al menos un item' });
+
+    // En cotizaciones del módulo correctivo, la foto de cada ítem es obligatoria.
+    if (subtipoCot.modulo_asociado === 'correctivo' && items.some(it => !it.id_archivo)) {
+      return res.status(400).json({ error: 'En una cotización de correctivo, cada ítem debe incluir una foto.' });
+    }
 
     if (d.id_lead) {
       const lead = await prisma.tbl_leads.findUnique({ where: { id: Number(d.id_lead) } });
@@ -522,28 +497,13 @@ const crear = async (req, res) => {
       }
     }
 
-    // Observaciones de origen (flujo "crear cotización desde observaciones de un
-    // servicio"). Cada ítem puede declarar `id_observacion_origen`. Validamos que
-    // existan, pertenezcan al mismo cliente y no estén ya cotizadas; la foto de la
-    // observación se clona por ítem dentro de la transacción.
-    const obsOrigenIds = [...new Set(items
-      .map(it => Number(it.id_observacion_origen))
-      .filter(n => Number.isInteger(n) && n > 0))];
-    const obsPorId = new Map();
-    if (obsOrigenIds.length > 0) {
-      const obs = await prisma.tbl_servicios_observaciones.findMany({
-        where: { id: { in: obsOrigenIds }, estado: 1 },
-        include: { servicio: { select: { id_cliente: true } } }
-      });
-      for (const o of obs) obsPorId.set(o.id, o);
-      for (const idObs of obsOrigenIds) {
-        const o = obsPorId.get(idObs);
-        if (!o) return res.status(400).json({ error: `La observación ${idObs} no existe` });
-        if (o.id_cotizacion) return res.status(400).json({ error: `La observación ${idObs} ya fue usada en otra cotización` });
-        if (o.servicio?.id_cliente !== Number(d.id_cliente)) {
-          return res.status(400).json({ error: `La observación ${idObs} pertenece a otro cliente` });
-        }
-      }
+    // Observaciones técnicas de origen (opcional). Se validan aquí para fallar
+    // con 400 antes de crear nada, y se REVALIDAN dentro de la transacción por
+    // si otro admin las cotizó entre el prellenado y este guardado.
+    const idsObservaciones = Array.isArray(d.ids_observaciones) ? d.ids_observaciones : [];
+    if (idsObservaciones.length > 0) {
+      const previa = await _resolverObservacionesCotizables(prisma, idsObservaciones);
+      if (previa.error) return res.status(400).json({ error: previa.error });
     }
 
     const codigo = await generarCodigoCotizacion();
@@ -596,18 +556,6 @@ const crear = async (req, res) => {
 
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
-        // Si el ítem viene de una observación con foto, clonamos esa foto (copia
-        // propia en Wasabi) para que el ítem conserve su imagen aunque luego se
-        // elimine la observación de origen.
-        let idArchivoItem = null;
-        const idObs = Number(it.id_observacion_origen);
-        if (Number.isInteger(idObs) && idObs > 0) {
-          const o = obsPorId.get(idObs);
-          if (o && o.id_archivo) {
-            const copia = await clonarArchivo(tx, o.id_archivo, { tipo: 'cotizaciones', usuarioId: req.user.id });
-            idArchivoItem = copia?.id || null;
-          }
-        }
         await tx.tbl_cotizaciones_items.create({
           data: {
             id_version: ver.id,
@@ -618,7 +566,7 @@ const crear = async (req, res) => {
             precio_unitario: it.precio_unitario || 0,
             descuento_porcentaje: it.descuento_porcentaje || 0,
             importe: require('../utils/cotizacionCalculos').calcularImporteLinea(it),
-            id_archivo: idArchivoItem,
+            id_archivo: it.id_archivo ? Number(it.id_archivo) : null,
             user_id_registration: req.user.id
           }
         });
@@ -635,13 +583,18 @@ const crear = async (req, res) => {
         });
       }
 
-      // Marcar las observaciones de origen como ya cotizadas (trazabilidad +
-      // evita que se vuelvan a jalar a otra cotización).
-      if (obsOrigenIds.length > 0) {
-        await tx.tbl_servicios_observaciones.updateMany({
-          where: { id: { in: obsOrigenIds } },
+      // Vincular las observaciones de origen a la cotización recién creada. El
+      // updateMany exige id_cotizacion todavía null: si otro admin las cotizó
+      // entre el prellenado y este guardado, el conteo no cuadra y se aborta la
+      // transacción entera en vez de pisar el vínculo existente.
+      if (idsObservaciones.length > 0) {
+        const vinculadas = await tx.tbl_servicios_observaciones.updateMany({
+          where: { id: { in: idsObservaciones.map(Number) }, estado: 1, id_cotizacion: null },
           data: { id_cotizacion: cot.id, user_id_modification: req.user.id, date_time_modification: new Date() }
         });
+        if (vinculadas.count !== idsObservaciones.length) {
+          throw new Error('Alguna observación fue cotizada por otro usuario mientras se creaba esta cotización');
+        }
       }
 
       // Si la cotización nace de un lead, marcarlo como 'Cotizado' (salvo que ya
@@ -654,7 +607,7 @@ const crear = async (req, res) => {
       }
 
       return cot;
-    }, { maxWait: 15000, timeout: 30000 });
+    });
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: creada.id,
@@ -768,6 +721,16 @@ const actualizarVersion = async (req, res) => {
     const igvTasa = await configuracion.obtener('IGV_RATE');
     const { calcularImporteLinea } = require('../utils/cotizacionCalculos');
 
+    // Foto obligatoria por ítem en cotizaciones de correctivo (al reemplazar items).
+    if (items) {
+      const cotSub = await prisma.tbl_cotizaciones.findUnique({
+        where: { id }, select: { subtipo_servicio: { select: { modulo_asociado: true } } }
+      });
+      if (cotSub?.subtipo_servicio?.modulo_asociado === 'correctivo' && items.some(it => !it.id_archivo)) {
+        return res.status(400).json({ error: 'En una cotización de correctivo, cada ítem debe incluir una foto.' });
+      }
+    }
+
     const nuevoSinIgv = Object.prototype.hasOwnProperty.call(d, 'sin_igv')
       ? Boolean(d.sin_igv) : version.sin_igv;
     // Los totales se recalculan si cambian los items o si cambia la condición de
@@ -848,6 +811,7 @@ const actualizarVersion = async (req, res) => {
               precio_unitario: it.precio_unitario || 0,
               descuento_porcentaje: it.descuento_porcentaje || 0,
               importe: calcularImporteLinea(it),
+              id_archivo: it.id_archivo ? Number(it.id_archivo) : null,
               user_id_registration: req.user.id
             }
           });
@@ -896,6 +860,9 @@ const crearNuevaVersion = async (req, res) => {
     // Se permite versionar cuando: la cotización está en proceso (Cotizado) o
     // fue reabierta (estado global != Terminado). Si quedó Terminada o si la
     // última versión sigue en Cotizado sin decidir, no tiene sentido versionar.
+    if (cot.estado_global === ESTADO_GLOBAL.ANULADO) {
+      return res.status(400).json({ error: 'La cotización está anulada y no admite acciones.' });
+    }
     if (cot.estado_global === ESTADO_GLOBAL.TERMINADO) {
       return res.status(400).json({ error: 'No se versiona una cotización Terminada' });
     }
@@ -949,6 +916,7 @@ const crearNuevaVersion = async (req, res) => {
             precio_unitario: it.precio_unitario,
             descuento_porcentaje: it.descuento_porcentaje,
             importe: it.importe,
+            id_archivo: it.id_archivo,
             user_id_registration: req.user.id
           }
         });
@@ -958,12 +926,6 @@ const crearNuevaVersion = async (req, res) => {
         data: { version_activa: ver.numero_version, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
       return ver;
-    });
-
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_cotizaciones_versiones', id_entidad: nueva.id,
-      accion: 'NEW_VERSION',
-      valor_nuevo: { numero_version: nueva.numero_version, motivo_cambio: motivo }, ip: req.ip
     });
 
     res.status(201).json({ data: nueva });
@@ -1034,7 +996,7 @@ const reabrir = async (req, res) => {
     // Solo tiene sentido reabrir cuando ya hay servicio en marcha y no está
     // totalmente terminada. Si quedó en Cotizado/Aceptado simplemente sigue
     // su flujo natural — no hay nada que reabrir.
-    if (cot.estado_global === ESTADO_GLOBAL.TERMINADO || cot.estado_global === ESTADO_GLOBAL.COTIZADO) {
+    if (cot.estado_global === ESTADO_GLOBAL.TERMINADO || cot.estado_global === ESTADO_GLOBAL.COTIZADO || cot.estado_global === ESTADO_GLOBAL.ANULADO) {
       return res.status(400).json({ error: `No se puede reabrir una cotización ${cot.estado_global}` });
     }
 
@@ -1327,6 +1289,9 @@ const aprobar = async (req, res) => {
       }
     });
     if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+    if (cot.estado_global === ESTADO_GLOBAL.ANULADO) {
+      return res.status(400).json({ error: 'La cotización está anulada y no admite acciones.' });
+    }
     if (cot.estado_global === ESTADO_GLOBAL.TERMINADO) {
       return res.status(400).json({ error: 'La cotización ya está Terminada' });
     }
@@ -1451,7 +1416,7 @@ const aprobar = async (req, res) => {
       //    (cents, sin perder redondeo) — los reportes podrán recomponer el total.
       const totalCents = Math.round(Number(version.monto_total) * 100);
       const baseCents = Math.floor(totalCents / idsResueltos.length);
-      const codigoSrv = await generarCodigoServicio();
+      const codigoSrv = await generarCodigoServicio(clasificacionCot.tipo_registro);
       // El edificio del servicio = el de los ascensores cotizados (mismo edificio).
       const edificioServicio = await tx.tbl_edificios.findFirst({
         where: { ascensores: { some: { id: { in: idsResueltos } } } },
@@ -1540,26 +1505,20 @@ const aprobar = async (req, res) => {
       //     PRIMER ascensor; los demás siguen vinculados via tbl_servicios_proyectos_ascensores.
       //   - mantenimiento: 1 plan por cada ascensor (planes son independientes).
       //   - atencion_rapida: no aplica al aprobar cotización (es captura inicial).
-      //     La atención rápida es el punto de captura, no el resultado de aprobar;
-      //     replicarEnModulo exigiría contacto (nombre/teléfono) que no existe en
-      //     el flujo de aprobación, por lo que se omite (mismo criterio que
-      //     atencionesRapidasController al convertir).
-      if (clasificacionCot.modulo_asociado && clasificacionCot.modulo_asociado !== 'atencion_rapida') {
-        await replicarEnModulo(tx, {
-          servicio,
-          tipoServicio: cot.subtipo_servicio,
-          idsAscensores: idsResueltos,
-          idCliente: cot.id_cliente,
-          // Sin hora de programación al aprobar; el inicio de plan de mantenimiento
-          // cae por defecto a la fecha de aprobación (hoy) salvo que el form indique
-          // una "Fecha de inicio del plan".
-          horaProgramada: null,
-          fechaProgramada: fechaAprobacion,
-          usuarioId: req.user.id,
-          datosModulo: d,
-          origenEtiqueta: `aprobación de ${cot.codigo} v${version.numero_version}`
-        });
-      }
+      await replicarEnModulo(tx, {
+        servicio,
+        tipoServicio: cot.subtipo_servicio,
+        idsAscensores: idsResueltos,
+        idCliente: cot.id_cliente,
+        // Sin hora de programación al aprobar; el inicio de plan de mantenimiento
+        // cae por defecto a la fecha de aprobación (hoy) salvo que el form indique
+        // una "Fecha de inicio del plan".
+        horaProgramada: null,
+        fechaProgramada: fechaAprobacion,
+        usuarioId: req.user.id,
+        datosModulo: d,
+        origenEtiqueta: `aprobación de ${cot.codigo} v${version.numero_version}`
+      });
 
       // 4. marcar versión aprobada
       const versionApro = await tx.tbl_cotizaciones_versiones.update({
@@ -1625,7 +1584,7 @@ const aprobar = async (req, res) => {
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
-      accion: 'APPROVE', valor_nuevo: { version: version.numero_version, id_servicio: resultado.servicio.id, monto: version.monto_total }, ip: req.ip
+      accion: 'APPROVE', valor_nuevo: { id_servicio: resultado.servicio.id, monto: version.monto_total }, ip: req.ip
     });
 
     sincronizarRecordatorioServicio(resultado.servicio.id).catch(err =>
@@ -1658,47 +1617,51 @@ const eliminar = async (req, res) => {
       }
     });
     if (!cot) return res.status(404).json({ error: 'No encontrada' });
-    // No se permite eliminar cotizaciones que ya generaron servicio en curso o
-    // terminado: cualquier estado_global diferente de Cotizado tiene servicio
-    // vivo, y eliminar la cotización dejaría a ese servicio huérfano.
-    if (cot.estado_global !== ESTADO_GLOBAL.COTIZADO) {
-      return res.status(400).json({ error: 'No se puede eliminar una cotización con servicio asociado' });
+    if (cot.estado_global === ESTADO_GLOBAL.ANULADO) {
+      return res.status(400).json({ error: 'La cotización ya está anulada.' });
     }
 
-    // Recolectar archivos a purgar de Wasabi: PDFs y respaldos de cada versión
-    // + adjuntos libres de la cotización.
-    const archivoIds = new Set();
-    for (const v of cot.versiones) {
-      if (v.id_archivo_pdf) archivoIds.add(v.id_archivo_pdf);
-      if (v.id_archivo_respaldo) archivoIds.add(v.id_archivo_respaldo);
-    }
-    for (const a of cot.archivos) if (a.id_archivo) archivoIds.add(a.id_archivo);
-    const versionIds = cot.versiones.map(v => v.id);
+    // Eliminación = baja lógica (estado=0) + estado_global 'Anulado'. El estado=0
+    // mantiene la coherencia con los demás módulos (deleted = estado 0); el
+    // 'Anulado' permite listarla aparte como historial (el listado la oculta por
+    // defecto, con un check para mostrarla). Sus servicios generados (p. ej.
+    // aprobada por error) se anulan en baja lógica en cascada. No se purgan los
+    // archivos de la cotización (se preservan para el historial).
+    const serviciosGenerados = await prisma.tbl_servicios_proyectos.findMany({
+      where: { id_cotizacion: id, estado: 1 }
+    });
 
     const wasabiKeys = [];
+    const tecnicoIds = [];
     await prisma.$transaction(async (tx) => {
       const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
-      // Cascada manual (el soft-delete no dispara onDelete:Cascade del schema).
-      if (versionIds.length) {
-        await tx.tbl_cotizaciones_items.updateMany({ where: { id_version: { in: versionIds }, estado: 1 }, data: { estado: 0, ...stamp } });
-      }
-      await tx.tbl_cotizaciones_versiones.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
-      await tx.tbl_cotizaciones_ascensores.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
-      await tx.tbl_cotizaciones_archivos.updateMany({ where: { id_cotizacion: id, estado: 1 }, data: { estado: 0, ...stamp } });
 
-      for (const idArchivo of archivoIds) {
-        const key = await bajaArchivoEnTx(tx, idArchivo, req.user.id);
-        if (key) wasabiKeys.push(key);
+      // Anular los servicios generados por la cotización (baja lógica en cascada).
+      for (const s of serviciosGenerados) {
+        const r = await bajaServicioCascadaEnTx(tx, s.id, req.user.id);
+        wasabiKeys.push(...r.wasabiKeys);
+        tecnicoIds.push(...r.tecnicoIds);
+        await tx.tbl_servicios_proyectos.update({
+          where: { id: s.id },
+          data: { estado_servicio: 'Cancelado', ...stamp }
+        });
       }
 
-      await tx.tbl_cotizaciones.update({ where: { id }, data: { estado: 0, ...stamp } });
+      // Baja lógica (estado=0) + marca 'Anulado' para el historial.
+      await tx.tbl_cotizaciones.update({
+        where: { id },
+        data: { estado: 0, estado_global: ESTADO_GLOBAL.ANULADO, ...stamp }
+      });
       await registrarAuditoria({
         id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
-        accion: 'DELETE', valor_anterior: cot, ip: req.ip
+        accion: 'DELETE', valor_anterior: cot,
+        valor_nuevo: { estado_global: ESTADO_GLOBAL.ANULADO, servicios_anulados: serviciosGenerados.map(s => s.codigo) }, ip: req.ip
       });
     });
 
+    // Solo se purgan archivos de los servicios anulados; los de la cotización se conservan.
     await purgarObjetosWasabi(wasabiKeys);
+    await liberarTecnicos(tecnicoIds, null);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cotizaciones.eliminar]', err);
@@ -1724,13 +1687,7 @@ const generarPdf = async (req, res) => {
 
     const version = await prisma.tbl_cotizaciones_versiones.findUnique({
       where: { id_cotizacion_numero_version: { id_cotizacion: id, numero_version: numero } },
-      include: {
-        items: {
-          where: { estado: 1 },
-          orderBy: { orden: 'asc' },
-          include: { archivo: { select: { id: true, ruta_almacenamiento: true, mime_type: true } } }
-        }
-      }
+      include: { items: { where: { estado: 1 }, orderBy: { orden: 'asc' } } }
     });
     if (!version) return res.status(404).json({ error: 'Versión no encontrada' });
 
@@ -1849,11 +1806,181 @@ const eliminarArchivo = async (req, res) => {
   }
 };
 
+
+// ===================================================================
+// [MERGE] Infraestructura de listado + endpoints exportar/historial
+// traídos del repo remoto (exportación XLSX/PDF e historial de
+// cotizaciones). Aditivo: no altera los endpoints locales existentes.
+// ===================================================================
+const INCLUDE_LISTA = {
+  cliente: { select: { id: true, nombre: true, telefono: true } },
+  ascensores: {
+    where: { estado: 1 },
+    orderBy: { orden: 'asc' },
+    include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
+  },
+  tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+  subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
+  versiones: {
+    where: { estado: 1 },
+    orderBy: { numero_version: 'desc' },
+    take: 1,
+    select: {
+      id: true, numero_version: true, estado_version: true,
+      monto_total: true, moneda: true, fecha_validez: true
+    }
+  },
+  servicios: {
+    where: { estado: 1 },
+    orderBy: { id: 'asc' },
+    select: { id: true, codigo: true, estado_servicio: true }
+  }
+};
+
+function construirWhereCotizaciones(query) {
+  const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = query;
+  const where = { estado: 1 };
+  if (q) where.OR = [
+    // Código de la cotización
+    { codigo: { contains: q, mode: 'insensitive' } },
+    // Nombre del cliente
+    { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+    // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
+    // los ascensores existentes vinculados a la cotización
+    { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+    // Nombre del edificio / obra donde están los ascensores de la cotización
+    { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
+    // Código de servicio generado por la cotización (cuando ya fue aprobada)
+    { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
+  ];
+  if (estado_global === 'Aprobadas') {
+    // Filtro agregado del frontend: todas las cotizaciones que el cliente
+    // aprobó alguna vez. No es un estado real — engloba todas las etapas con
+    // servicio en marcha, incluidas las ya facturadas/cobradas, que avanzaron
+    // más allá de 'Aceptado'.
+    where.estado_global = { in: [ESTADO_GLOBAL.ACEPTADO, ESTADO_GLOBAL.EJECUCION, ESTADO_GLOBAL.PENDIENTE, ESTADO_GLOBAL.TERMINADO] };
+  } else if (estado_global) {
+    where.estado_global = estado_global;
+  }
+  if (id_cliente) where.id_cliente = Number(id_cliente);
+  if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
+  if (desde || hasta) {
+    where.date_time_registration = {};
+    if (desde) where.date_time_registration.gte = parseYMDLima(desde);
+    if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
+  }
+  return where;
+}
+
+// Hidrata cada cotización con `creado_por` (usuario que la registró). La columna
+// user_id_registration no tiene relación FK en Prisma, así que se resuelve con
+// una consulta por lote. Muta y devuelve el mismo arreglo recibido.
+async function adjuntarCreador(cotizaciones) {
+  const mapa = await mapaUsuariosPorId(cotizaciones.map(c => c.user_id_registration));
+  for (const c of cotizaciones) {
+    c.creado_por = c.user_id_registration ? (mapa[c.user_id_registration] || null) : null;
+  }
+  return cotizaciones;
+}
+
+
+const exportar = async (req, res) => {
+  try {
+    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
+    const formato = String(req.query.formato || 'excel').toLowerCase();
+    if (!['excel', 'pdf'].includes(formato)) {
+      return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
+    }
+
+    const where = construirWhereCotizaciones(req.query);
+    conAlcance(where, cotizacionAlcanceWhere(req.user));
+    const cotizaciones = await prisma.tbl_cotizaciones.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      include: INCLUDE_LISTA
+    });
+    await adjuntarCreador(cotizaciones);
+
+    const { generarExcelCotizaciones, generarPdfCotizaciones } = require('../utils/cotizacionesExport');
+    const stamp = ymdLima();
+
+    if (formato === 'excel') {
+      const buffer = await generarExcelCotizaciones(cotizaciones);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.xlsx"`);
+      return res.end(buffer);
+    }
+
+    const buffer = await generarPdfCotizaciones(cotizaciones);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.pdf"`);
+    return res.end(buffer);
+  } catch (err) {
+    console.error('[cotizaciones.exportar]', err);
+    res.status(500).json({ error: 'Error al exportar cotizaciones: ' + err.message });
+  }
+};
+
+
+const historial = async (req, res) => {
+  try {
+    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
+    const id = Number(req.params.id);
+    const cot = await prisma.tbl_cotizaciones.findUnique({
+      where: { id },
+      select: { id: true, versiones: { select: { id: true, numero_version: true } } }
+    });
+    if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+
+    // numero_version por id de versión, para etiquetar los eventos de versión.
+    const numeroVersionPorId = Object.fromEntries(cot.versiones.map(v => [v.id, v.numero_version]));
+    const versionIds = cot.versiones.map(v => v.id);
+
+    const filtros = [{ entidad: 'tbl_cotizaciones', id_entidad: id }];
+    if (versionIds.length > 0) {
+      filtros.push({ entidad: 'tbl_cotizaciones_versiones', id_entidad: { in: versionIds } });
+    }
+    const eventos = await prisma.tbl_auditoria.findMany({
+      where: { OR: filtros },
+      orderBy: { fecha_evento: 'asc' }
+    });
+
+    const mapa = await mapaUsuariosPorId(eventos.map(e => e.id_usuario));
+    const data = eventos.map(e => ({
+      id: e.id,
+      accion: e.accion,
+      fecha_evento: e.fecha_evento,
+      ip: e.ip,
+      usuario: e.id_usuario ? (mapa[e.id_usuario] || null) : null,
+      // Número de versión afectada: directo si el evento es sobre una versión,
+      // o derivado del payload auditado (APPROVE/RE_APPROVE guardan `version`).
+      numero_version: e.entidad === 'tbl_cotizaciones_versiones'
+        ? (numeroVersionPorId[e.id_entidad] ?? null)
+        : (e.valor_nuevo?.version ?? e.valor_nuevo?.numero_version ?? null),
+      // Motivo asociado (rechazo / cambio / reapertura) cuando exista.
+      motivo: e.valor_nuevo?.motivo ?? e.valor_nuevo?.motivo_cambio ?? null
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    console.error('[cotizaciones.historial]', err);
+    res.status(500).json({ error: 'Error al obtener historial de la cotización' });
+  }
+};
+// Catálogos de estado que consume el listado (filtro) y la ficha. Se sirven
+// desde el backend para que la UI no vuelva a duplicarlos en un array literal
+// y no pueda desalinearse de lo que realmente se escribe en la BD.
+const catalogos = (_req, res) => {
+  res.json({ data: { estados_globales: ESTADOS_GLOBALES, estados_version: ESTADOS_VERSION_LISTA } });
+};
+
 module.exports = {
   listar,
-  exportar,
+  catalogos,
   obtener,
+  exportar,
   historial,
+  desdeObservaciones,
   crear,
   actualizarCabecera,
   actualizarVersion,

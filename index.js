@@ -4,6 +4,7 @@ process.env.TZ = process.env.TZ || 'America/Lima';
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -37,22 +38,32 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Archivos: el frontend pide `/uploads/<tipo>/<yyyy>/<mm>/<file>`. El backend
 // genera una URL firmada de Wasabi y 302-redirige al cliente. El navegador
 // (o un <img>) sigue el redirect transparentemente.
-const { urlPresigned, keyDesdeRuta } = require('./utils/storage');
+const storage = require('./utils/storage');
 app.get('/uploads/*', async (req, res) => {
   try {
-    const key = keyDesdeRuta(req.path); // quita el "/" inicial
+    const key = storage.keyDesdeRuta(req.path); // quita el "/" inicial
     // `?download=1` (opcional con `?n=<nombre>`) fuerza Content-Disposition: attachment
     // para descargar en lugar de reproducir/abrir inline. Útil para videos grandes
     // donde no queremos cargarlos en memoria en el navegador antes de guardar.
     const descargar = req.query.download === '1' || req.query.download === 'true';
     const nombreDescarga = descargar ? (String(req.query.n || '').trim() || 'archivo') : undefined;
-    const url = await urlPresigned(key, {
+
+    // Driver LOCAL: servir el archivo directamente desde disco (sin redirect).
+    if (storage.esLocal()) {
+      const filePath = storage.rutaAbsoluta(key);
+      if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Archivo no encontrado' });
+      if (descargar) return res.download(filePath, nombreDescarga || path.basename(filePath));
+      return res.sendFile(filePath);
+    }
+
+    // Driver WASABI: 302 a la URL firmada; el navegador sigue el redirect.
+    const url = await storage.urlPresigned(key, {
       expiresIn: Number(process.env.WASABI_URL_TTL) || 3600,
       nombreDescarga
     });
     res.redirect(302, url);
   } catch (err) {
-    console.error('[uploads] error firmando URL:', err.message);
+    console.error('[uploads] error resolviendo archivo:', err.message);
     res.status(404).json({ error: 'Archivo no encontrado' });
   }
 });

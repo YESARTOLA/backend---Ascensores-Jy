@@ -10,6 +10,7 @@ router.use(verificarToken);
 router.use(requiereAlcance('servicio'));
 
 router.get('/', c.listar);
+router.get('/:id', permitirRoles('super_admin', 'admin', 'coordinador'), c.obtener);
 router.post('/', permitirRoles('super_admin', 'admin', 'coordinador'), c.crear);
 router.put('/:id', permitirRoles('super_admin', 'admin', 'coordinador'), c.actualizar);
 router.delete('/:id', permitirRoles('super_admin'), c.eliminar);

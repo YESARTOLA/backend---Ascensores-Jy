@@ -1,4 +1,5 @@
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_FINALIZADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const {
@@ -24,7 +25,7 @@ const {
   ESTADO_FACTURACION_SIN,
   calcularEstadoFacturacion
 } = require('../utils/estadoFactura');
-const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
+const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const {
   sincronizarRecordatorioServicio,
@@ -45,8 +46,72 @@ const { aplicaAlcance, aplicaAlcanceEdificio, tiposRegistroPermitidos, tiposEdif
 const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere, servicioVisiblePorEdificio } = require('../utils/visibilidadEdificio');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
+const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
 const { ensureChecklistFinalizacion } = require('./checklistFinalizacionController');
-const { validarAscensores } = require('../utils/ascensoresMonto');
+
+/**
+ * Resuelve la lista de ascensores de un proyecto a ids concretos, dentro de una
+ * transacción. Cada entrada es un ascensor EXISTENTE ({ id_ascensor }) o uno
+ * NUEVO a instalar ({ ascensor_nuevo: { id_edificio, ... } }), que se crea con
+ * estado 'Por instalar'. Homogeneiza la creación directa de proyectos con el
+ * flujo de aprobación de cotización. Lanza Error (mensaje al usuario) si algo no
+ * valida (ascensor ajeno al cliente, edificio inválido, instalación cancelada…).
+ */
+async function resolverAscensoresProyectoEnTx(tx, ascensores, idCliente, userId) {
+  if (!Array.isArray(ascensores) || ascensores.length === 0) {
+    throw new Error('Debe indicar al menos un ascensor');
+  }
+  const ids = [];
+  let totalAscensoresCliente = await tx.tbl_ascensores.count({
+    where: { edificio: { is: { id_cliente: Number(idCliente) } } }
+  });
+  for (const fila of ascensores) {
+    if (fila?.id_ascensor) {
+      const idAsc = Number(fila.id_ascensor);
+      if (ids.includes(idAsc)) throw new Error('No se puede repetir un mismo ascensor');
+      const asc = await tx.tbl_ascensores.findFirst({
+        where: { id: idAsc, estado: 1 },
+        include: { edificio: { select: { id_cliente: true } } }
+      });
+      if (!asc) throw new Error('Uno o más ascensores no existen o están inactivos');
+      if (asc.edificio?.id_cliente !== Number(idCliente)) {
+        throw new Error(`El ascensor ${asc.codigo} no pertenece al cliente seleccionado`);
+      }
+      if (asc.estado_operativo === 'Instalación cancelada') {
+        throw new Error(`El ascensor ${asc.codigo} tiene la instalación cancelada y no admite servicios`);
+      }
+      ids.push(idAsc);
+      continue;
+    }
+    // Ascensor nuevo a instalar: se crea en un edificio del cliente, 'Por instalar'.
+    const datos = fila?.ascensor_nuevo;
+    if (!datos || !datos.id_edificio) throw new Error('Cada ascensor nuevo debe indicar su edificio');
+    const edif = await tx.tbl_edificios.findFirst({
+      where: { id: Number(datos.id_edificio), id_cliente: Number(idCliente) }
+    });
+    if (!edif) throw new Error('El edificio del ascensor nuevo no pertenece al cliente');
+    totalAscensoresCliente += 1;
+    const codigoAsc = `ASC-${idCliente}-${String(totalAscensoresCliente).padStart(3, '0')}-${Date.now().toString().slice(-4)}`;
+    const nuevo = await tx.tbl_ascensores.create({
+      data: {
+        id_edificio: Number(datos.id_edificio),
+        codigo: codigoAsc,
+        ubicacion: datos.ubicacion || null,
+        tipo: datos.tipo || null,
+        marca: datos.marca || null,
+        modelo: datos.modelo || null,
+        capacidad: datos.capacidad || null,
+        pisos: datos.pisos ? Number(datos.pisos) : null,
+        anio_aproximado: datos.anio_aproximado ? Number(datos.anio_aproximado) : null,
+        estado_operativo: 'Por instalar',
+        observaciones: datos.descripcion || null,
+        user_id_registration: userId
+      }
+    });
+    ids.push(nuevo.id);
+  }
+  return ids;
+}
 
 const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
 
@@ -57,6 +122,19 @@ function sanitizarPrecio(servicio, rolCodigo) {
   clon.precio_interno = null;
   if (Array.isArray(clon.ascensores)) {
     clon.ascensores = clon.ascensores.map(a => ({ ...a, monto: null }));
+  }
+  // Ítems de la cotización de origen: ocultar precios a roles sin permiso (técnicos).
+  if (clon.cotizacion && Array.isArray(clon.cotizacion.versiones)) {
+    clon.cotizacion = {
+      ...clon.cotizacion,
+      versiones: clon.cotizacion.versiones.map(v => ({
+        ...v,
+        monto_total: null,
+        items: Array.isArray(v.items)
+          ? v.items.map(it => ({ ...it, precio_unitario: null, descuento_porcentaje: null, importe: null }))
+          : v.items
+      }))
+    };
   }
   return clon;
 }
@@ -89,6 +167,8 @@ const listar = async (req, res) => {
       // Ascensores asociados: código y tipo (Pasajeros / Camillero / Carga)
       { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } },
       { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+      // Edificio / obra del ascensor asociado
+      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
       // Código de la cotización origen (si fue aprobada)
       { cotizacion: { codigo: { contains: q, mode: 'insensitive' } } }
     ];
@@ -115,9 +195,11 @@ const listar = async (req, res) => {
     if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
     if (origen) where.origen = origen;
     if (desde || hasta) {
+      // fecha_programada es @db.Date (medianoche UTC): los límites deben ir en
+      // medianoche UTC, no en Lima, o el borde superior arrastra el día siguiente.
       where.fecha_programada = {};
-      if (desde) where.fecha_programada.gte = parseYMDLima(desde);
-      if (hasta) where.fecha_programada.lte = parseYMDFinDiaLima(hasta);
+      if (desde) where.fecha_programada.gte = parseYMDUTC(desde);
+      if (hasta) where.fecha_programada.lte = parseYMDUTC(hasta);
     }
 
     // Si el rol es tecnico, solo ve servicios donde está asignado
@@ -166,7 +248,24 @@ const obtener = async (req, res) => {
             id: true,
             codigo: true,
             estado_global: true,
-            version_activa: true
+            version_activa: true,
+            // Versiones con sus ítems (y la foto de cada ítem) para mostrar la
+            // lista de ítems en la página del servicio. Los precios se ocultan a
+            // los técnicos vía sanitizarPrecio().
+            versiones: {
+              where: { estado: 1 },
+              select: {
+                numero_version: true, estado_version: true, monto_total: true, moneda: true, sin_igv: true,
+                items: {
+                  where: { estado: 1 }, orderBy: { orden: 'asc' },
+                  select: {
+                    id: true, orden: true, descripcion: true, cantidad: true, unidad: true,
+                    precio_unitario: true, descuento_porcentaje: true, importe: true,
+                    archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
+                  }
+                }
+              }
+            }
           }
         },
         mantenimiento_plan: {
@@ -244,11 +343,17 @@ const crear = async (req, res) => {
     if (!ROLES_PRECIO.includes(req.user.rol_codigo)) {
       return res.status(403).json({ error: 'Rol no autorizado para crear servicios con precio' });
     }
-    if (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '') {
-      return res.status(400).json({ error: 'El precio es obligatorio' });
+    // Precio GLOBAL del proyecto (lo pone el usuario). Cubre a uno o varios
+    // ascensores; el precio se reparte parejo entre ellos (homogéneo con la
+    // aprobación de cotización). Ya no se compone por precio de catálogo.
+    const precioProyecto = Number(d.precio_interno);
+    if (!Number.isFinite(precioProyecto) || precioProyecto < 0) {
+      return res.status(400).json({ error: 'El precio del proyecto es obligatorio' });
     }
-    const validacion = await validarAscensores(d.ascensores, d.id_cliente, d.precio_interno, d.moneda);
-    if (!validacion.ok) return res.status(400).json({ error: validacion.error });
+    if (!Array.isArray(d.ascensores) || d.ascensores.length === 0) {
+      return res.status(400).json({ error: 'Debe indicar al menos un ascensor' });
+    }
+    const monedaProyecto = d.moneda || 'PEN';
 
     const esBorrador = d.es_borrador === true || d.es_borrador === 1 || d.estado_servicio === 'Borrador';
     const estadoInicial = esBorrador ? 'Borrador' : 'Pendiente';
@@ -284,54 +389,67 @@ const crear = async (req, res) => {
       return res.status(403).json({ error: 'No tiene acceso para crear registros de este ámbito' });
     }
 
-    const codigo = await generarCodigoServicio();
-    const servicio = await prisma.$transaction(async (tx) => {
-      const s = await tx.tbl_servicios_proyectos.create({
-        data: {
-          codigo,
-          tipo_registro: tipoRegistro,
-          id_tipo_servicio: Number(d.id_tipo_servicio),
-          id_cliente: Number(d.id_cliente),
-          origen: origenDerivado,
-          titulo: d.titulo || `Servicio ${codigo}`,
-          descripcion: d.descripcion || null,
-          fecha_programada: parseYMDLima(d.fecha_programada),
-          hora_programada: d.hora_programada || null,
-          duracion_dias: duracionDias,
-          fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null,
-          prioridad: d.prioridad || 'media',
-          estado_servicio: estadoInicial,
-          precio_interno: d.precio_interno,
-          moneda: validacion.moneda,
-          sin_cobro: d.sin_cobro ? 1 : 0,
-          observaciones: d.observaciones || null,
-          user_id_registration: req.user.id,
-          ascensores: {
-            create: validacion.items.map(it => ({
-              id_ascensor: it.id_ascensor,
-              monto: it.monto,
-              moneda: validacion.moneda,
-              user_id_registration: req.user.id
-            }))
+    const codigo = await generarCodigoServicio(tipoRegistro);
+    let idsAscensores = [];
+    let servicio;
+    try {
+      servicio = await prisma.$transaction(async (tx) => {
+        // Resolver ascensores (existentes y/o nuevos a instalar) e igualar el
+        // reparto del precio global entre todos ellos.
+        idsAscensores = await resolverAscensoresProyectoEnTx(tx, d.ascensores, d.id_cliente, req.user.id);
+        const montos = repartirParejo(precioProyecto, idsAscensores.length);
+        const s = await tx.tbl_servicios_proyectos.create({
+          data: {
+            codigo,
+            tipo_registro: tipoRegistro,
+            id_tipo_servicio: Number(d.id_tipo_servicio),
+            id_cliente: Number(d.id_cliente),
+            origen: origenDerivado,
+            titulo: d.titulo || `Servicio ${codigo}`,
+            descripcion: d.descripcion || null,
+            fecha_programada: parseYMDLima(d.fecha_programada),
+            hora_programada: d.hora_programada || null,
+            duracion_dias: duracionDias,
+            fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null,
+            prioridad: d.prioridad || 'media',
+            estado_servicio: estadoInicial,
+            precio_interno: precioProyecto,
+            moneda: monedaProyecto,
+            sin_cobro: d.sin_cobro ? 1 : 0,
+            observaciones: d.observaciones || null,
+            user_id_registration: req.user.id,
+            ascensores: {
+              create: idsAscensores.map((idAsc, i) => ({
+                id_ascensor: idAsc,
+                monto: montos[i],
+                moneda: monedaProyecto,
+                user_id_registration: req.user.id
+              }))
+            }
           }
-        }
-      });
+        });
 
-      // Replicar en el módulo operativo (no-op si tipo no tiene módulo asociado).
-      await replicarEnModulo(tx, {
-        servicio: s,
-        tipoServicio,
-        idsAscensores: validacion.items.map(it => it.id_ascensor),
-        idCliente: Number(d.id_cliente),
-        horaProgramada: d.hora_programada || null,
-        fechaProgramada: parseYMDLima(d.fecha_programada),
-        usuarioId: req.user.id,
-        datosModulo: d,
-        origenEtiqueta: `servicio ${codigo}`
-      });
+        // Replicar en el módulo operativo (no-op si tipo no tiene módulo asociado).
+        await replicarEnModulo(tx, {
+          servicio: s,
+          tipoServicio,
+          idsAscensores,
+          idCliente: Number(d.id_cliente),
+          horaProgramada: d.hora_programada || null,
+          fechaProgramada: parseYMDLima(d.fecha_programada),
+          usuarioId: req.user.id,
+          datosModulo: d,
+          origenEtiqueta: `servicio ${codigo}`
+        });
 
-      return s;
-    });
+        return s;
+      });
+    } catch (e) {
+      // Errores de validación de ascensores → 400 (mensaje al usuario). Los
+      // errores de Prisma (con .code) se tratan como 500 en el catch externo.
+      if (e.code) throw e;
+      return res.status(400).json({ error: e.message || 'No se pudo crear el proyecto' });
+    }
 
     // Solo registrar en calendario, historiales y notificar a otros módulos si NO es borrador.
     // Los borradores quedan invisibles para todos los flujos operativos hasta promoverse.
@@ -348,10 +466,10 @@ const crear = async (req, res) => {
           creado_por: req.user.id
         }
       });
-      for (const it of validacion.items) {
+      for (const idAsc of idsAscensores) {
         await prisma.tbl_ascensores_historial.create({
           data: {
-            id_ascensor: it.id_ascensor, id_servicio: servicio.id,
+            id_ascensor: idAsc, id_servicio: servicio.id,
             tipo_evento: 'servicio_creado',
             descripcion: `Servicio ${servicio.codigo} creado`,
             creado_por: req.user.id
@@ -1147,7 +1265,7 @@ const finalizarServicio = async (req, res) => {
 
     // Evento calendario
     await prisma.tbl_calendario_eventos.updateMany({
-      where: { id_servicio: id }, data: { estado_evento: 'finalizado' }
+      where: { id_servicio: id }, data: { estado_evento: ESTADO_EVENTO_FINALIZADO }
     });
 
     // Alertas de "servicio finalizado" para el calendario. Se sincronizan AQUÍ
@@ -1197,7 +1315,7 @@ const cancelar = async (req, res) => {
     });
     await cambiarEstadoServicio(id, 'Cancelado', req.user.id, motivo || null);
     await prisma.tbl_calendario_eventos.updateMany({
-      where: { id_servicio: id }, data: { estado_evento: 'cancelado' }
+      where: { id_servicio: id }, data: { estado_evento: ESTADO_EVENTO_CANCELADO }
     });
 
     // Si existía folder contable (creado al aprobar la cotización), darlo de
@@ -1266,6 +1384,9 @@ const realizados = async (req, res) => {
         { cliente: { nombre: { contains: q, mode: 'insensitive' } } }
       ];
     }
+    // Los servicios marcados "Sin factura" (requiere_factura = 0) no son
+    // "pendientes por facturar": se excluyen al filtrar por ese estado.
+    if (estado_facturacion === ESTADO_FACTURACION_SIN) servicioWhere.requiere_factura = 1;
     // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
     const tiposRealizados = tiposRegistroPermitidos(req.user);
     if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };
@@ -1515,7 +1636,7 @@ const eliminar = async (req, res) => {
     // Evento de calendario: baja lógica para que deje de listarse (filtra estado=1).
     await prisma.tbl_calendario_eventos.updateMany({
       where: { id_servicio: id, estado: 1 },
-      data: { estado: 0, estado_evento: 'cancelado', user_id_modification: req.user.id, date_time_modification: new Date() }
+      data: { estado: 0, estado_evento: ESTADO_EVENTO_CANCELADO, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
     // Folder contable (servicios realizados): baja lógica si existía.
     await prisma.tbl_servicios_realizados.updateMany({
@@ -1548,6 +1669,44 @@ const eliminar = async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al eliminar servicio' });
+  }
+};
+
+/**
+ * Cambia la bandera persistida `requiere_factura` del servicio de forma
+ * independiente al candado operativo: es una decisión administrativa/contable
+ * que no altera el historial de ejecución, así que se puede cambiar en cualquier
+ * momento MIENTRAS no exista una factura emitida (activa, no anulada). Una vez
+ * emitida, la marca queda fija para no quedar inconsistente con el comprobante.
+ */
+const cambiarRequiereFactura = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const nuevo = (req.body.requiere_factura === true || req.body.requiere_factura === 1 || req.body.requiere_factura === '1') ? 1 : 0;
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      include: { facturas: { where: { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } } } }
+    });
+    if (!servicio || servicio.estado === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (servicio.facturas.length > 0) {
+      return res.status(409).json({ error: 'El servicio ya tiene una factura emitida; no se puede cambiar la marca de facturación.' });
+    }
+    if (servicio.requiere_factura !== nuevo) {
+      await prisma.tbl_servicios_proyectos.update({
+        where: { id },
+        data: { requiere_factura: nuevo, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+        accion: 'UPDATE',
+        valor_anterior: { requiere_factura: servicio.requiere_factura },
+        valor_nuevo: { requiere_factura: nuevo }, ip: req.ip
+      });
+    }
+    res.json({ data: { id, requiere_factura: nuevo } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al cambiar la marca de facturación' });
   }
 };
 
@@ -1618,6 +1777,6 @@ const cambiarDuracion = async (req, res) => {
 module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
   asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
-  promoverBorrador, revisarServicio, cambiarDuracion,
+  promoverBorrador, revisarServicio, cambiarRequiereFactura, cambiarDuracion,
   crearGuia, actualizarGuia, eliminarGuia
 };

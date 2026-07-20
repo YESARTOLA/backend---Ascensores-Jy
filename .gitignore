@@ -4,6 +4,7 @@ node_modules/
 *.log
 dist/
 build/
+uploads-local/
 .DS_Store
 .vscode/
 .idea/

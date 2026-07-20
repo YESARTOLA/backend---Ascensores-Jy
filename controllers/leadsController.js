@@ -1,4 +1,5 @@
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, combinarFechaHoraLima } = require('../utils/tiempo');
@@ -367,7 +368,7 @@ const convertir = async (req, res) => {
     try { clasifLead = clasificarTipoServicio(subtipoLead); }
     catch (e) { return res.status(400).json({ error: e.message }); }
 
-    const codigo = await generarCodigoServicio();
+    const codigo = await generarCodigoServicio(clasifLead.tipo_registro);
     const moneda = d.moneda || 'PEN';
     // Los datos comerciales del lead viajan al servicio: el nombre del
     // proyecto como título y la ubicación + tipo de ascensor en la descripción.
@@ -451,7 +452,7 @@ const convertir = async (req, res) => {
         titulo: `${servicio.codigo} – ${servicio.titulo}`,
         tipo_evento: tipoEventoLead,
         fecha_inicio: combinarFechaHoraLima(d.fecha_programada, d.hora_programada),
-        estado_evento: 'programado',
+        estado_evento: ESTADO_EVENTO_PROGRAMADO,
         color: colorPorTipo(tipoEventoLead)
       }
     });

@@ -1,4 +1,5 @@
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeFecha, finDelDiaLima } = require('../utils/tiempo');
@@ -6,10 +7,12 @@ const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServici
 const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
-const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
+const { validarPertenenciaAscensores, preciosConfiguradosPorAscensor, repartirParejo } = require('../utils/ascensoresMonto');
+const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
-const { bajaServicioCascadaEnTx, bajaArchivoEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
+const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 
 // Un plan admite cupo de mantenimientos gratuitos solo si su subtipo pertenece
 // al módulo Mantenimientos (preventivo). SSoT: se deriva de modulo_asociado.
@@ -110,7 +113,7 @@ function _eventoPlan({ plan, fecha, fechaInicio, codigoServicio, idServicio, tit
     // `fechaInicio` (instante absoluto) gana cuando la ocurrencia se reagenda;
     // si no, se calcula desde la fecha + hora del plan.
     fecha_inicio: fechaInicio || combinarFechaHoraLima(fecha, plan.hora_programada),
-    estado_evento: 'programado',
+    estado_evento: ESTADO_EVENTO_PROGRAMADO,
     color: COLOR_MANTENIMIENTO
   };
 }
@@ -240,22 +243,16 @@ const crear = async (req, res) => {
 
     const tipoServicio = await prisma.tbl_tipos_servicio.findUnique({ where: { id: Number(d.id_tipo_servicio) } });
 
-    // El precio se hereda del cliente (tbl_clientes_precios por tipo de servicio).
-    // Si no hay precio configurado para ese par, no se permite crear el plan:
-    // primero hay que registrarlo en el módulo de Clientes. Ese precio es el total
-    // por mantenimiento y se reparte entre los ascensores del plan.
-    const precioCliente = await prisma.tbl_clientes_precios.findUnique({
-      where: { id_cliente_id_tipo_servicio: { id_cliente: Number(d.id_cliente), id_tipo_servicio: Number(d.id_tipo_servicio) } }
-    });
-    if (!precioCliente) {
-      return res.status(400).json({
-        error: `Configure primero el precio del cliente para el tipo de servicio "${tipoServicio?.nombre || ''}" en el módulo de Clientes.`
-      });
-    }
+    // El precio NO se hereda del cliente: cada ascensor tiene el suyo por subtipo
+    // de servicio (tbl_ascensores_precios), configurable desde la ficha del
+    // ascensor o desde el propio modal del plan. El monto se lee de la base y se
+    // ignora el que venga en el body, para que un cliente HTTP no pueda fijarlo.
+    const idsAscensores = (Array.isArray(d.ascensores) ? d.ascensores : []).map(a => a?.id_ascensor);
 
-    // Ascensores del plan con su monto (el precio del catálogo repartido). Valida
-    // pertenencia al cliente y que la suma de montos cuadre con el precio total.
-    const validacion = await validarAscensores(d.ascensores, d.id_cliente, precioCliente.precio, precioCliente.moneda);
+    const pertenencia = await validarPertenenciaAscensores(idsAscensores, d.id_cliente);
+    if (!pertenencia.ok) return res.status(400).json({ error: pertenencia.error });
+
+    const validacion = await preciosConfiguradosPorAscensor(idsAscensores, d.id_tipo_servicio);
     if (!validacion.ok) return res.status(400).json({ error: validacion.error });
 
     let normalizado;
@@ -270,7 +267,7 @@ const crear = async (req, res) => {
     const primerServicioGratuito = normalizado.cantidad_mantenimientos_gratuitos >= 1;
 
     const resultado = await prisma.$transaction(async (tx) => {
-      const monedaServicio = precioCliente.moneda || 'PEN';
+      const monedaServicio = validacion.moneda;
       const plan = await tx.tbl_mantenimientos_planes.create({
         data: {
           id_cliente: Number(d.id_cliente),
@@ -278,7 +275,7 @@ const crear = async (req, res) => {
           ...normalizado,
           fecha_inicio: parseYMDLima(d.fecha_inicio),
           hora_programada: d.hora_programada || null,
-          estado_plan: 'activo',
+          estado_plan: ESTADO_PLAN_ACTIVO,
           observaciones: d.observaciones || null,
           user_id_registration: req.user.id,
           ascensores: {
@@ -513,7 +510,7 @@ async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fecha
     // tx-aware: ve los servicios ya creados en esta misma transacción → sin colisión.
     const codigo = await generarCodigoServicio(tx);
     const monto = Number(a.monto);
-    const moneda = a.moneda || 'PEN';
+    const moneda = a.moneda || MONEDA_POR_DEFECTO;
     // Título por servicio: distingue el ascensor para que el coordinador asigne
     // el técnico al servicio correcto. Sin código de ascensor, cae a tituloBase.
     const titulo = a.codigo ? `${tituloBase} · ${a.codigo}` : tituloBase;
@@ -608,11 +605,11 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
     if (!Number.isFinite(precio) || precio < 0) {
       throw new Error('Precio inválido');
     }
-    moneda = overrides.moneda || ascensoresPlan[0].moneda || 'PEN';
+    moneda = overrides.moneda || ascensoresPlan[0].moneda || MONEDA_POR_DEFECTO;
     montosPorAscensor = repartirParejo(precio, ascensoresPlan.length);
   } else {
     montosPorAscensor = ascensoresPlan.map(a => Number(a.monto));
-    moneda = ascensoresPlan[0].moneda || 'PEN';
+    moneda = ascensoresPlan[0].moneda || MONEDA_POR_DEFECTO;
   }
 
   const cupoGratuito = Number(plan.cantidad_mantenimientos_gratuitos || 0);
@@ -721,7 +718,7 @@ async function materializarSiguienteEventoDelPlan({ idPlan, fechaServicioFinaliz
     where: { id: idPlan },
     include: { tipo_servicio: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { nombre: true } } } } } } }
   });
-  if (!plan || plan.estado !== 1 || plan.estado_plan !== 'activo' || plan.tipo_plan !== 'continuo') {
+  if (!plan || plan.estado !== 1 || plan.estado_plan !== ESTADO_PLAN_ACTIVO || plan.tipo_plan !== 'continuo') {
     return null;
   }
   // `fechaServicioFinalizado` viene de `tbl_servicios_proyectos.fecha_programada`,
@@ -988,7 +985,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
  * el resumen del reporte. Devuelve también ascensor y tipo_servicio.
  */
 async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
-  const where = { estado: 1, estado_plan: 'activo' };
+  const where = { estado: 1, estado_plan: ESTADO_PLAN_ACTIVO };
   if (ids_cliente && ids_cliente.length > 0) where.id_cliente = { in: ids_cliente };
   if (ids_ascensor && ids_ascensor.length > 0) where.ascensores = { some: { estado: 1, id_ascensor: { in: ids_ascensor } } };
 
@@ -1203,70 +1200,137 @@ const exportar = async (req, res) => {
 };
 
 /**
+ * Reúne lo que se llevaría por delante el borrado de un plan: servicios
+ * generados (ejecutados vs. pendientes), dinero ya cobrado, facturas y eventos
+ * futuros aún sin materializar.
+ *
+ * Punto único de la verdad compartido por `impactoEliminacion` (el preview que
+ * alimenta el modal de confirmación) y `eliminar` (que ejecuta la cascada), para
+ * que lo que se le muestra al Super Admin no pueda divergir de lo que realmente
+ * se borra.
+ *
+ * @returns null si el plan no existe o ya está de baja.
+ */
+async function _calcularImpactoEliminacion(id) {
+  const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id } });
+  if (!plan || plan.estado === 0) return null;
+
+  const serviciosGenerados = await prisma.tbl_servicios_proyectos.findMany({
+    where: { id_mantenimiento_plan: id, estado: 1 },
+    include: { cobro: { include: { pagos: { where: { estado: 1 } } } } }
+  });
+  // Cobro ÚNICO del plan (la facturación es a nivel de plan, no por servicio).
+  const cobroPlan = await prisma.tbl_cobros.findFirst({
+    where: { id_mantenimiento_plan: id, estado: 1 },
+    include: { pagos: { where: { estado: 1 } } }
+  });
+
+  const ejecutados = serviciosGenerados.filter(s => estaServicioFinalizado(s.estado_servicio));
+
+  // Dinero real: abonos del cobro del plan + los de cobros por servicio (legacy).
+  const abonadoPlan = cobroPlan ? Number(cobroPlan.total_abonado || 0) : 0;
+  const abonadoServicios = serviciosGenerados
+    .reduce((acc, s) => acc + Number(s.cobro?.total_abonado || 0), 0);
+  const pagos = (cobroPlan?.pagos?.length || 0) +
+    serviciosGenerados.reduce((acc, s) => acc + (s.cobro?.pagos?.length || 0), 0);
+
+  const facturas = await prisma.tbl_facturas.count({
+    where: {
+      estado: 1,
+      OR: [
+        { id_mantenimiento_plan: id },
+        { id_servicio: { in: serviciosGenerados.map(s => s.id) } }
+      ]
+    }
+  });
+  // Eventos del plan que todavía no tienen servicio materializado: se cancelan
+  // sin pasar por la cascada de servicio, así que se cuentan aparte.
+  const eventosFuturos = await prisma.tbl_calendario_eventos.count({
+    where: { id_mantenimiento_plan: id, estado: 1, id_servicio: null }
+  });
+
+  return {
+    plan,
+    serviciosGenerados,
+    cobroPlan,
+    resumen: {
+      plan: { id: plan.id, estado_plan: plan.estado_plan },
+      servicios: {
+        total: serviciosGenerados.length,
+        ejecutados: ejecutados.length,
+        pendientes: serviciosGenerados.length - ejecutados.length,
+        codigos_ejecutados: ejecutados.map(s => s.codigo).filter(Boolean)
+      },
+      cobros: {
+        total_abonado: Number((abonadoPlan + abonadoServicios).toFixed(2)),
+        // La moneda sale del cobro real (nunca se asume): la del cobro del plan
+        // o, si no hay, la del primer cobro por servicio.
+        moneda: cobroPlan?.moneda || serviciosGenerados.find(s => s.cobro)?.cobro?.moneda || null,
+        pagos,
+        facturas
+      },
+      eventos: { futuros: eventosFuturos }
+    }
+  };
+}
+
+/**
+ * Preview del borrado en cascada de un plan. Solo lectura, sin efectos.
+ *
+ * El modal de confirmación lo consulta al abrirse para que el Super Admin vea
+ * cuántos mantenimientos ejecutados y cuánto dinero cobrado se va a dar de baja
+ * ANTES de escribir la palabra clave.
+ */
+const impactoEliminacion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const impacto = await _calcularImpactoEliminacion(id);
+    if (!impacto) return res.status(404).json({ error: 'Plan no encontrado' });
+    res.json({ data: impacto.resumen });
+  } catch (err) {
+    console.error('[mantenimientos.impactoEliminacion]', err);
+    res.status(500).json({ error: 'Error al calcular el impacto: ' + err.message });
+  }
+};
+
+/**
  * Soft-delete de un plan de mantenimiento (estado = 0). Solo Super Admin.
  *
- * BLOQUEO: no se permite borrar si alguno de los servicios generados por el
- * plan ya fue ejecutado (finalizado) o ya tiene abonos registrados — eso
- * borraría historial operativo o ingresos reales. En ese caso el SA debe
- * gestionar/anular esas instancias primero.
+ * Da de baja TODO en cascada, sin excepción: cada servicio generado —incluidos
+ * los ya ejecutados y los que tienen abonos— vía el motor de reversión, el cobro
+ * único del plan con su cadena (cuotas, pagos, recordatorios, facturas), TODOS
+ * los eventos de calendario del plan (incluidos los futuros aún sin servicio
+ * materializado), sus recordatorios y la junction de ascensores.
  *
- * Si está limpio: da de baja en cascada cada servicio generado (pendiente) vía
- * el motor de reversión, cancela TODOS los eventos de calendario del plan
- * (incluidos los futuros aún sin servicio materializado), descarta sus
- * recordatorios, purga Wasabi y libera técnicos. Queda auditado y recuperable.
+ * Los archivos de Wasabi NO se purgan: se da de baja la fila de `tbl_archivos`
+ * (dejan de verse en la operación) pero el objeto sobrevive en el bucket, para
+ * que el borrado sea realmente reversible y no se destruya evidencia de trabajo
+ * ya ejecutado ni respaldo contable. El resto de módulos conserva su purga.
+ *
+ * ADVERTENCIA: los abonos y facturas pasan a estado 0, con lo que ese ingreso
+ * desaparece de los reportes contables. Por eso el modal exige confirmación con
+ * el monto a la vista (ver `impactoEliminacion`). Queda auditado y recuperable.
  */
 const eliminar = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id } });
-    if (!plan || plan.estado === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    const impacto = await _calcularImpactoEliminacion(id);
+    if (!impacto) return res.status(404).json({ error: 'Plan no encontrado' });
+    const { plan, serviciosGenerados, cobroPlan } = impacto;
 
-    const serviciosGenerados = await prisma.tbl_servicios_proyectos.findMany({
-      where: { id_mantenimiento_plan: id, estado: 1 },
-      include: { cobro: { include: { pagos: { where: { estado: 1 } } } } }
-    });
-    // Cobro ÚNICO del plan (la facturación es a nivel de plan, no por servicio).
-    const cobroPlan = await prisma.tbl_cobros.findFirst({
-      where: { id_mantenimiento_plan: id, estado: 1 },
-      include: { pagos: { where: { estado: 1 } } }
-    });
-
-    // Bloqueo por servicios ejecutados.
-    const ejecutado = serviciosGenerados.find(s => estaServicioFinalizado(s.estado_servicio));
-    if (ejecutado) {
-      return res.status(409).json({
-        error: `No se puede eliminar el plan: el servicio ${ejecutado.codigo} ya fue ejecutado. Gestione esa instancia antes de borrar el plan.`
-      });
-    }
-    // Bloqueo por abonos: en el cobro del plan o (legacy) en algún cobro por servicio.
-    if (cobroPlan && (Number(cobroPlan.total_abonado) > 0 || (cobroPlan.pagos || []).length > 0)) {
-      return res.status(409).json({
-        error: 'No se puede eliminar el plan: su cobro ya tiene abonos registrados. Gestione el cobro antes de borrar el plan.'
-      });
-    }
-    const cobrado = serviciosGenerados.find(s =>
-      s.cobro && (Number(s.cobro.total_abonado) > 0 || (s.cobro.pagos || []).length > 0));
-    if (cobrado) {
-      return res.status(409).json({
-        error: `No se puede eliminar el plan: el servicio ${cobrado.codigo} ya tiene abonos registrados. Gestione el cobro antes de borrar el plan.`
-      });
-    }
-
-    const wasabiKeys = [];
     const tecnicoIds = [];
     await prisma.$transaction(async (tx) => {
       const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
 
       for (const s of serviciosGenerados) {
         const r = await bajaServicioCascadaEnTx(tx, s.id, req.user.id);
-        wasabiKeys.push(...r.wasabiKeys);
         tecnicoIds.push(...r.tecnicoIds);
       }
 
       // Eventos de calendario del plan: incluye los futuros aún sin id_servicio.
       await tx.tbl_calendario_eventos.updateMany({
         where: { id_mantenimiento_plan: id, estado: 1 },
-        data: { estado: 0, estado_evento: 'cancelado', ...stamp }
+        data: { estado: 0, estado_evento: ESTADO_EVENTO_CANCELADO, ...stamp }
       });
       await tx.tbl_recordatorios.updateMany({
         where: { id_mantenimiento_plan: id, estado: 1 },
@@ -1280,13 +1344,12 @@ const eliminar = async (req, res) => {
       });
 
       // Cobro único del plan + su cadena (cuotas, pagos, recordatorios, facturas).
-      // Sin abonos (bloqueado arriba), así que no hay comprobantes de pago que purgar;
-      // sí se purgan los PDF de factura del plan si los hubiera.
+      // Los abonos, si los hay, se dan de baja con el resto. Los PDF de factura
+      // se desvinculan (fila de archivo a estado 0) pero NO se purgan del bucket.
       if (cobroPlan) {
         const facturasPlan = await tx.tbl_facturas.findMany({ where: { id_mantenimiento_plan: id, estado: 1 } });
         for (const f of facturasPlan) {
-          const key = await bajaArchivoEnTx(tx, f.id_archivo, req.user.id);
-          if (key) wasabiKeys.push(key);
+          await bajaArchivoEnTx(tx, f.id_archivo, req.user.id);
         }
         await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
         await tx.tbl_pagos.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
@@ -1297,7 +1360,7 @@ const eliminar = async (req, res) => {
 
       const planActualizado = await tx.tbl_mantenimientos_planes.update({
         where: { id },
-        data: { estado: 0, estado_plan: 'cancelado', ...stamp }
+        data: { estado: 0, estado_plan: ESTADO_PLAN_CANCELADO, ...stamp }
       });
       await registrarAuditoria({
         id_usuario: req.user.id, entidad: 'tbl_mantenimientos_planes', id_entidad: id,
@@ -1305,10 +1368,11 @@ const eliminar = async (req, res) => {
       });
     });
 
-    await purgarObjetosWasabi(wasabiKeys);
+    // Sin purga de Wasabi: los objetos quedan en el bucket para que el borrado
+    // sea reversible (ver cabecera). Solo se liberan los técnicos asignados.
     await liberarTecnicos(tecnicoIds, -1);
 
-    res.json({ ok: true });
+    res.json({ ok: true, impacto: impacto.resumen });
   } catch (err) {
     console.error('[mantenimientos.eliminar]', err);
     res.status(500).json({ error: 'Error al eliminar plan: ' + err.message });
@@ -1317,7 +1381,8 @@ const eliminar = async (req, res) => {
 
 module.exports = {
   listar, crear, actualizar, materializarEvento, listarFrecuencias,
-  materializarSiguienteEventoDelPlan, listarInstancias, exportar, eliminar,
+  materializarSiguienteEventoDelPlan, listarInstancias, exportar,
+  impactoEliminacion, eliminar,
   // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
   // para no duplicar la lógica de instancias + proyecciones por rango de fechas.
   construirDatasetReporteMantenimientos: _construirDatasetReporte

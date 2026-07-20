@@ -811,12 +811,7 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
       include: {
         mantenimiento_plan: {
           include: {
-            cliente: {
-              select: {
-                id: true, nombre: true,
-                precios: { where: { estado: 1 }, select: { id_tipo_servicio: true, precio: true, moneda: true } }
-              }
-            },
+            cliente: { select: { id: true, nombre: true } },
             ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
             tipo_servicio: { select: { id: true, nombre: true } }
           }
@@ -829,7 +824,11 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
       const plan = e.mantenimiento_plan;
       const fecha = e.fecha_inicio;
       const vencido = fecha && new Date(fecha) < hoy;
-      const precioCfg = plan?.cliente?.precios?.find(p => p.id_tipo_servicio === plan.id_tipo_servicio) || null;
+      // El precio del evento = suma de los montos por ascensor del plan (cada
+      // monto es el precio configurado del ascensor al crear el plan).
+      const montos = (plan?.ascensores || []).map(a => Number(a.monto || 0));
+      const precioPlan = montos.length ? montos.reduce((acc, m) => acc + m, 0) : null;
+      const monedaPlan = plan?.ascensores?.[0]?.moneda || 'PEN';
       // El plan cubre N ascensores; se muestran sus códigos/ubicaciones unidos.
       const ascs = (plan?.ascensores || []).map(a => a.ascensor).filter(Boolean);
       const ascensor = ascs.length
@@ -843,8 +842,8 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
         cliente: plan?.cliente ? { id: plan.cliente.id, nombre: plan.cliente.nombre } : null,
         ascensor,
         tipo_servicio: plan?.tipo_servicio || null,
-        precio: precioCfg ? Number(precioCfg.precio) : null,
-        moneda: precioCfg?.moneda || 'PEN',
+        precio: precioPlan,
+        moneda: monedaPlan,
         titulo: e.titulo,
         tipo_plan: plan?.tipo_plan || null,
         frecuencia: plan?.frecuencia || null

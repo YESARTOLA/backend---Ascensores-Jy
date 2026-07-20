@@ -26,12 +26,12 @@ function fechaISO(d) {
   return new Date(d).toISOString().slice(0, 10);
 }
 
-function estadoContrato(c, hoyISO) {
-  if (!c.contrato_inicio || !c.contrato_fin) return 'Sin contrato';
-  const fin = String(c.contrato_fin).slice(0, 10);
-  const inicio = String(c.contrato_inicio).slice(0, 10);
-  if (fin < hoyISO) return 'Vencido';
-  if (inicio > hoyISO) return 'Pendiente';
+function estadoContratoArea(inicio, fin, hoyISO) {
+  if (!inicio || !fin) return 'Sin contrato';
+  const f = String(fin).slice(0, 10);
+  const i = String(inicio).slice(0, 10);
+  if (f < hoyISO) return 'Vencido';
+  if (i > hoyISO) return 'Pendiente';
   return 'Vigente';
 }
 
@@ -48,10 +48,14 @@ const COLUMNAS = [
   { header: 'Contacto principal',     key: 'contacto_principal',     width: 30 },
   { header: 'Contacto cobranzas',     key: 'contacto_cobranzas',     width: 30 },
   { header: 'Contacto administrativo',key: 'contacto_admin',         width: 30 },
-  { header: 'Inicio contrato',        key: 'contrato_inicio',        width: 13 },
-  { header: 'Fin contrato',           key: 'contrato_fin',           width: 13 },
-  { header: 'Estado contrato',        key: 'estado_contrato',        width: 14 },
-  { header: 'Contrato adjunto',       key: 'contrato_adjunto',       width: 18 },
+  { header: 'Serv. inicio contrato',  key: 'serv_inicio',            width: 15 },
+  { header: 'Serv. fin contrato',     key: 'serv_fin',               width: 15 },
+  { header: 'Serv. estado',           key: 'serv_estado',            width: 12 },
+  { header: 'Serv. contrato adjunto', key: 'serv_adjunto',           width: 20 },
+  { header: 'Proy. inicio contrato',  key: 'proy_inicio',            width: 15 },
+  { header: 'Proy. fin contrato',     key: 'proy_fin',               width: 15 },
+  { header: 'Proy. estado',           key: 'proy_estado',            width: 12 },
+  { header: 'Proy. contrato adjunto', key: 'proy_adjunto',           width: 20 },
   { header: 'Adjuntos',               key: 'adjuntos',               width: 10 },
   { header: 'Ascensores',             key: 'ascensores',             width: 11 },
   { header: 'Servicios',              key: 'servicios',              width: 10 },
@@ -79,10 +83,14 @@ function mapearFila(c, hoyISO) {
     contacto_principal: formateaContacto(c.contacto_principal_nombre, c.contacto_principal_correo, c.contacto_principal_telefono),
     contacto_cobranzas: formateaContacto(c.contacto_cobranzas_nombre, c.contacto_cobranzas_correo, c.contacto_cobranzas_telefono),
     contacto_admin: formateaContacto(c.contacto_admin_nombre, c.contacto_admin_correo, c.contacto_admin_telefono),
-    contrato_inicio: fechaISO(c.contrato_inicio),
-    contrato_fin: fechaISO(c.contrato_fin),
-    estado_contrato: estadoContrato(c, hoyISO),
-    contrato_adjunto: c.archivo_contrato?.nombre_original || '',
+    serv_inicio: fechaISO(c.contrato_servicio_inicio),
+    serv_fin: fechaISO(c.contrato_servicio_fin),
+    serv_estado: estadoContratoArea(c.contrato_servicio_inicio, c.contrato_servicio_fin, hoyISO),
+    serv_adjunto: c.archivo_contrato_servicio?.nombre_original || '',
+    proy_inicio: fechaISO(c.contrato_proyecto_inicio),
+    proy_fin: fechaISO(c.contrato_proyecto_fin),
+    proy_estado: estadoContratoArea(c.contrato_proyecto_inicio, c.contrato_proyecto_fin, hoyISO),
+    proy_adjunto: c.archivo_contrato_proyecto?.nombre_original || '',
     adjuntos: c._count?.archivos ?? (Array.isArray(c.archivos) ? c.archivos.length : 0),
     ascensores: edificios.reduce((n, e) => n + (e._count?.ascensores ?? 0), 0),
     servicios: c._count?.servicios ?? 0,
@@ -190,9 +198,8 @@ async function generarPdfClientes(clientes) {
     { titulo: 'Teléfono',         key: 'telefono',               w: 60 },
     { titulo: 'Distritos',        key: 'distritos',              w: 55 },
     { titulo: 'Contacto princ.',  key: 'contacto_principal',     w: 100 },
-    { titulo: 'Inicio',           key: 'contrato_inicio',        w: 50 },
-    { titulo: 'Fin',              key: 'contrato_fin',           w: 50 },
-    { titulo: 'Estado',           key: 'estado_contrato',        w: 55 },
+    { titulo: 'Contrato Serv.',   key: 'serv_estado',            w: 60 },
+    { titulo: 'Contrato Proy.',   key: 'proy_estado',            w: 60 },
     { titulo: 'Asc.',             key: 'ascensores',             w: 30, align: 'right' },
     { titulo: 'Svc.',             key: 'servicios',              w: 30, align: 'right' }
   ];

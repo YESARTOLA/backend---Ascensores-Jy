@@ -18,6 +18,7 @@
  */
 
 const prismaDefault = require('../config/prisma');
+const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 const { combinarFechaHoraLima } = require('./tiempo');
 const { colorPorTipo } = require('./visibilidadCalendario');
 
@@ -203,7 +204,7 @@ async function sincronizarDiasYEventos(db, idServicio, { userId = null, confirma
           titulo,
           tipo_evento: tipoBase,
           fecha_inicio: fechaInicio,
-          estado_evento: 'programado',
+          estado_evento: ESTADO_EVENTO_PROGRAMADO,
           color: colorBase
         }
       });
@@ -216,7 +217,7 @@ async function sincronizarDiasYEventos(db, idServicio, { userId = null, confirma
   for (const e of sobrantesEventos) {
     await db.tbl_calendario_eventos.update({
       where: { id: e.id },
-      data: { estado: 0, estado_evento: 'cancelado', ...stamp }
+      data: { estado: 0, estado_evento: ESTADO_EVENTO_CANCELADO, ...stamp }
     });
   }
 

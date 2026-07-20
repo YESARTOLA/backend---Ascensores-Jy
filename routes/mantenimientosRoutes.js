@@ -20,6 +20,9 @@ router.post(
   permitirRoles('super_admin', 'admin', 'coordinador'),
   c.materializarEvento
 );
+// Preview del borrado en cascada (solo lectura). Mismo rol que el DELETE: lo
+// consulta el modal de confirmación para mostrar el impacto real antes de borrar.
+router.get('/:id/impacto-eliminacion', permitirRoles('super_admin'), c.impactoEliminacion);
 router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 module.exports = router;

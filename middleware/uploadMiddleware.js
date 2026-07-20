@@ -20,6 +20,7 @@ const TIPOS_VALIDOS = new Set([
   'ot',
   'clientes',           // adjuntos libres del expediente del cliente
   'observaciones',      // adjuntos de tbl_servicios_observaciones
+  'emergencias',        // fotos/videos de contexto de tbl_emergencias_archivos
   'informes-servicio',  // PDFs auto-generados por checklist de finalización
   'documents'
 ]);

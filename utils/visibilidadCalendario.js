@@ -8,16 +8,20 @@
  *     - 'ninguno'   → no se consultan eventos operativos
  *
  * - `tipos_recordatorio`: subconjunto de `tbl_recordatorios.tipo` visibles.
- *   Valores posibles: 'servicio', 'mantenimiento', 'emergencia', 'cobro'.
+ *   Incluye 'manual' (recordatorios creados a mano por el usuario) para los
+ *   roles que gestionan la agenda; sin él quedarían invisibles en lista y mes.
+ *   NO incluye 'servicio': ese tipo genérico es redundante con los módulos
+ *   específicos (emergencia, correctivo, mantenimiento, atención rápida), que ya
+ *   son servicios; sus recordatorios se ocultan en lista, mes y contadores.
  *
  * Espejado en `frontend/src/utils/visibilidadCalendario.js`.
  */
 const VISIBILIDAD_POR_ROL = {
-  super_admin:  { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
-  admin:        { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
-  coordinador:  { operativos: 'todos',     tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia', 'observacion', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
-  tecnico:      { operativos: 'asignados', tipos_recordatorio: ['servicio', 'mantenimiento', 'emergencia'] },
-  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] },
+  super_admin:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
+  admin:        { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'servicio_finalizado_aviso'] },
+  coordinador:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
+  tecnico:      { operativos: 'asignados', tipos_recordatorio: ['mantenimiento', 'emergencia'] },
+  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['manual', 'cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] },
   // La Vendedora ve TODA la agenda operativa (solo lectura) para validar la
   // disponibilidad de los técnicos al programar; sin recordatorios.
   vendedora:    { operativos: 'todos',     tipos_recordatorio: [] }

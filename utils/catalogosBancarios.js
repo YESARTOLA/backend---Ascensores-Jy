@@ -26,6 +26,10 @@ const METODOS_PAGO = [
 
 const TIPOS_CUENTA_CODIGOS = TIPOS_CUENTA.map(t => t.codigo);
 const MONEDAS_CODIGOS = MONEDAS.map(m => m.codigo);
+// Moneda por defecto de todo el sistema: la primera del catálogo. Cualquier
+// fallback de moneda debe leerse de aquí y no escribirse literal, para que
+// cambiar el catálogo no deje códigos sueltos regados por los controladores.
+const MONEDA_POR_DEFECTO = MONEDAS[0].codigo;
 const METODOS_PAGO_CODIGOS = METODOS_PAGO.map(m => m.codigo);
 const METODOS_REQUIEREN_CUENTA = METODOS_PAGO.filter(m => m.requiere_cuenta).map(m => m.codigo);
 
@@ -35,6 +39,7 @@ module.exports = {
   METODOS_PAGO,
   TIPOS_CUENTA_CODIGOS,
   MONEDAS_CODIGOS,
+  MONEDA_POR_DEFECTO,
   METODOS_PAGO_CODIGOS,
   METODOS_REQUIEREN_CUENTA
 };

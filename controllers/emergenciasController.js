@@ -1,7 +1,8 @@
 const prisma = require('../config/prisma');
+const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { hmLima, inicioDelDiaLima } = require('../utils/tiempo');
+const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioEmergencia, sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { paginar } = require('../utils/paginacion');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
@@ -12,13 +13,63 @@ const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/
 const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
 const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { keyDesdeRuta, eliminarObjeto } = require('../utils/storage');
+const {
+  INCLUDE_ADJUNTOS, COUNT_ADJUNTOS, MAX_ADJUNTOS,
+  vincularAdjuntosEnTx, bajaAdjuntosEnTx, puedeGestionar
+} = require('../utils/adjuntosEmergencia');
 
 const ROLES_PRECIO_EM = ['super_admin', 'admin', 'contabilidad'];
+
+/**
+ * Cláusula de visibilidad de emergencias para un usuario. Única fuente de verdad
+ * compartida por el listado y por los endpoints de adjuntos, para que un técnico
+ * no pueda alcanzar por una vía lo que el listado le oculta por la otra.
+ */
+function whereEmergenciasVisibles(user) {
+  const where = { estado: 1 };
+  const filtroServicio = whereServicioAsignadoSiTecnico(user);
+  if (filtroServicio) where.servicio = filtroServicio;
+  // Oculta a roles distintos de super_admin las emergencias de edificios inactivos.
+  aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(user));
+  // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+  conAlcance(where, porAscensorEdificioWhere(user));
+  return where;
+}
+
+// Devuelve una emergencia por id con la misma forma que una fila del listado
+// (incluye servicio + ejecución). Lo consume el frontend para abrir el modal de
+// edición desde la página del servicio (ServicioDetalle → /emergencias?edit=ID).
+const obtener = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const em = await prisma.tbl_emergencias.findFirst({
+      where: { id, estado: 1 },
+      include: {
+        cliente: true,
+        ascensor: { include: { edificio: true } },
+        archivos: INCLUDE_ADJUNTOS,
+        servicio: {
+          include: {
+            asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+            historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } },
+            servicio_realizado: { select: { fecha_realizacion: true } }
+          }
+        }
+      }
+    });
+    if (!em) return res.status(404).json({ error: 'Emergencia no encontrada' });
+    res.json({ data: { ...em, ejecucion: derivarEjecucion(em.servicio) } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al obtener emergencia' });
+  }
+};
 
 const listar = async (req, res) => {
   try {
     const { estado_emergencia, nivel_urgencia, q } = req.query;
-    const where = { estado: 1 };
+    const where = whereEmergenciasVisibles(req.user);
     if (estado_emergencia) where.estado_emergencia = estado_emergencia;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
     // Buscador libre: edificio/obra, cliente, ascensor, distrito, motivo y código del servicio.
@@ -30,12 +81,6 @@ const listar = async (req, res) => {
       { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } },
       { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
     ];
-    const filtroServicio = whereServicioAsignadoSiTecnico(req.user);
-    if (filtroServicio) where.servicio = filtroServicio;
-    // Oculta a roles distintos de super_admin las emergencias de edificios inactivos.
-    aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(req.user));
-    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
-    conAlcance(where, porAscensorEdificioWhere(req.user));
     const result = await paginar(
       prisma.tbl_emergencias,
       {
@@ -43,6 +88,10 @@ const listar = async (req, res) => {
         include: {
           cliente: true,
           ascensor: { include: { edificio: true } },
+          // Solo el CONTADOR de adjuntos: la tabla pinta un chip con el número y
+          // el detalle se pide al abrir el modal. Traer las filas aquí cargaría
+          // los adjuntos de la página entera para nada.
+          _count: COUNT_ADJUNTOS,
           servicio: {
             include: {
               asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
@@ -71,17 +120,37 @@ const crear = async (req, res) => {
     if (!d.id_cliente || !d.id_ascensor || !d.motivo) {
       return res.status(400).json({ error: 'Cliente, ascensor y motivo son obligatorios' });
     }
+    // Un ascensor con la instalación cancelada no admite servicios.
+    const ascSel = await prisma.tbl_ascensores.findUnique({ where: { id: Number(d.id_ascensor) }, select: { estado_operativo: true } });
+    if (ascSel?.estado_operativo === 'Instalación cancelada') {
+      return res.status(400).json({ error: 'Este ascensor tiene la instalación cancelada y no admite servicios.' });
+    }
     const sinCobro = d.sin_cobro === true || d.sin_cobro === 1 || d.sin_cobro === '1';
     if (!sinCobro && (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')) {
       return res.status(400).json({ error: 'Precio obligatorio' });
     }
     const precioFinal = sinCobro ? 0 : d.precio_interno;
+    // Bandera persistida "requiere factura": default del módulo Emergencias = 0
+    // (sin factura). Editable desde el formulario de creación.
+    const requiereFactura = d.requiere_factura === undefined
+      ? 0
+      : (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0);
 
     const tecnicos = Array.isArray(d.tecnicos) ? d.tecnicos : [];
     const items_checklist = Array.isArray(d.items_checklist) ? d.items_checklist : [];
 
     const consistencia = validarConsistenciaAsignaciones(tecnicos);
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
+
+    // Fechas de agenda: el usuario elige la fecha programada (por defecto hoy) y,
+    // opcionalmente, una fecha estimada de término para que el servicio ocupe
+    // varios días en el calendario. Sin estimada, dura solo el día programado.
+    const fechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima();
+    const horaProgramada = d.hora_programada || hmLima();
+    const fechaEstimadaEntrega = d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null;
+    if (fechaEstimadaEntrega && fechaEstimadaEntrega < fechaProgramada) {
+      return res.status(400).json({ error: 'La fecha estimada de término no puede ser anterior a la fecha programada.' });
+    }
 
     const codigo = await generarCodigoServicio();
     // Subtipo vinculado al módulo Emergencias (SSoT). Sin él no se puede clasificar.
@@ -100,13 +169,15 @@ const crear = async (req, res) => {
         origen: 'emergencia',
         titulo: `Emergencia – ${d.motivo.substring(0, 80)}`,
         descripcion: d.motivo,
-        fecha_programada: inicioDelDiaLima(),
-        hora_programada: hmLima(),
+        fecha_programada: fechaProgramada,
+        hora_programada: horaProgramada,
+        fecha_estimada_entrega: fechaEstimadaEntrega,
         prioridad: d.nivel_urgencia || 'alta',
         estado_servicio: tecnicos.length > 0 ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado') : 'Pendiente',
         precio_interno: precioFinal,
         moneda: d.moneda || 'PEN',
         sin_cobro: sinCobro ? 1 : 0,
+        requiere_factura: requiereFactura,
         observaciones: d.observaciones || null,
         user_id_registration: req.user.id,
         ascensores: {
@@ -133,13 +204,18 @@ const crear = async (req, res) => {
       }
     });
 
+    // Adjuntos de contexto: el modal los sube a POST /archivos antes de guardar
+    // (la emergencia aún no existía) y manda aquí los ids resultantes.
+    await vincularAdjuntosEnTx(prisma, emergencia.id, d.archivos, req.user.id);
+
     await prisma.tbl_calendario_eventos.create({
       data: {
         id_servicio: servicio.id, id_emergencia: emergencia.id,
         titulo: `EMERGENCIA ${servicio.codigo}`,
         tipo_evento: 'emergencia',
-        fecha_inicio: new Date(),
-        estado_evento: 'programado',
+        fecha_inicio: combinarFechaHoraLima(fechaProgramada, horaProgramada),
+        fecha_fin: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null,
+        estado_evento: ESTADO_EVENTO_PROGRAMADO,
         color: '#dc2626'
       }
     });
@@ -228,7 +304,8 @@ const actualizar = async (req, res) => {
       d.sin_cobro !== undefined ||
       d.motivo !== undefined ||
       d.nivel_urgencia !== undefined ||
-      d.moneda !== undefined
+      d.moneda !== undefined ||
+      d.requiere_factura !== undefined
     );
     if (cambiaServicio && servicioPrevio && !esServicioEditable(servicioPrevio.estado_servicio)) {
       return res.status(409).json({
@@ -242,11 +319,28 @@ const actualizar = async (req, res) => {
       : servicioPrevio?.sin_cobro;
     const precioRecibido = d.precio_interno !== undefined ? Number(d.precio_interno) : null;
     const precioFinal = sinCobroNuevo === 1 ? 0 : (puedeCambiarPrecio && precioRecibido !== null ? precioRecibido : Number(servicioPrevio?.precio_interno || 0));
+    const requiereFacturaNuevo = d.requiere_factura !== undefined
+      ? (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0)
+      : servicioPrevio?.requiere_factura;
     const nuevoMotivo = d.motivo ?? previo.motivo;
     const nuevoNivel = d.nivel_urgencia ?? previo.nivel_urgencia;
     const nuevaMoneda = d.moneda ?? servicioPrevio?.moneda ?? 'PEN';
     const nuevoIdCliente = d.id_cliente ? Number(d.id_cliente) : (servicioPrevio?.id_cliente ?? previo.id_cliente);
     const nuevoIdAscensor = d.id_ascensor ? Number(d.id_ascensor) : (servicioPrevio?.id_ascensor ?? previo.id_ascensor);
+
+    // Fechas de agenda (opcionales en el payload: si no vienen, se conservan).
+    const nuevaFechaProgramada = d.fecha_programada !== undefined
+      ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
+      : servicioPrevio?.fecha_programada;
+    const nuevaHoraProgramada = d.hora_programada !== undefined
+      ? (d.hora_programada || null)
+      : servicioPrevio?.hora_programada;
+    const nuevaFechaEstimada = d.fecha_estimada_entrega !== undefined
+      ? (d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null)
+      : servicioPrevio?.fecha_estimada_entrega;
+    if (nuevaFechaProgramada && nuevaFechaEstimada && nuevaFechaEstimada < nuevaFechaProgramada) {
+      return res.status(400).json({ error: 'La fecha estimada de término no puede ser anterior a la fecha programada.' });
+    }
 
     // Validar que el ascensor pertenezca al cliente seleccionado
     if (cambiaServicio) {
@@ -285,6 +379,10 @@ const actualizar = async (req, res) => {
             precio_interno: precioFinal,
             moneda: nuevaMoneda,
             sin_cobro: sinCobroNuevo,
+            requiere_factura: requiereFacturaNuevo,
+            fecha_programada: nuevaFechaProgramada,
+            hora_programada: nuevaHoraProgramada,
+            fecha_estimada_entrega: nuevaFechaEstimada,
             observaciones: d.observaciones ?? servicioPrevio.observaciones,
             user_id_modification: req.user.id, date_time_modification: new Date()
           }
@@ -303,10 +401,15 @@ const actualizar = async (req, res) => {
           create: { id_servicio: servicioPrevio.id, id_ascensor: nuevoIdAscensor, monto: precioFinal, moneda: nuevaMoneda, user_id_registration: req.user.id }
         });
 
-        // Actualizar título del evento de calendario
+        // Actualizar título y rango de fechas del evento de calendario
         await tx.tbl_calendario_eventos.updateMany({
           where: { id_servicio: servicioPrevio.id, estado: 1 },
-          data: { titulo: `EMERGENCIA ${servicioPrevio.codigo}`, user_id_modification: req.user.id, date_time_modification: new Date() }
+          data: {
+            titulo: `EMERGENCIA ${servicioPrevio.codigo}`,
+            ...(nuevaFechaProgramada ? { fecha_inicio: combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada) } : {}),
+            fecha_fin: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null,
+            user_id_modification: req.user.id, date_time_modification: new Date()
+          }
         });
       }
       return em;
@@ -357,16 +460,21 @@ const eliminar = async (req, res) => {
       // emergencia (los que cuelgan del servicio los cubre la cascada).
       await tx.tbl_calendario_eventos.updateMany({
         where: { id_emergencia: id, estado: 1 },
-        data: { estado: 0, estado_evento: 'cancelado', user_id_modification: req.user.id, date_time_modification: new Date() }
+        data: { estado: 0, estado_evento: ESTADO_EVENTO_CANCELADO, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
       await tx.tbl_recordatorios.updateMany({
         where: { id_emergencia: id, estado: 1 },
         data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
 
+      // Adjuntos de contexto: cuelgan de la emergencia, no del servicio, así que
+      // la cascada de servicio no los alcanza. Sin esto quedarían huérfanos en
+      // el bucket.
+      wasabiKeys = await bajaAdjuntosEnTx(tx, id, req.user.id);
+
       if (idServicio) {
         const r = await bajaServicioCascadaEnTx(tx, idServicio, req.user.id);
-        wasabiKeys = r.wasabiKeys;
+        wasabiKeys = [...wasabiKeys, ...r.wasabiKeys];
         tecnicoIds = r.tecnicoIds;
       }
 
@@ -386,4 +494,107 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar, eliminar };
+// ---------------------------------------------------------------------
+// ADJUNTOS DE CONTEXTO (fotos / videos de la falla)
+//
+// Los carga quien reporta la emergencia para que el TÉCNICO asignado los revise
+// antes de salir a campo. Por eso LEER está abierto a cualquier rol que alcance
+// la emergencia —incluido el técnico, que es el destinatario— mientras que
+// ADJUNTAR y ELIMINAR quedan en los roles de gestión.
+// ---------------------------------------------------------------------
+
+/**
+ * Resuelve la emergencia aplicando la MISMA visibilidad que el listado. Devuelve
+ * null si el usuario no la alcanza (técnico no asignado, edificio fuera de su
+ * alcance, etc.), para responder 404 sin filtrar su existencia.
+ */
+async function emergenciaVisible(user, id) {
+  const where = whereEmergenciasVisibles(user);
+  return prisma.tbl_emergencias.findFirst({ where: { ...where, id }, select: { id: true } });
+}
+
+const listarArchivos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!await emergenciaVisible(req.user, id)) {
+      return res.status(404).json({ error: 'Emergencia no encontrada' });
+    }
+    const archivos = await prisma.tbl_emergencias_archivos.findMany({
+      ...INCLUDE_ADJUNTOS,
+      where: { ...INCLUDE_ADJUNTOS.where, id_emergencia: id }
+    });
+    res.json({ data: archivos, meta: { max: MAX_ADJUNTOS, puede_gestionar: puedeGestionar(req.user) } });
+  } catch (err) {
+    console.error('[emergencias.listarArchivos]', err);
+    res.status(500).json({ error: 'Error al listar los adjuntos' });
+  }
+};
+
+const agregarArchivos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!await emergenciaVisible(req.user, id)) {
+      return res.status(404).json({ error: 'Emergencia no encontrada' });
+    }
+    const creados = await vincularAdjuntosEnTx(prisma, id, req.body?.archivos, req.user.id);
+    if (creados === 0) return res.status(400).json({ error: 'No se recibió ningún archivo válido' });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_emergencias_archivos', id_entidad: id,
+      accion: 'CREATE', valor_nuevo: { id_emergencia: id, adjuntos: creados }, ip: req.ip
+    });
+
+    const archivos = await prisma.tbl_emergencias_archivos.findMany({
+      ...INCLUDE_ADJUNTOS,
+      where: { ...INCLUDE_ADJUNTOS.where, id_emergencia: id }
+    });
+    res.status(201).json({ data: archivos });
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[emergencias.agregarArchivos]', err);
+    res.status(500).json({ error: 'Error al adjuntar archivos' });
+  }
+};
+
+const eliminarArchivo = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const idVinculo = Number(req.params.idVinculo);
+    if (!await emergenciaVisible(req.user, id)) {
+      return res.status(404).json({ error: 'Emergencia no encontrada' });
+    }
+    const vinculo = await prisma.tbl_emergencias_archivos.findFirst({
+      where: { id: idVinculo, id_emergencia: id, estado: 1 },
+      include: { archivo: { select: { id: true, ruta_almacenamiento: true } } }
+    });
+    if (!vinculo) return res.status(404).json({ error: 'Adjunto no encontrado' });
+
+    const marca = { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() };
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_emergencias_archivos.update({ where: { id: idVinculo }, data: marca });
+      await tx.tbl_archivos.updateMany({ where: { id: vinculo.id_archivo, estado: 1 }, data: marca });
+    });
+
+    // Purga del bucket tras el commit: si falla, el registro ya quedó dado de
+    // baja y el objeto se limpia después — nunca al revés.
+    const key = vinculo.archivo?.ruta_almacenamiento ? keyDesdeRuta(vinculo.archivo.ruta_almacenamiento) : null;
+    if (key) {
+      try { await eliminarObjeto(key); }
+      catch (e) { console.warn('[emergencias.eliminarArchivo] no se pudo borrar del bucket:', e.message); }
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_emergencias_archivos', id_entidad: idVinculo,
+      accion: 'DELETE', valor_anterior: vinculo, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[emergencias.eliminarArchivo]', err);
+    res.status(500).json({ error: 'Error al eliminar el adjunto' });
+  }
+};
+
+module.exports = {
+  listar, obtener, crear, actualizar, eliminar,
+  listarArchivos, agregarArchivos, eliminarArchivo
+};
