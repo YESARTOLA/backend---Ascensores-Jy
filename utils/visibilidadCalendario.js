@@ -18,13 +18,16 @@
  */
 const VISIBILIDAD_POR_ROL = {
   super_admin:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
-  admin:        { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'servicio_finalizado_aviso'] },
-  coordinador:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
+  admin:        { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
+  coordinador:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
   tecnico:      { operativos: 'asignados', tipos_recordatorio: ['mantenimiento', 'emergencia'] },
-  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['manual', 'cobro', 'observacion_alerta', 'servicio_finalizado_facturar'] },
-  // La Vendedora ve TODA la agenda operativa (solo lectura) para validar la
-  // disponibilidad de los técnicos al programar; sin recordatorios.
-  vendedora:    { operativos: 'todos',     tipos_recordatorio: [] }
+  // Contabilidad recibe SOLO el aviso sin detalle (observacion_facturar), no la
+  // alerta con el texto/imagen (observacion_alerta).
+  contabilidad: { operativos: 'todos',     tipos_recordatorio: ['manual', 'cobro', 'observacion_facturar', 'servicio_finalizado_facturar'] },
+  // La Vendedora ve la agenda operativa (solo lectura) para validar la
+  // disponibilidad de los técnicos al programar y recibe la alerta de
+  // observación técnica (con detalle) para armar la cotización.
+  vendedora:    { operativos: 'todos',     tipos_recordatorio: ['observacion_alerta'] }
 };
 
 function incluyeOperativos(rol) {
@@ -53,6 +56,7 @@ const COLOR_POR_TIPO = {
   cobro: '#8b5cf6',
   observacion: '#f97316',
   observacion_alerta: '#dc2626',
+  observacion_facturar: '#0891b2',
   cotizacion_urgente: '#dc2626',
   servicio_finalizado_revisar: '#f59e0b',
   servicio_finalizado_facturar: '#8b5cf6',

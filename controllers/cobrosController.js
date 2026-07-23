@@ -126,6 +126,7 @@ const listar = async (req, res) => {
     const {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
       id_cliente, id_tecnico, id_tipo_servicio, id_proyecto,
+      tipo_categoria, situacion_cobro, banco,
       fecha_proximo_desde, fecha_proximo_hasta,
       orden, direccion
     } = req.query;
@@ -157,7 +158,7 @@ const listar = async (req, res) => {
           include: {
             tipo_servicio: true,
             cotizacion: { select: { id: true, codigo: true } },
-            ascensores: { where: { estado: 1 }, include: { ascensor: true } },
+            ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
             asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
             servicio_realizado: { include: { archivo_ot: true } }
           }
@@ -167,7 +168,7 @@ const listar = async (req, res) => {
         mantenimiento_plan: {
           include: {
             tipo_servicio: true,
-            ascensores: { where: { estado: 1 }, include: { ascensor: true } }
+            ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } }
           }
         },
         pagos: { where: { estado: 1 }, include: { cuenta_bancaria: true }, orderBy: { id: 'desc' } },
@@ -181,12 +182,45 @@ const listar = async (req, res) => {
 
     if (q) {
       const ql = q.toLowerCase();
+      // Buscador amplio: cliente, código/título del servicio, documento
+      // (RUC/DNI) y número/serie de factura (numero_factura tiene formato
+      // "F001-000123", por lo que un término de serie o de número coincide).
       data = data.filter(c =>
         c.cliente?.nombre?.toLowerCase().includes(ql) ||
         c.servicio?.codigo?.toLowerCase().includes(ql) ||
-        c.servicio?.titulo?.toLowerCase().includes(ql)
+        c.servicio?.titulo?.toLowerCase().includes(ql) ||
+        c.cliente?.numero_documento?.toLowerCase().includes(ql) ||
+        (c.facturas || []).some(f => f.numero_factura?.toLowerCase().includes(ql))
       );
     }
+    // Filtro por tipo de servicio: correctivo | preventivo (mantenimiento, incluye
+    // cobros de plan) | proyecto.
+    if (tipo_categoria) {
+      data = data.filter(c => {
+        const modulo = c.servicio?.tipo_servicio?.modulo_asociado;
+        if (tipo_categoria === 'proyecto') return c.servicio?.tipo_registro === 'proyecto';
+        if (tipo_categoria === 'correctivo') return modulo === 'correctivo';
+        if (tipo_categoria === 'preventivo') return modulo === 'mantenimiento' || (!c.servicio && !!c.mantenimiento_plan);
+        return true;
+      });
+    }
+    // Filtro por banco: cobros con al menos un pago recibido en una cuenta de ese banco.
+    if (banco) {
+      data = data.filter(c => (c.pagos || []).some(p => p.cuenta_bancaria?.banco === banco));
+    }
+    // Filtro de situación de cobro (opciones consolidadas).
+    if (situacion_cobro) {
+      data = data.filter(c => {
+        const saldo = aCentavos(c.saldo_pendiente);
+        const abonado = aCentavos(c.total_abonado);
+        if (situacion_cobro === 'cancelado') return saldo === 0;
+        if (situacion_cobro === 'parcial') return abonado > 0 && saldo > 0;
+        if (situacion_cobro === 'vencido') return c.vencido;
+        if (situacion_cobro === 'pendiente') return saldo > 0 && abonado === 0;
+        return true;
+      });
+    }
+    // Filtros legacy (compatibilidad; la UI ahora usa `situacion_cobro`).
     if (vencidos === '1') data = data.filter(c => c.vencido);
     if (en_mora === '1') data = data.filter(c => c.dias_mora > 0);
     if (pagados === '1') data = data.filter(c => Number(c.saldo_pendiente) === 0);

@@ -15,7 +15,7 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { esServicioPostRevision } = require('../utils/estadoServicio');
-const { sincronizarRecordatorioObservaciones, crearAlertaObservacion, descartarAlertaObservacion } = require('../utils/recordatoriosAuto');
+const { sincronizarRecordatorioObservaciones, crearAlertaObservacion, descartarAlertaObservacion, sincronizarRecordatorioCotizacionUrgente } = require('../utils/recordatoriosAuto');
 
 const ROLES_ATIENDEN = ['super_admin', 'admin', 'coordinador'];
 const ROLES_ADMIN = ['super_admin', 'admin'];
@@ -30,6 +30,11 @@ async function tecnicoEstaAsignado(idServicio, idTecnico) {
 
 const listar = async (req, res) => {
   try {
+    // Contabilidad no ve las observaciones técnicas (ni comentario ni imagen):
+    // recibe únicamente el aviso de facturación por recordatorios.
+    if (req.user.rol_codigo === 'contabilidad') {
+      return res.status(403).json({ error: 'No autorizado para ver observaciones técnicas' });
+    }
     const idServicio = Number(req.params.idServicio);
     const observaciones = await prisma.tbl_servicios_observaciones.findMany({
       where: { id_servicio: idServicio, estado: 1 },
@@ -120,6 +125,8 @@ const crear = async (req, res) => {
 
     sincronizarRecordatorioObservaciones(idServicio).catch(err =>
       console.error('Sync rec observacion:', err));
+    sincronizarRecordatorioCotizacionUrgente(idServicio).catch(err =>
+      console.error('Sync cotizacion urgente:', err));
     if (generaAlerta === 1) {
       crearAlertaObservacion(obs.id).catch(err =>
         console.error('Crear alerta observacion:', err));
@@ -185,6 +192,8 @@ const eliminar = async (req, res) => {
     });
     sincronizarRecordatorioObservaciones(previa.id_servicio).catch(err =>
       console.error('Sync rec observacion:', err));
+    sincronizarRecordatorioCotizacionUrgente(previa.id_servicio).catch(err =>
+      console.error('Sync cotizacion urgente:', err));
     descartarAlertaObservacion(previa.id).catch(err =>
       console.error('Descartar alerta observacion:', err));
     res.json({ ok: true });

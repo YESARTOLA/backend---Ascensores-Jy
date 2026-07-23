@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
-const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeFecha, finDelDiaLima } = require('../utils/tiempo');
+const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeFecha, finDelDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, COLORES } = require('../utils/recordatoriosAuto');
 const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
@@ -975,7 +975,24 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
       return campos.some(s => s && String(s).toLowerCase().includes(ql));
     });
   }
-  todas.sort((a, b) => new Date(b.fecha_programada) - new Date(a.fecha_programada));
+  // Orden por fecha PROGRAMADA centrado en HOY (Lima): primero los mantenimientos
+  // de hoy en adelante ascendente (el más próximo arriba), luego los ya pasados
+  // descendente (el más reciente primero). Los sin fecha van al final. Antes se
+  // ordenaba solo descendente, lo que empujaba arriba fechas lejanas (p.ej. 2029)
+  // y escondía el próximo mantenimiento a ejecutar.
+  const hoyMs = inicioDelDiaLima().getTime();
+  const clasificar = (i) => {
+    if (!i.fecha_programada) return { grupo: 2, t: 0 };            // sin fecha: al final
+    const t = new Date(i.fecha_programada).getTime();
+    return { grupo: t >= hoyMs ? 0 : 1, t };                        // 0 = hoy en adelante, 1 = pasado
+  };
+  todas.sort((a, b) => {
+    const ca = clasificar(a), cb = clasificar(b);
+    if (ca.grupo !== cb.grupo) return ca.grupo - cb.grupo;
+    if (ca.grupo === 0) return ca.t - cb.t;                         // próximos: ascendente
+    if (ca.grupo === 1) return cb.t - ca.t;                         // pasados: descendente
+    return 0;
+  });
   return todas;
 }
 

@@ -574,6 +574,10 @@ model tbl_servicios_evidencias {
   id_archivo             Int?
   tipo_evidencia         String                  @default("Foto") @db.VarChar(30)
   descripcion            String?
+  // Momento de la evidencia dentro del trabajo: "Antes" o "Despues". NULL para
+  // evidencias sin clasificar (legado, fotos de ítem del checklist o del cierre):
+  // en la UI se muestran junto a las de "Despues".
+  momento                String?                 @db.VarChar(10)
   latitud                Decimal?                @db.Decimal(10, 7)
   longitud               Decimal?                @db.Decimal(10, 7)
   fecha_carga            DateTime                @default(now()) @db.Timestamptz(6)
@@ -1227,6 +1231,11 @@ model tbl_cotizaciones {
   // (si el padre es SERVICIOS) o queda descriptivo (si el padre es PROYECTOS).
   id_subtipo_servicio    Int
   descripcion            String?
+  // Servicio EXISTENTE al que se adjunta el cobro al APROBAR, sin crear un
+  // servicio/proyecto nuevo ni replicar en módulo (p.ej. cotización de cobro de
+  // una emergencia ya atendida). Escalar (sin relación Prisma) para no colisionar
+  // con la relación `servicios` existente vía id_cotizacion. NULL = flujo normal.
+  id_servicio_cobro      Int?
   estado_global          String                       @default("Cotizado") @db.VarChar(30)
   version_activa         Int                          @default(1)
   estado                 Int                          @default(1)
@@ -1247,6 +1256,7 @@ model tbl_cotizaciones {
   @@index([id_cliente])
   @@index([estado_global])
   @@index([codigo])
+  @@index([id_servicio_cobro])
 }
 
 model tbl_cotizaciones_archivos {

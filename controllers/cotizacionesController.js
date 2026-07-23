@@ -9,6 +9,7 @@ const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
@@ -37,7 +38,9 @@ const {
   ESTADOS_VERSION,
   ESTADO_GLOBAL,
   ESTADOS_GLOBALES,
-  ESTADOS_VERSION_LISTA
+  ESTADOS_VERSION_LISTA,
+  FILTROS_GLOBALES,
+  resolverFiltroGlobal
 } = require('../utils/estadoCotizacion');
 
 function puedeVer(req) {
@@ -200,7 +203,14 @@ const listar = async (req, res) => {
       // Código de servicio generado por la cotización (cuando ya fue aprobada)
       { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
     ] });
-    if (estado_global) and.push({ estado_global });
+    // El filtro acepta un estado_global exacto o un filtro virtual ('Aprobadas')
+    // que agrupa todas las etapas posteriores a la aceptación. Sin esto, una
+    // cotización aceptada desaparecía del filtro 'Aceptado' apenas su servicio
+    // pasaba a ejecución (estado_global → 'Ejecución').
+    if (estado_global) {
+      const estadosVirtual = resolverFiltroGlobal(estado_global);
+      and.push(estadosVirtual ? { estado_global: { in: estadosVirtual } } : { estado_global });
+    }
     if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
     if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
     if (desde || hasta) {
@@ -409,6 +419,122 @@ const desdeObservaciones = async (req, res) => {
   }
 };
 
+/**
+ * Valida que el servicio de una emergencia YA ATENDIDA pueda recibir un cobro vía
+ * cotización de "cobro sobre servicio existente" (sin crear servicio nuevo).
+ * Punto único usado por el prellenado (`desdeEmergencia`), por `crear` (al fijar
+ * id_servicio_cobro) y por `aprobar` (al generar el cobro).
+ *
+ * Exige: emergencia activa; su servicio activo, finalizado y no cancelado; sin un
+ * cobro con movimiento (nada abonado ni facturado); y que el servicio no esté ya
+ * ligado a otra cotización (ni tenga una cotización de cobro activa en curso).
+ *
+ * @returns {{ error: string }} o {{ emergencia, servicio, cobro }}
+ */
+async function _resolverEmergenciaCobrable(tx, idEmergenciaCrudo) {
+  const idEmergencia = Number(idEmergenciaCrudo);
+  if (!Number.isInteger(idEmergencia) || idEmergencia <= 0) {
+    return { error: 'Emergencia inválida' };
+  }
+  const emergencia = await tx.tbl_emergencias.findUnique({
+    where: { id: idEmergencia },
+    include: {
+      cliente: { select: { id: true, nombre: true } },
+      ascensor: { select: { id: true, codigo: true, tipo: true, ubicacion: true } },
+      archivos: {
+        where: { estado: 1 },
+        orderBy: { orden: 'asc' },
+        include: { archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } }
+      }
+    }
+  });
+  if (!emergencia || emergencia.estado !== 1) return { error: 'La emergencia no existe o fue eliminada' };
+  if (!emergencia.id_servicio) return { error: 'La emergencia no tiene un servicio asociado' };
+
+  const servicio = await tx.tbl_servicios_proyectos.findUnique({
+    where: { id: emergencia.id_servicio },
+    include: { tipo_servicio: { include: { padre: true } } }
+  });
+  if (!servicio || servicio.estado !== 1) return { error: 'El servicio de la emergencia no existe o fue eliminado' };
+  if (servicio.estado_servicio === 'Cancelado') return { error: 'El servicio de la emergencia está cancelado' };
+  if (!estaServicioFinalizado(servicio.estado_servicio)) {
+    return { error: 'Solo se puede cotizar una emergencia cuyo servicio ya fue finalizado por el técnico' };
+  }
+
+  // No debe estar ya cotizada: ni el servicio ligado a una cotización, ni una
+  // cotización de cobro activa (no anulada) apuntando a este servicio.
+  if (servicio.id_cotizacion) {
+    const cotLigada = await tx.tbl_cotizaciones.findFirst({
+      where: { id: servicio.id_cotizacion }, select: { codigo: true }
+    });
+    return { error: `El servicio ya está ligado a la cotización ${cotLigada?.codigo || ''}`.trim() };
+  }
+  const cobroCotActiva = await tx.tbl_cotizaciones.findFirst({
+    where: { id_servicio_cobro: servicio.id, estado: 1, estado_global: { not: ESTADO_GLOBAL.ANULADO } },
+    select: { codigo: true }
+  });
+  if (cobroCotActiva) {
+    return { error: `Ya existe una cotización de cobro (${cobroCotActiva.codigo}) para esta emergencia` };
+  }
+
+  // Un cobro con movimiento (abonos o facturas) bloquea: no se puede regenerar.
+  const cobro = await tx.tbl_cobros.findFirst({
+    where: { id_servicio: servicio.id, estado: 1 },
+    include: { cuotas: { where: { estado: 1 }, include: { facturas: { where: { estado: 1 } } } } }
+  });
+  if (cobro) {
+    const conMovimiento = Number(cobro.total_abonado || 0) > 0
+      || (cobro.cuotas || []).some(c => Number(c.monto_pagado || 0) > 0 || (c.facturas || []).length > 0);
+    if (conMovimiento) {
+      return { error: 'El servicio de la emergencia ya tiene un cobro con abonos o facturas — no se puede regenerar' };
+    }
+  }
+
+  return { emergencia, servicio, cobro };
+}
+
+/**
+ * Prellenado de una cotización a partir de una emergencia ya atendida. Devuelve el
+ * cliente, el ascensor, el subtipo del servicio de la emergencia y un ítem con el
+ * motivo (y, si hay, la primera foto adjunta de la emergencia). El front lo usa
+ * para abrir el modal de nueva cotización en modo "cobro de servicio existente".
+ */
+const desdeEmergencia = async (req, res) => {
+  try {
+    if (!puedeEditar(req)) return res.status(403).json({ error: 'No autorizado' });
+    const resultado = await _resolverEmergenciaCobrable(prisma, req.query.id);
+    if (resultado.error) return res.status(400).json({ error: resultado.error });
+    const { emergencia, servicio } = resultado;
+
+    // Foto sugerida para el ítem: primer adjunto de imagen de la emergencia.
+    const fotoAdjunta = emergencia.archivos
+      .map(a => a.archivo)
+      .find(a => a && (a.mime_type || '').startsWith('image/')) || null;
+
+    res.json({
+      data: {
+        id_emergencia: emergencia.id,
+        id_cliente: servicio.id_cliente,
+        id_servicio_cobro: servicio.id,
+        codigo_servicio: servicio.codigo,
+        // El servicio referencia el SUBTIPO; su padre es la categoría funcional.
+        id_subtipo_servicio: servicio.id_tipo_servicio,
+        id_tipo_servicio: servicio.tipo_servicio?.id_padre || null,
+        ascensor: emergencia.ascensor,
+        moneda: servicio.moneda,
+        item: {
+          descripcion: emergencia.motivo,
+          id_archivo: fotoAdjunta?.id || null,
+          archivo: fotoAdjunta
+        }
+      }
+    });
+  } catch (err) {
+    console.error('[cotizaciones.desdeEmergencia]', err);
+    res.status(500).json({ error: 'Error al preparar la cotización: ' + err.message });
+  }
+};
+
 const crear = async (req, res) => {
   try {
     if (!puedeEditar(req)) return res.status(403).json({ error: 'No autorizado' });
@@ -506,6 +632,19 @@ const crear = async (req, res) => {
       if (previa.error) return res.status(400).json({ error: previa.error });
     }
 
+    // Cotización de "cobro sobre servicio existente" (emergencia ya atendida): se
+    // valida contra la emergencia de origen y se fija id_servicio_cobro. Al aprobar
+    // NO se creará servicio nuevo, solo el cobro sobre ese servicio.
+    let idServicioCobro = null;
+    if (d.id_emergencia) {
+      const prevEm = await _resolverEmergenciaCobrable(prisma, d.id_emergencia);
+      if (prevEm.error) return res.status(400).json({ error: prevEm.error });
+      if (prevEm.servicio.id_cliente !== Number(d.id_cliente)) {
+        return res.status(400).json({ error: 'El cliente de la cotización no coincide con el de la emergencia' });
+      }
+      idServicioCobro = prevEm.servicio.id;
+    }
+
     const codigo = await generarCodigoCotizacion();
 
     const creada = await prisma.$transaction(async (tx) => {
@@ -517,6 +656,7 @@ const crear = async (req, res) => {
           id_tipo_servicio: idPadreCot,
           id_subtipo_servicio: subtipoCot.id,
           descripcion: d.descripcion || null,
+          id_servicio_cobro: idServicioCobro,
           estado_global: ESTADO_GLOBAL.COTIZADO,
           version_activa: 1,
           user_id_registration: req.user.id,
@@ -1060,7 +1200,7 @@ const reabrir = async (req, res) => {
  *   - El nuevo monto es menor que la suma de cuotas blindadas.
  *   - La suma del nuevo plan_cuotas ≠ (nuevo_monto - sumaBlindadas) ± 1 céntimo.
  */
-async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaProgramada, userId, idArchivoRespaldo }) {
+async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaProgramada, userId, idArchivoRespaldo, cuentasPdf }) {
   return await tx.$transaction(async (trx) => {
     // 1. Actualizar precio del servicio existente
     await trx.tbl_servicios_proyectos.update({
@@ -1225,6 +1365,7 @@ async function _reAprobarTx({ tx, cot, version, servicioExistente, fechaPrograma
         fecha_aprobacion: new Date(),
         aprobada_por: userId,
         id_archivo_respaldo: idArchivoRespaldo,
+        ...(cuentasPdf !== undefined ? { cuentas_pdf: cuentasPdf } : {}),
         user_id_modification: userId,
         date_time_modification: new Date()
       }
@@ -1307,6 +1448,166 @@ const aprobar = async (req, res) => {
       return res.status(400).json({ error: `No se puede aprobar desde ${version.estado_version}` });
     }
 
+    // Selección de cuentas bancarias al aprobar: OPCIONAL. Si el modal de
+    // aprobación envía `cuentas_pdf`, se persiste en la versión (permite ajustar
+    // las cuentas a utilizar en ese momento, precargadas desde lo ya guardado).
+    // Si no se envía el campo, se conserva la selección guardada de la versión.
+    const enviaCuentasApro = Object.prototype.hasOwnProperty.call(d, 'cuentas_pdf');
+    const cuentasPdfAprob = enviaCuentasApro ? await normalizarCuentasPdf(d.cuentas_pdf) : undefined;
+
+    // Foto obligatoria por ítem AL APROBAR. En la creación de la cotización la
+    // foto es opcional (salvo correctivo), pero al pasar a servicio/proyecto cada
+    // ítem debe llevar su foto: el técnico asignado la visualiza en el servicio
+    // generado. Aplica a la conversión y a la re-aprobación (ambas usan `version`).
+    const itemsVersion = await prisma.tbl_cotizaciones_items.findMany({
+      where: { id_version: version.id, estado: 1 },
+      select: { id: true, id_archivo: true }
+    });
+    if (itemsVersion.length === 0) {
+      return res.status(400).json({ error: 'La versión no tiene ítems para aprobar' });
+    }
+    const itemsSinFoto = itemsVersion.filter(it => !it.id_archivo).length;
+    if (itemsSinFoto > 0) {
+      return res.status(400).json({ error: `Cada ítem debe incluir una foto antes de aprobar (faltan ${itemsSinFoto}). Súbelas desde el modal de aprobación.` });
+    }
+
+    // ─── Cobro sobre servicio existente (emergencia ya atendida) ────────────
+    // La cotización marca id_servicio_cobro: al aprobar NO se crea servicio nuevo
+    // ni se replica en módulo. Se liga la cotización al servicio existente, se lo
+    // vuelve facturable con el precio cotizado y se genera el cobro siguiendo el
+    // flujo (plan de cuotas de la versión si lo hay).
+    if (cot.id_servicio_cobro) {
+      try {
+        const resultadoCobro = await prisma.$transaction(async (tx) => {
+          const servicio = await tx.tbl_servicios_proyectos.findUnique({ where: { id: cot.id_servicio_cobro } });
+          if (!servicio || servicio.estado !== 1) throw new Error('El servicio asociado no existe o fue eliminado');
+          if (servicio.estado_servicio === 'Cancelado') throw new Error('El servicio asociado está cancelado');
+          if (!estaServicioFinalizado(servicio.estado_servicio)) throw new Error('El servicio asociado aún no está finalizado');
+          if (servicio.id_cotizacion && servicio.id_cotizacion !== cot.id) {
+            throw new Error('El servicio ya está ligado a otra cotización');
+          }
+
+          // Cobro existente sin movimiento → se reemplaza; con movimiento → bloquea.
+          const cobroExistente = await tx.tbl_cobros.findFirst({
+            where: { id_servicio: servicio.id, estado: 1 },
+            include: { cuotas: { where: { estado: 1 }, include: { facturas: { where: { estado: 1 } } } } }
+          });
+          if (cobroExistente) {
+            const conMovimiento = Number(cobroExistente.total_abonado || 0) > 0
+              || (cobroExistente.cuotas || []).some(c => Number(c.monto_pagado || 0) > 0 || (c.facturas || []).length > 0);
+            if (conMovimiento) throw new Error('El servicio ya tiene un cobro con abonos o facturas — no se puede regenerar');
+            await tx.tbl_cobros_cuotas.deleteMany({ where: { id_cobro: cobroExistente.id } });
+            await tx.tbl_cobros.delete({ where: { id: cobroExistente.id } });
+          }
+
+          // Ligar servicio ↔ cotización y volverlo facturable con el precio cotizado.
+          await tx.tbl_servicios_proyectos.update({
+            where: { id: servicio.id },
+            data: {
+              id_cotizacion: cot.id,
+              precio_interno: version.monto_total,
+              moneda: version.moneda,
+              sin_cobro: 0,
+              requiere_factura: 1,
+              user_id_modification: req.user.id,
+              date_time_modification: new Date()
+            }
+          });
+          await tx.tbl_servicios_ascensores.updateMany({
+            where: { id_servicio: servicio.id, estado: 1 },
+            data: { monto: version.monto_total, moneda: version.moneda, user_id_modification: req.user.id, date_time_modification: new Date() }
+          });
+
+          // Cobro siguiendo el flujo (una cuota o el plan de la versión).
+          await crearCobroInicial(tx, {
+            idServicio: servicio.id,
+            idCliente: cot.id_cliente,
+            monto: version.monto_total,
+            moneda: version.moneda,
+            fechaCuotaUnica: new Date(),
+            planCuotas: Array.isArray(version.plan_cuotas) ? version.plan_cuotas : null,
+            saldoVariable: Boolean(version.saldo_variable),
+            idUsuario: req.user.id
+          });
+
+          // Folder contable: el servicio finalizado suele tenerlo. Se alinea al
+          // nuevo cobro (pendiente de iniciar, facturable sin comprobante aún);
+          // si no existe, se crea.
+          const realizadoPrev = await tx.tbl_servicios_realizados.findFirst({ where: { id_servicio: servicio.id } });
+          if (realizadoPrev) {
+            await tx.tbl_servicios_realizados.update({
+              where: { id: realizadoPrev.id },
+              data: {
+                estado_cobro: 'Pendiente de iniciar',
+                estado_facturacion: ESTADO_FACTURACION_SIN,
+                user_id_modification: req.user.id,
+                date_time_modification: new Date()
+              }
+            });
+          } else {
+            await tx.tbl_servicios_realizados.create({
+              data: {
+                id_servicio: servicio.id,
+                id_cliente: cot.id_cliente,
+                estado_administrativo: 'En ejecución',
+                estado_cobro: 'Pendiente de iniciar',
+                estado_facturacion: ESTADO_FACTURACION_SIN,
+                user_id_registration: req.user.id
+              }
+            });
+          }
+
+          const versionApro = await tx.tbl_cotizaciones_versiones.update({
+            where: { id: version.id },
+            data: {
+              estado_version: ESTADOS_VERSION.APROBADO,
+              fecha_aprobacion: new Date(),
+              aprobada_por: req.user.id,
+              id_archivo_respaldo: d.id_archivo_respaldo ? Number(d.id_archivo_respaldo) : null,
+              user_id_modification: req.user.id,
+              date_time_modification: new Date()
+            }
+          });
+
+          await sincronizarEstadoGlobal(cot.id, tx);
+
+          await tx.tbl_clientes_historial.create({
+            data: {
+              id_cliente: cot.id_cliente,
+              id_servicio: servicio.id,
+              tipo_evento: 'cotizacion_aprobada',
+              descripcion: `Cotización ${cot.codigo} v${version.numero_version} aprobada — cobro sobre servicio existente ${servicio.codigo}`,
+              creado_por: req.user.id
+            }
+          });
+
+          return { servicio, version: versionApro };
+        }, { maxWait: 15000, timeout: 30000 });
+
+        await registrarAuditoria({
+          id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
+          accion: 'APPROVE',
+          valor_nuevo: { id_servicio_cobro: resultadoCobro.servicio.id, monto: Number(version.monto_total), sin_servicio_nuevo: true },
+          ip: req.ip
+        });
+        sincronizarRecordatorioServicio(resultadoCobro.servicio.id).catch(err =>
+          console.error('Sync recordatorio servicio (cobro emergencia):', err));
+
+        return res.json({
+          data: {
+            id_cotizacion: id,
+            version: resultadoCobro.version,
+            id_servicio_cobro: resultadoCobro.servicio.id,
+            codigo_servicio: resultadoCobro.servicio.codigo,
+            es_cobro_servicio_existente: true
+          }
+        });
+      } catch (errCobro) {
+        return res.status(400).json({ error: errCobro.message });
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     if (!Array.isArray(cot.ascensores) || cot.ascensores.length === 0) {
       return res.status(400).json({ error: 'Cotización sin ascensores asociados' });
     }
@@ -1336,7 +1637,8 @@ const aprobar = async (req, res) => {
           servicioExistente,
           fechaProgramada: fechaAprobacion,
           userId: req.user.id,
-          idArchivoRespaldo: d.id_archivo_respaldo ? Number(d.id_archivo_respaldo) : null
+          idArchivoRespaldo: d.id_archivo_respaldo ? Number(d.id_archivo_respaldo) : null,
+          cuentasPdf: cuentasPdfAprob
         });
         await registrarAuditoria({
           id_usuario: req.user.id, entidad: 'tbl_cotizaciones', id_entidad: id,
@@ -1528,6 +1830,7 @@ const aprobar = async (req, res) => {
           fecha_aprobacion: new Date(),
           aprobada_por: req.user.id,
           id_archivo_respaldo: d.id_archivo_respaldo ? Number(d.id_archivo_respaldo) : null,
+          ...(enviaCuentasApro ? { cuentas_pdf: cuentasPdfAprob } : {}),
           user_id_modification: req.user.id,
           date_time_modification: new Date()
         }
@@ -1853,14 +2156,12 @@ function construirWhereCotizaciones(query) {
     // Código de servicio generado por la cotización (cuando ya fue aprobada)
     { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
   ];
-  if (estado_global === 'Aprobadas') {
-    // Filtro agregado del frontend: todas las cotizaciones que el cliente
-    // aprobó alguna vez. No es un estado real — engloba todas las etapas con
-    // servicio en marcha, incluidas las ya facturadas/cobradas, que avanzaron
-    // más allá de 'Aceptado'.
-    where.estado_global = { in: [ESTADO_GLOBAL.ACEPTADO, ESTADO_GLOBAL.EJECUCION, ESTADO_GLOBAL.PENDIENTE, ESTADO_GLOBAL.TERMINADO] };
-  } else if (estado_global) {
-    where.estado_global = estado_global;
+  // Igual que el listado: el valor puede ser un estado exacto o el filtro
+  // virtual 'Aprobadas' (todas las etapas posteriores a la aceptación). La
+  // traducción vive en utils/estadoCotizacion.js para no duplicarla aquí.
+  if (estado_global) {
+    const estadosVirtual = resolverFiltroGlobal(estado_global);
+    where.estado_global = estadosVirtual ? { in: estadosVirtual } : estado_global;
   }
   if (id_cliente) where.id_cliente = Number(id_cliente);
   if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
@@ -1971,7 +2272,7 @@ const historial = async (req, res) => {
 // desde el backend para que la UI no vuelva a duplicarlos en un array literal
 // y no pueda desalinearse de lo que realmente se escribe en la BD.
 const catalogos = (_req, res) => {
-  res.json({ data: { estados_globales: ESTADOS_GLOBALES, estados_version: ESTADOS_VERSION_LISTA } });
+  res.json({ data: { estados_globales: ESTADOS_GLOBALES, filtros_globales: FILTROS_GLOBALES, estados_version: ESTADOS_VERSION_LISTA } });
 };
 
 module.exports = {
@@ -1981,6 +2282,7 @@ module.exports = {
   exportar,
   historial,
   desdeObservaciones,
+  desdeEmergencia,
   crear,
   actualizarCabecera,
   actualizarVersion,

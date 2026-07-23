@@ -29,7 +29,6 @@ const { generarInformeFinalizacionPdf, descargarArchivoImagen } = require('../ut
 const { subirObjeto, rutaDesdeKey, urlPresigned, keyDesdeRuta } = require('../utils/storage');
 const { construirKey } = require('../middleware/uploadMiddleware');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
-const { sincronizarRecordatorioCotizacionUrgente } = require('../utils/recordatoriosAuto');
 
 const CATEGORIAS_VALIDAS = ['mantenimiento', 'correctivo', 'emergencia'];
 const RESPUESTAS_VALIDAS = ['si', 'no', 'na'];
@@ -467,8 +466,11 @@ const generarInforme = async (req, res) => {
       return res.status(403).json({ error: 'Solo el técnico responsable puede generar el informe' });
     }
 
+    // El checklist de finalización es OPCIONAL. Si la categoría no tiene plantilla
+    // configurada no hay checklist ni informe que generar: se responde OK para que
+    // la finalización pueda continuar sin bloquear al técnico.
     const ctx = await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
-    if (!ctx) return res.status(400).json({ error: `La plantilla de checklist no tiene ítems. Pídale a un administrador que la configure.` });
+    if (!ctx) return res.json({ data: { sin_checklist: true } });
     const { plantilla } = ctx;
 
     // Respuestas persistidas + fotos por ítem.
@@ -483,20 +485,9 @@ const generarInforme = async (req, res) => {
     });
     const respuestasPorItemId = new Map((checklist?.respuestas || []).map(r => [r.id_item, r]));
 
-    // Validar completitud: todos respondidos + cada "Sí" con ≥1 foto.
-    const sinResponder = [];
-    const siSinFoto = [];
-    for (const it of plantilla.items) {
-      const r = respuestasPorItemId.get(it.id);
-      if (!r) { sinResponder.push(it.texto); continue; }
-      if (r.respuesta === 'si' && (!r.fotos || r.fotos.length === 0)) siSinFoto.push(it.texto);
-    }
-    if (sinResponder.length > 0 || siSinFoto.length > 0) {
-      const partes = [];
-      if (sinResponder.length) partes.push(`sin responder: ${sinResponder.slice(0, 5).join('; ')}${sinResponder.length > 5 ? '…' : ''}`);
-      if (siSinFoto.length) partes.push(`marcados "Sí" sin foto: ${siSinFoto.slice(0, 5).join('; ')}${siSinFoto.length > 5 ? '…' : ''}`);
-      return res.status(400).json({ error: `Checklist incompleto — ${partes.join(' · ')}` });
-    }
+    // El checklist NO bloquea la finalización: el informe se genera con lo que
+    // haya respondido el técnico (los ítems sin responder o sin foto simplemente
+    // no se completan en el PDF).
 
     // Observaciones técnicas (para el PDF).
     const observacionesTecnicas = await prisma.tbl_servicios_observaciones.findMany({
@@ -589,11 +580,9 @@ const generarInforme = async (req, res) => {
       accion: 'UPDATE', valor_nuevo: { id_servicio: idServicio, items: plantilla.items.length, informe: true }, ip: req.ip
     });
 
-    // Alerta de cotización urgente tras generar el informe. Las alertas de
-    // "servicio finalizado" se sincronizan al cerrar el servicio (serviciosController).
-    sincronizarRecordatorioCotizacionUrgente(idServicio).catch(err => {
-      console.error('Sync cotización urgente:', err);
-    });
+    // La alerta de "cotización urgente" NO se genera aquí: se crea únicamente al
+    // registrar una observación técnica (observacionesServicioController). Las
+    // alertas de "servicio finalizado" se sincronizan al cerrar el servicio.
 
     let urlPdf = null;
     try { urlPdf = await urlPresigned(keyDesdeRuta(archivo.ruta_almacenamiento)); } catch { /* no crítica */ }

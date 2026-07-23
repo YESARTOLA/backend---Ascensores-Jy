@@ -287,7 +287,7 @@ const obtener = async (req, res) => {
         dias: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
         checklists: { include: { items: { where: { estado: 1 } } } },
         guias: { include: { archivo: true, tecnico: true } },
-        evidencias: { include: { archivo: true, tecnico: true } },
+        evidencias: { where: { estado: 1 }, include: { archivo: true, tecnico: true } },
         entregas: { include: { archivo: true } },
         cobro: { include: { pagos: { where: { estado: 1 }, include: { archivo: true } }, cuotas: { where: { estado: 1 } } } },
         facturas: { include: { archivo: true } },
@@ -1022,15 +1022,10 @@ const finalizarServicio = async (req, res) => {
     if (sinGuia && sinObservaciones) {
       return res.status(400).json({ error: 'Se requiere guía o al menos observación técnica' });
     }
-    // Checklist de finalización: obligatorio para todos los roles. El frontend
-    // debe completarlo (POST /servicios/:id/finalizacion) antes de invocar
-    // este endpoint; aquí solo validamos que exista con PDF generado.
-    const checklistFin = await prisma.tbl_servicios_finalizacion_checklist.findUnique({
-      where: { id_servicio: id }
-    });
-    if (!checklistFin || !checklistFin.id_archivo_pdf) {
-      return res.status(400).json({ error: 'Debe completar el checklist de finalización del servicio antes de cerrarlo' });
-    }
+    // Checklist de finalización: OPCIONAL. La configuración de plantillas es
+    // opcional y un checklist incompleto (o inexistente) no impide cerrar el
+    // servicio. Si existe informe generado se conserva enlazado; si no, se cierra
+    // igual. Por eso ya no se valida su existencia aquí.
 
     // Evidencias del trabajo terminado: obligatorias para técnicos al finalizar.
     // Admin/SuperAdmin pueden cerrar sin evidencias (igual que con la guía).
@@ -1360,7 +1355,7 @@ const cancelar = async (req, res) => {
 
 const realizados = async (req, res) => {
   try {
-    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q } = req.query;
+    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1379,14 +1374,38 @@ const realizados = async (req, res) => {
     const servicioWhere = {};
     if (id_cliente) servicioWhere.id_cliente = Number(id_cliente);
     if (q) {
+      // Buscador amplio: código de servicio, razón social (nombre del cliente),
+      // documento (RUC/DNI) y código del edificio/ascensor.
       servicioWhere.OR = [
         { codigo: { contains: q, mode: 'insensitive' } },
-        { cliente: { nombre: { contains: q, mode: 'insensitive' } } }
+        { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+        { cliente: { numero_documento: { contains: q, mode: 'insensitive' } } },
+        { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } }
       ];
     }
+    // Filtro por tipo de servicio: correctivo | preventivo (mantenimiento) |
+    // proyecto. Se aplica vía AND para no pisar el filtro de ámbito por tipo_registro.
+    const filtrosCategoria = [];
+    if (tipo_categoria === 'proyecto') filtrosCategoria.push({ tipo_registro: 'proyecto' });
+    else if (tipo_categoria === 'correctivo') filtrosCategoria.push({ tipo_servicio: { modulo_asociado: 'correctivo' } });
+    else if (tipo_categoria === 'preventivo') filtrosCategoria.push({ tipo_servicio: { modulo_asociado: 'mantenimiento' } });
+    if (filtrosCategoria.length) servicioWhere.AND = filtrosCategoria;
     // Los servicios marcados "Sin factura" (requiere_factura = 0) no son
     // "pendientes por facturar": se excluyen al filtrar por ese estado.
     if (estado_facturacion === ESTADO_FACTURACION_SIN) servicioWhere.requiere_factura = 1;
+    // Filtro por situación de pago (columna "Situación"):
+    //   sin_cobro → servicios gratuitos.
+    //   cancelado → cobro pagado (Pagado/Cerrado), excluyendo gratuitos.
+    //   pendiente → cobro no pagado, excluyendo gratuitos.
+    if (situacion === 'sin_cobro') {
+      servicioWhere.sin_cobro = 1;
+    } else if (situacion === 'cancelado') {
+      servicioWhere.sin_cobro = { not: 1 };
+      where.estado_cobro = { in: ['Pagado', 'Cerrado'] };
+    } else if (situacion === 'pendiente') {
+      servicioWhere.sin_cobro = { not: 1 };
+      where.estado_cobro = { notIn: ['Pagado', 'Cerrado'] };
+    }
     // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
     const tiposRealizados = tiposRegistroPermitidos(req.user);
     if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };

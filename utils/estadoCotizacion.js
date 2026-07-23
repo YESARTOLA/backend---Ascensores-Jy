@@ -50,6 +50,42 @@ const ESTADOS_VERSION_LISTA = [
   ESTADOS_VERSION.RECHAZADO
 ];
 
+// ----------------------------------------------------------------------------
+// Filtros VIRTUALES del listado / exportación.
+//
+// No son estados que se escriban en la BD: son opciones del selector que
+// agrupan varios estado_global reales bajo un solo `IN (...)`. Existen porque
+// `estado_global` avanza (Aceptado → Ejecución → Pendiente → Terminado) y, al
+// pasar el servicio a ejecución, una cotización que el cliente SÍ aceptó deja
+// de aparecer bajo el filtro exacto 'Aceptado'. Este agregado permite ver de un
+// vistazo todas las que se aceptaron alguna vez, sin perder los filtros exactos.
+//
+// El `valor` ('Aprobadas') es el que viaja en la query; `despues_de` le dice al
+// frontend tras qué opción real insertarlo en el selector.
+const FILTRO_GLOBAL_APROBADAS = 'Aprobadas';
+
+const FILTROS_GLOBALES = [
+  {
+    valor: FILTRO_GLOBAL_APROBADAS,
+    etiqueta: 'Aceptadas (incluye ejecución)',
+    despues_de: ESTADO_GLOBAL.ACEPTADO,
+    estados: [
+      ESTADO_GLOBAL.ACEPTADO,
+      ESTADO_GLOBAL.EJECUCION,
+      ESTADO_GLOBAL.PENDIENTE,
+      ESTADO_GLOBAL.TERMINADO
+    ]
+  }
+];
+
+// Traduce un valor de filtro (real o virtual) al conjunto de estado_global
+// reales que representa. Devuelve un array cuando es virtual, o null cuando el
+// valor no es un filtro virtual (el caller debe tratarlo como estado exacto).
+function resolverFiltroGlobal(valor) {
+  const f = FILTROS_GLOBALES.find(x => x.valor === valor);
+  return f ? f.estados : null;
+}
+
 function esEstadoGlobalValido(estado) {
   return ESTADOS_GLOBALES.includes(estado);
 }
@@ -63,6 +99,9 @@ module.exports = {
   ESTADO_GLOBAL,
   ESTADOS_GLOBALES,
   ESTADOS_VERSION_LISTA,
+  FILTRO_GLOBAL_APROBADAS,
+  FILTROS_GLOBALES,
+  resolverFiltroGlobal,
   esEstadoGlobalValido,
   esEstadoVersionValido
 };

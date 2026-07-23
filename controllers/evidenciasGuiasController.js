@@ -5,7 +5,16 @@ const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const subirEvidencia = async (req, res) => {
   try {
     const id_servicio = Number(req.params.id);
-    const { id_archivo, tipo_evidencia, descripcion, id_dia } = req.body;
+    const { id_archivo, tipo_evidencia, descripcion, id_dia, momento } = req.body;
+    // Momento del trabajo al que pertenece la evidencia. Opcional; si viene debe
+    // ser uno de los valores canónicos. NULL = sin clasificar.
+    let momentoNorm = null;
+    if (momento !== undefined && momento !== null && momento !== '') {
+      if (!['Antes', 'Despues'].includes(momento)) {
+        return res.status(400).json({ error: 'Momento inválido (use Antes o Despues)' });
+      }
+      momentoNorm = momento;
+    }
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id: id_servicio }, include: { asignaciones: { where: { estado: 1 } } }
     });
@@ -34,6 +43,7 @@ const subirEvidencia = async (req, res) => {
         id_archivo: id_archivo || null,
         tipo_evidencia: tipo_evidencia || 'Foto',
         descripcion: descripcion || null,
+        momento: momentoNorm,
         user_id_registration: req.user.id
       }
     });
@@ -59,10 +69,40 @@ const listarEvidencias = async (req, res) => {
   }
 };
 
+// Registra/edita el comentario (descripción) de una evidencia ya subida. Pensado
+// para el flujo "adjuntar la foto primero, escribir el comentario después".
+const actualizarEvidencia = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { descripcion } = req.body;
+    const previa = await prisma.tbl_servicios_evidencias.findUnique({
+      where: { id },
+      include: { servicio: { select: { estado_servicio: true } } }
+    });
+    if (!previa) return res.status(404).json({ error: 'Evidencia no encontrada' });
+    if (previa.estado === 0) return res.status(400).json({ error: 'Evidencia eliminada' });
+    if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
+      return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se puede editar evidencias` });
+    }
+    const evidencia = await prisma.tbl_servicios_evidencias.update({
+      where: { id },
+      data: {
+        descripcion: (descripcion ?? '').trim() || null,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      }
+    });
+    res.json({ data: evidencia });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar evidencia' });
+  }
+};
+
 const eliminarEvidencia = async (req, res) => {
   try {
-    if (!['super_admin', 'admin'].includes(req.user.rol_codigo)) {
-      return res.status(403).json({ error: 'Solo Super Admin o Admin pueden eliminar evidencias' });
+    if (!['super_admin', 'admin', 'tecnico'].includes(req.user.rol_codigo)) {
+      return res.status(403).json({ error: 'No tiene permiso para eliminar evidencias' });
     }
     const id = Number(req.params.id);
     const previa = await prisma.tbl_servicios_evidencias.findUnique({
@@ -90,4 +130,4 @@ const eliminarEvidencia = async (req, res) => {
   }
 };
 
-module.exports = { subirEvidencia, listarEvidencias, eliminarEvidencia };
+module.exports = { subirEvidencia, listarEvidencias, actualizarEvidencia, eliminarEvidencia };

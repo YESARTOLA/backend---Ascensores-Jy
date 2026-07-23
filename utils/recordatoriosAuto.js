@@ -38,7 +38,8 @@ const COLORES = {
   cobro: '#9333ea',                          // púrpura
   manual: '#475569',                         // gris pizarra
   observacion: '#0d9488',                    // turquesa
-  observacion_alerta: '#e11d48',             // rosa-rojo
+  observacion_alerta: '#e11d48',             // rosa-rojo (detalle → admin/vendedora/coordinador)
+  observacion_facturar: '#0891b2',           // cian (aviso sin detalle → contabilidad)
   cotizacion_urgente: '#c026d3',             // fucsia
   servicio_finalizado_revisar:  '#65a30d',   // coordinador → revisar trabajo/informe (lima)
   servicio_finalizado_facturar: '#4f46e5',   // contabilidad → emitir factura (índigo)
@@ -308,13 +309,20 @@ async function sincronizarRecordatorioObservaciones(servicioId) {
 }
 
 /**
- * Crea una alerta puntual tipo 'observacion_alerta' para una observación técnica
- * con el flag genera_alerta=1. A diferencia de `sincronizarRecordatorioObservaciones`
- * (un único agregado por servicio), esta crea UN recordatorio por observación
- * marcada, visible solo para super_admin, admin y contabilidad según
- * `utils/visibilidadCalendario.js`. El link a la observación se guarda en
- * `notas_seguimiento` (`obs:<id>`) para poder atender o descartar la alerta
- * cuando la observación pase a "atendida".
+ * Crea las alertas puntuales para una observación técnica con el flag
+ * genera_alerta=1. Se generan DOS alertas diferenciadas (una por observación),
+ * ambas vinculadas a la observación por `notas_seguimiento` (`obs:<id>`) para
+ * poder descartarlas juntas cuando se atienda/elimine:
+ *
+ *  1. 'observacion_alerta' — CON detalle (texto de la observación). La ven
+ *     administración (super_admin, admin), cotización (vendedora) y oficina
+ *     técnica (coordinador), para hacer seguimiento y armar la cotización.
+ *     La imagen está disponible al abrir la observación en el servicio.
+ *  2. 'observacion_facturar' — SOLO aviso, SIN el texto ni la imagen. La ve
+ *     únicamente contabilidad, para que sepa que hay un servicio con observación
+ *     y prepare la facturación.
+ *
+ * Visibilidad por rol gobernada en `utils/visibilidadCalendario.js`.
  */
 async function crearAlertaObservacion(idObservacion) {
   if (!idObservacion) return;
@@ -326,19 +334,37 @@ async function crearAlertaObservacion(idObservacion) {
   });
   if (!obs || obs.estado !== 1) return;
   const s = obs.servicio;
-  const titulo = `🔔 Alerta técnica — ${s?.codigo || 'Servicio'}`;
   const detalleCliente = s?.cliente?.nombre || '';
+  const fecha = obs.date_time_registration || new Date();
+
+  // 1) Alerta CON detalle → administración / vendedora / coordinador.
   const recorte = (obs.texto || '').replace(/\s+/g, ' ').trim().slice(0, 140);
-  const descripcion = `${detalleCliente ? detalleCliente + ' · ' : ''}${recorte}${(obs.texto || '').length > 140 ? '…' : ''}`;
-  return prisma.tbl_recordatorios.create({
+  const descripcionDetalle = `${detalleCliente ? detalleCliente + ' · ' : ''}${recorte}${(obs.texto || '').length > 140 ? '…' : ''}`;
+  await prisma.tbl_recordatorios.create({
     data: {
       tipo: 'observacion_alerta',
       origen: 'auto',
-      titulo,
-      descripcion,
-      fecha_recordatorio: obs.date_time_registration || new Date(),
+      titulo: `🔔 Alerta técnica — ${s?.codigo || 'Servicio'}`,
+      descripcion: descripcionDetalle,
+      fecha_recordatorio: fecha,
       prioridad: 'alta',
       color: COLORES.observacion_alerta,
+      estado_recordatorio: 'pendiente',
+      id_servicio: s?.id || null,
+      notas_seguimiento: `obs:${obs.id}`
+    }
+  });
+
+  // 2) Alerta SOLO aviso (sin texto ni imagen) → contabilidad.
+  await prisma.tbl_recordatorios.create({
+    data: {
+      tipo: 'observacion_facturar',
+      origen: 'auto',
+      titulo: `🔔 Servicio con observación — ${s?.codigo || 'Servicio'}`,
+      descripcion: `${detalleCliente ? detalleCliente + ' · ' : ''}Se registró una observación técnica en el servicio. Preparar la facturación cuando corresponda.`,
+      fecha_recordatorio: fecha,
+      prioridad: 'alta',
+      color: COLORES.observacion_facturar,
       estado_recordatorio: 'pendiente',
       id_servicio: s?.id || null,
       notas_seguimiento: `obs:${obs.id}`
@@ -354,7 +380,7 @@ async function descartarAlertaObservacion(idObservacion) {
   if (!idObservacion) return;
   await prisma.tbl_recordatorios.updateMany({
     where: {
-      tipo: 'observacion_alerta',
+      tipo: { in: ['observacion_alerta', 'observacion_facturar'] },
       notas_seguimiento: `obs:${idObservacion}`,
       estado: 1,
       estado_recordatorio: { not: 'atendido' }
@@ -368,8 +394,12 @@ async function descartarAlertaObservacion(idObservacion) {
 }
 
 /**
- * Crea (idempotente) una alerta tipo 'cotizacion_urgente' tras la finalización
- * de un servicio con su informe generado. La ven los roles habilitados en
+ * Crea (idempotente) una alerta tipo 'cotizacion_urgente' SOLO cuando el
+ * servicio tiene al menos una observación técnica registrada (activa) — es lo
+ * que se cotizaría. Se dispara únicamente al registrar/eliminar observaciones
+ * (no al generar el informe). Se agenda en la fecha_programada del servicio.
+ * Si el servicio se elimina/desactiva o se queda sin observaciones, la alerta
+ * se descarta. La ven los roles habilitados en
  * `utils/visibilidadCalendario.js` (super_admin, admin, coordinador) — no la
  * ven técnico ni contabilidad. Se queda pendiente hasta que un coordinador la
  * marque como atendida manualmente desde el módulo Recordatorios.
@@ -383,18 +413,30 @@ async function sincronizarRecordatorioCotizacionUrgente(idServicio) {
   if (!s || s.estado !== 1) {
     return descartarAuto({ tipo: 'cotizacion_urgente', id_servicio: idServicio });
   }
+  // La alerta solo aplica si el servicio tiene al menos una observación técnica
+  // registrada (es lo que se cotizaría). Sin observaciones, se descarta.
+  const observaciones = await prisma.tbl_servicios_observaciones.count({
+    where: { id_servicio: idServicio, estado: 1 }
+  });
+  if (observaciones === 0) {
+    return descartarAuto({ tipo: 'cotizacion_urgente', id_servicio: idServicio });
+  }
   const titulo = `Cotización urgente — ${s.codigo}`;
   const edificioNombre = (s.ascensores || []).map(a => a.ascensor?.edificio?.nombre).find(Boolean);
   const detalleCliente = s.cliente
     ? `${s.cliente.nombre}${edificioNombre ? ` · ${edificioNombre}` : ''}`
     : '';
-  const descripcion = `Servicio finalizado con informe. Revisar y emitir cotización si corresponde.${detalleCliente ? ` · ${detalleCliente}` : ''}`;
+  const descripcion = `Servicio con observación técnica registrada. Revisar y emitir cotización.${detalleCliente ? ` · ${detalleCliente}` : ''}`;
+  // Se registra en la fecha en que el técnico tiene agendado el servicio
+  // (fecha_programada). Como no se agenda trabajo los domingos, nunca cae en
+  // domingo. Si por algún motivo no hubiera fecha programada, se usa hoy.
+  const fechaRecordatorio = s.fecha_programada || new Date();
   return upsertAuto({
     filtro: { tipo: 'cotizacion_urgente', id_servicio: idServicio },
     datos: {
       titulo,
       descripcion,
-      fecha_recordatorio: new Date(),
+      fecha_recordatorio: fechaRecordatorio,
       prioridad: 'alta',
       color: COLORES.cotizacion_urgente,
       estado_recordatorio: 'pendiente'

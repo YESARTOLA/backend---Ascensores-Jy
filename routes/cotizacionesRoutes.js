@@ -49,6 +49,7 @@ router.get('/catalogos', permitirRoles('super_admin', 'admin', 'contabilidad'), 
 // Prellenado de una cotización desde observaciones técnicas (?ids=1,2,3).
 // Debe ir antes de /:id para que no lo capture como id. Solo lectura.
 router.get('/desde-observaciones', permitirRoles('super_admin', 'admin'), c.desdeObservaciones);
+router.get('/desde-emergencia', permitirRoles('super_admin', 'admin'), c.desdeEmergencia);
 router.get('/:id', permitirRoles('super_admin', 'admin', 'contabilidad'), c.obtener);
 router.get('/:id/historial', permitirRoles('super_admin', 'admin', 'contabilidad'), c.historial);
 

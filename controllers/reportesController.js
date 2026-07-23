@@ -436,13 +436,23 @@ const ascensores = async (req, res) => {
 const mantenimientosVencidos = async (req, res) => {
   try {
     if (sinAmbitoServicio(req)) return res.json({ data: [] });
+    const { desde, hasta } = req.query;
     const hoy = inicioDelDiaLima();
+    // Vencido = fecha programada anterior a hoy. El rango (desde/hasta) acota
+    // además por fecha programada; ambos límites se eligen en un mismo calendario.
+    const fechaWhere = { lt: hoy };
+    if (desde) fechaWhere.gte = parseYMDLima(desde);
+    if (hasta) {
+      // Si el "hasta" es futuro, basta con lt:hoy (los vencidos nunca son futuros).
+      const finHasta = parseYMDFinDiaLima(hasta);
+      if (finHasta < hoy) fechaWhere.lte = finHasta;
+    }
     const list = await prisma.tbl_servicios_proyectos.findMany({
       where: {
         estado: 1,
         origen: 'mantenimiento',
         estado_servicio: { in: ['Pendiente', 'Asignado', 'Checklist de salida pendiente', 'Listo para salida'] },
-        fecha_programada: { lt: hoy }
+        fecha_programada: fechaWhere
       },
       orderBy: { fecha_programada: 'asc' },
       include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } }, tipo_servicio: true }
