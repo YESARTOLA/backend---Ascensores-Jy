@@ -14,11 +14,15 @@ const PREFIJO_POR_TIPO = { proyecto: 'PRY', servicio: 'SRV' };
  * descendente coincide con el numérico.
  *
  * @param {'servicio'|'proyecto'} tipoRegistro  Deriva el prefijo (default: servicio).
+ * @param {object} [client=prisma]  Cliente Prisma o transaccional (`tx`). Pasar el
+ *   `tx` cuando se generan VARIOS códigos dentro de una misma transacción (p.ej. un
+ *   plan de mantenimiento multi-ascensor: N servicios en un solo tx): así la
+ *   consulta ve los servicios ya creados en el mismo tx y no repite el correlativo.
  */
-async function generarCodigoServicio(tipoRegistro = 'servicio') {
+async function generarCodigoServicio(tipoRegistro = 'servicio', client = prisma) {
   const prefijo = PREFIJO_POR_TIPO[tipoRegistro] || PREFIJO_POR_TIPO.servicio;
   const anio = new Date().getFullYear();
-  const ultimo = await prisma.tbl_servicios_proyectos.findFirst({
+  const ultimo = await client.tbl_servicios_proyectos.findFirst({
     where: { codigo: { startsWith: `${prefijo}-${anio}-` } },
     orderBy: { codigo: 'desc' },
     select: { codigo: true }

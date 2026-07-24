@@ -322,18 +322,19 @@ const crear = async (req, res) => {
       // plan se vean todos como "Mantenimiento" con la misma nomenclatura.
       await _crearEventosServiciosSecundarios(tx, { plan, servicios, fecha: plan.fecha_inicio, tituloBase });
 
-      // Cobro ÚNICO del plan, pero por UNA sola ocurrencia (la primera ejecución,
-      // todos los ascensores): el monto = precio por ocurrencia (= suma del precio
-      // del catálogo repartido entre los ascensores), NO multiplicado por la
-      // cantidad de mantenimientos del plan. Las ejecuciones siguientes no generan
-      // cobro automático. Si la primera ocurrencia es gratuita, el cobro nace en 0.
-      const montoPrimeraOcurrencia = primerServicioGratuito ? 0 : Number(Number(validacion.suma).toFixed(2));
+      // Cobro ÚNICO del plan que CRECE por periodo aprobado. Nace VACÍO (monto 0,
+      // sin cuotas): cada periodo (ocurrencia) que el admin aprueba desde
+      // `aprobarPeriodo` le añade una cuota por el total de ese periodo (suma de
+      // todos los ascensores) y sube el total del cobro. Así el cliente nunca
+      // aparece debiendo periodos aún no ejecutados, y por periodo se genera una
+      // sola factura y un solo pago.
       await crearCobroInicial(tx, {
         idMantenimientoPlan: plan.id,
         idCliente: plan.id_cliente,
-        monto: montoPrimeraOcurrencia,
+        monto: 0,
         moneda: monedaServicio,
         fechaCuotaUnica: plan.fecha_inicio,
+        sinCuotas: true,
         idUsuario: req.user.id
       });
 
@@ -507,8 +508,9 @@ const actualizar = async (req, res) => {
 async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fechaProgramada, horaProgramada, esGratuito, userId }) {
   const servicios = [];
   for (const a of ascItems) {
-    // tx-aware: ve los servicios ya creados en esta misma transacción → sin colisión.
-    const codigo = await generarCodigoServicio(tx);
+    // tx-aware: ve los servicios ya creados en esta misma transacción → sin colisión
+    // de correlativo al crear N servicios (uno por ascensor) en el mismo tx.
+    const codigo = await generarCodigoServicio('servicio', tx);
     const monto = Number(a.monto);
     const moneda = a.moneda || MONEDA_POR_DEFECTO;
     // Título por servicio: distingue el ascensor para que el coordinador asigne
@@ -556,6 +558,105 @@ async function _ordinalOcurrencia(tx, idPlan, fechaProgramada) {
     distinct: ['fecha_programada']
   });
   return previas.length + 1;
+}
+
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Estado de facturación de un plan de mantenimiento, agrupado por PERIODO
+ * (= ocurrencia de la frecuencia; todos los servicios de una ocurrencia comparten
+ * `fecha_programada`). Un periodo es la unidad de facturación: se factura una sola
+ * vez por el total de todos sus ascensores. Fuente única usada por `listarPeriodos`,
+ * `aprobarPeriodo`, `ajustarPeriodo` y la detección de "periodo completo".
+ *
+ * Por cada periodo devuelve: ordinal, fecha (YMD), servicios (no cancelados),
+ * total_servicios, done (finalizados), total_monto (suma de precio_interno),
+ * es_gratuito, completo (done === total), la `cuota` del cobro del plan asociada
+ * (mapeada por fecha de vencimiento = fecha de ocurrencia) y el `estado_periodo`
+ * (pendiente | completo | aprobado | facturado | pagado).
+ *
+ * @param {object} client - prisma o tx
+ * @param {number} idPlan
+ */
+async function _periodosDelPlan(client, idPlan) {
+  const plan = await client.tbl_mantenimientos_planes.findUnique({
+    where: { id: Number(idPlan) },
+    select: { id: true, cantidad_mantenimientos_gratuitos: true, cobro: { select: { id: true } } }
+  });
+  if (!plan) return { id_cobro: null, cupo_gratuito: 0, periodos: [] };
+
+  // Servicios del plan, excluyendo cancelados: un periodo con un servicio cancelado
+  // se puede completar con los restantes.
+  const servicios = await client.tbl_servicios_proyectos.findMany({
+    where: { id_mantenimiento_plan: Number(idPlan), estado: 1, estado_servicio: { not: 'Cancelado' } },
+    select: { id: true, codigo: true, estado_servicio: true, precio_interno: true, moneda: true, sin_cobro: true, fecha_programada: true },
+    orderBy: { fecha_programada: 'asc' }
+  });
+
+  const cuotas = plan.cobro
+    ? await client.tbl_cobros_cuotas.findMany({
+        where: { id_cobro: plan.cobro.id, estado: 1 },
+        select: { id: true, numero_cuota: true, fecha_vencimiento: true, monto: true, monto_pagado: true, estado_cuota: true }
+      })
+    : [];
+  const facturas = plan.cobro
+    ? await client.tbl_facturas.findMany({
+        where: { id_mantenimiento_plan: Number(idPlan), estado: 1, id_cuota: { not: null } },
+        select: { id_cuota: true }
+      })
+    : [];
+  const cuotaFacturada = new Set(facturas.map(f => f.id_cuota));
+
+  // Agrupar servicios por fecha de ocurrencia (YMD Lima).
+  const porFecha = new Map();
+  for (const s of servicios) {
+    const ymd = ymdLima(s.fecha_programada);
+    if (!porFecha.has(ymd)) porFecha.set(ymd, []);
+    porFecha.get(ymd).push(s);
+  }
+  const cupoGratuito = Number(plan.cantidad_mantenimientos_gratuitos || 0);
+  const fechas = [...porFecha.keys()].sort();
+
+  const periodos = fechas.map((ymd, idx) => {
+    const grupo = porFecha.get(ymd);
+    const ordinal = idx + 1;
+    const total_servicios = grupo.length;
+    const done = grupo.filter(s => estaServicioFinalizado(s.estado_servicio)).length;
+    const total_monto = round2(grupo.reduce((a, s) => a + Number(s.precio_interno || 0), 0));
+    const es_gratuito = grupo.every(s => s.sin_cobro === 1) || ordinal <= cupoGratuito;
+    const completo = total_servicios > 0 && done === total_servicios;
+    // La cuota del periodo se liga por `numero_cuota` = ordinal de la ocurrencia
+    // (fijado al aprobar). Se usa el ordinal y NO la fecha porque la cuota guarda
+    // `fecha_vencimiento` como @db.Date (medianoche UTC) y el servicio guarda un
+    // timestamptz: pasarlos por ymdLima daría días distintos y rompería el mapeo
+    // (duplicaría cuotas al re-aprobar).
+    const cuota = cuotas.find(c => c.numero_cuota === ordinal) || null;
+    let estado_periodo = completo ? 'completo' : 'pendiente';
+    if (cuota) {
+      estado_periodo = 'aprobado';
+      if (cuotaFacturada.has(cuota.id)) estado_periodo = 'facturado';
+      if (String(cuota.estado_cuota) === 'Pagada' || Number(cuota.monto_pagado || 0) >= Number(cuota.monto)) {
+        estado_periodo = 'pagado';
+      }
+    }
+    return {
+      ordinal,
+      fecha: ymd,
+      moneda: grupo[0]?.moneda || null,
+      total_servicios,
+      done,
+      total_monto,
+      es_gratuito,
+      completo,
+      servicios: grupo.map(s => ({ id: s.id, codigo: s.codigo, estado_servicio: s.estado_servicio })),
+      cuota: cuota ? { id: cuota.id, numero_cuota: cuota.numero_cuota, monto: Number(cuota.monto), monto_pagado: Number(cuota.monto_pagado || 0), estado_cuota: cuota.estado_cuota } : null,
+      estado_periodo
+    };
+  });
+
+  return { id_cobro: plan.cobro?.id || null, cupo_gratuito: cupoGratuito, periodos };
 }
 
 /**
@@ -1396,10 +1497,172 @@ const eliminar = async (req, res) => {
   }
 };
 
+/**
+ * GET /:id/periodos — estado de facturación por periodo de un plan (para la UI
+ * de aprobación). Solo lectura.
+ */
+const listarPeriodos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({ where: { id }, select: { id: true } });
+    if (!plan) return res.status(404).json({ error: 'Plan no encontrado' });
+    const data = await _periodosDelPlan(prisma, id);
+    res.json({ data });
+  } catch (err) {
+    console.error('[mantenimientos.listarPeriodos]', err);
+    res.status(500).json({ error: 'Error al obtener periodos del plan' });
+  }
+};
+
+/**
+ * POST /:id/periodos/aprobar — aprueba un PERIODO del plan para facturación.
+ * El periodo es la unidad de cobro: se le crea UNA cuota (por el total de todos
+ * los ascensores) en el cobro único del plan, y el cobro sube su total.
+ *
+ * Body: { fecha_ocurrencia?: 'YYYY-MM-DD', ordinal?: number, forzar?: bool, modo?: 'total'|'equivalente' }
+ *  - Normal: solo si el periodo está completo (todos los servicios finalizados).
+ *  - Forzado: con periodo incompleto, el admin elige facturar el TOTAL o el
+ *    EQUIVALENTE proporcional (done/total × total).
+ * Devuelve la cuota creada → el front abre el modal de factura con id_cuota.
+ */
+const aprobarPeriodo = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { fecha_ocurrencia, ordinal, forzar, modo } = req.body || {};
+
+    const info = await _periodosDelPlan(prisma, id);
+    if (!info.id_cobro) return res.status(400).json({ error: 'El plan no tiene un cobro asociado' });
+
+    const p = info.periodos.find(x =>
+      (fecha_ocurrencia && x.fecha === String(fecha_ocurrencia).substring(0, 10)) ||
+      (ordinal && x.ordinal === Number(ordinal))
+    );
+    if (!p) return res.status(404).json({ error: 'Periodo no encontrado' });
+    if (p.cuota) return res.status(409).json({ error: 'El periodo ya fue aprobado' });
+
+    if (!p.completo && !forzar) {
+      return res.status(409).json({
+        error: 'El periodo tiene mantenimientos pendientes. Requiere aprobación forzada.',
+        requiere_forzar: true, done: p.done, total: p.total_servicios, total_monto: p.total_monto
+      });
+    }
+
+    // Monto de la cuota del periodo.
+    let monto;
+    if (p.es_gratuito) {
+      monto = 0;
+    } else if (p.completo || (forzar && modo === 'total')) {
+      monto = p.total_monto;
+    } else if (forzar && modo === 'equivalente') {
+      monto = p.total_servicios > 0 ? round2(p.total_monto * p.done / p.total_servicios) : 0;
+    } else {
+      return res.status(400).json({ error: 'Indica el modo de facturación forzada: "total" o "equivalente"' });
+    }
+
+    const cobro = await prisma.tbl_cobros.findUnique({
+      where: { id: info.id_cobro },
+      select: { id: true, estado_cobro: true, fecha_proximo_abono: true }
+    });
+    const fechaVenc = parseYMDLima(p.fecha);
+
+    const resultado = await prisma.$transaction(async (tx) => {
+      const cuota = await tx.tbl_cobros_cuotas.create({
+        data: {
+          id_cobro: info.id_cobro,
+          numero_cuota: p.ordinal,
+          fecha_vencimiento: fechaVenc,
+          monto,
+          estado_cuota: monto > 0 ? 'Pendiente' : 'Pagada',
+          fecha_pago: monto > 0 ? null : new Date(),
+          user_id_registration: req.user.id
+        }
+      });
+      await tx.tbl_cobros.update({
+        where: { id: info.id_cobro },
+        data: {
+          monto_total: { increment: monto },
+          saldo_pendiente: { increment: monto },
+          numero_cuotas: { increment: 1 },
+          // Una cuota gratuita (monto 0) nace 'Pagada': no suma a las faltantes.
+          cuotas_faltantes: monto > 0 ? { increment: 1 } : undefined,
+          ...(monto > 0 && cobro.estado_cobro === 'Sin cobro' ? { estado_cobro: 'Pendiente de iniciar' } : {}),
+          ...(monto > 0 && !cobro.fecha_proximo_abono ? { fecha_proximo_abono: fechaVenc } : {}),
+          user_id_modification: req.user.id,
+          date_time_modification: new Date()
+        }
+      });
+      return cuota;
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_cobros_cuotas', id_entidad: resultado.id,
+      accion: 'CREATE',
+      valor_nuevo: { plan: id, periodo: p.ordinal, fecha: p.fecha, monto, forzado: !!forzar, modo: forzar ? modo : null, done: p.done, total: p.total_servicios },
+      ip: req.ip
+    });
+
+    res.status(201).json({ data: { cuota: resultado, id_cobro: info.id_cobro, periodo: { ordinal: p.ordinal, fecha: p.fecha, monto } } });
+  } catch (err) {
+    console.error('[mantenimientos.aprobarPeriodo]', err);
+    res.status(500).json({ error: 'Error al aprobar periodo: ' + err.message });
+  }
+};
+
+/**
+ * POST /:id/periodos/ajustar — sube el monto de la cuota de un periodo ya
+ * aprobado de forma parcial (equivalente) cuando después se completan los
+ * mantenimientos faltantes. Solo si la cuota NO está facturada ni pagada.
+ * Body: { fecha_ocurrencia?, ordinal? }
+ */
+const ajustarPeriodo = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { fecha_ocurrencia, ordinal } = req.body || {};
+    const info = await _periodosDelPlan(prisma, id);
+    const p = info.periodos.find(x =>
+      (fecha_ocurrencia && x.fecha === String(fecha_ocurrencia).substring(0, 10)) ||
+      (ordinal && x.ordinal === Number(ordinal))
+    );
+    if (!p) return res.status(404).json({ error: 'Periodo no encontrado' });
+    if (!p.cuota) return res.status(400).json({ error: 'El periodo aún no está aprobado' });
+    if (p.estado_periodo === 'facturado' || p.estado_periodo === 'pagado' || p.cuota.monto_pagado > 0) {
+      return res.status(400).json({ error: 'La cuota ya fue facturada o tiene pagos; ajústela manualmente (nota de crédito/débito)' });
+    }
+    const delta = round2(p.total_monto - p.cuota.monto);
+    if (delta <= 0) return res.status(400).json({ error: 'No hay monto adicional que ajustar' });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_cobros_cuotas.update({
+        where: { id: p.cuota.id },
+        data: { monto: p.total_monto, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      await tx.tbl_cobros.update({
+        where: { id: info.id_cobro },
+        data: {
+          monto_total: { increment: delta },
+          saldo_pendiente: { increment: delta },
+          user_id_modification: req.user.id,
+          date_time_modification: new Date()
+        }
+      });
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_cobros_cuotas', id_entidad: p.cuota.id,
+      accion: 'UPDATE', valor_nuevo: { plan: id, periodo: p.ordinal, delta, monto_nuevo: p.total_monto }, ip: req.ip
+    });
+    res.json({ data: { id_cuota: p.cuota.id, monto: p.total_monto, delta } });
+  } catch (err) {
+    console.error('[mantenimientos.ajustarPeriodo]', err);
+    res.status(500).json({ error: 'Error al ajustar periodo: ' + err.message });
+  }
+};
+
 module.exports = {
   listar, crear, actualizar, materializarEvento, listarFrecuencias,
   materializarSiguienteEventoDelPlan, listarInstancias, exportar,
   impactoEliminacion, eliminar,
+  listarPeriodos, aprobarPeriodo, ajustarPeriodo,
   // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
   // para no duplicar la lógica de instancias + proyecciones por rango de fechas.
   construirDatasetReporteMantenimientos: _construirDatasetReporte

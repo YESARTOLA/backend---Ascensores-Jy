@@ -20,6 +20,12 @@ router.post(
   permitirRoles('super_admin', 'admin', 'coordinador'),
   c.materializarEvento
 );
+// Facturación por PERIODO del plan (unidad = ocurrencia de la frecuencia; una
+// factura y un pago por el total de todos los ascensores de ese periodo).
+router.get('/:id/periodos', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.listarPeriodos);
+router.post('/:id/periodos/aprobar', permitirRoles('super_admin', 'admin'), c.aprobarPeriodo);
+router.post('/:id/periodos/ajustar', permitirRoles('super_admin', 'admin'), c.ajustarPeriodo);
+
 // Preview del borrado en cascada (solo lectura). Mismo rol que el DELETE: lo
 // consulta el modal de confirmación para mostrar el impacto real antes de borrar.
 router.get('/:id/impacto-eliminacion', permitirRoles('super_admin'), c.impactoEliminacion);

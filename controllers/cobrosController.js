@@ -5,7 +5,7 @@ const { diffDiasLima, parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = req
 const { sincronizarRecordatorioCobro } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
 const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA } = require('../utils/catalogosBancarios');
-const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
+const { ESTADO_FACTURACION_SIN, esFacturaActiva } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
@@ -824,6 +824,174 @@ const cuotasCalendario = async (req, res) => {
 };
 
 /**
+ * Cuotas PENDIENTES DE FACTURAR (Gestión de cobros → pestaña "Por facturar").
+ *
+ * Una cuota está pendiente de facturar cuando su cobro NO tiene una factura
+ * general activa (id_cuota = null; una factura general cubre todo el
+ * servicio/plan y, por tanto, todas sus cuotas) Y la cuota misma NO tiene una
+ * factura por-cuota activa. "Activa" = estado 1 y no Anulada (esFacturaActiva),
+ * criterio compartido con el cálculo del estado_facturacion agregado.
+ *
+ * Cada fila trae la fecha de vencimiento (la fecha registrada de la cuota), el
+ * cliente, el proyecto/servicio o plan y el tipo, para saber qué falta facturar
+ * y en qué fecha. Filtros: q (cliente/servicio/documento), id_cliente,
+ * id_proyecto, tipo_categoria, rango de fecha_vencimiento y orden.
+ */
+const cuotasNoFacturadas = async (req, res) => {
+  try {
+    const {
+      q, id_cliente, id_proyecto, tipo_categoria,
+      fecha_desde, fecha_hasta, orden, direccion
+    } = req.query;
+
+    const cobroWhere = { estado: 1 };
+    if (id_cliente) cobroWhere.id_cliente = Number(id_cliente);
+    if (id_proyecto) cobroWhere.id_servicio = Number(id_proyecto);
+    // Alcance por tipo de edificio (Administrador): la cuota cuelga de un cobro,
+    // que a su vez cuelga de un servicio o de un plan de mantenimiento.
+    const alcance = porServicioOPlanAscensorEdificioWhere(req.user);
+    if (Object.keys(alcance).length > 0) Object.assign(cobroWhere, alcance);
+
+    const where = { estado: 1, cobro: { is: cobroWhere } };
+    if (fecha_desde || fecha_hasta) {
+      where.fecha_vencimiento = {};
+      if (fecha_desde) where.fecha_vencimiento.gte = parseYMDLima(fecha_desde);
+      if (fecha_hasta) where.fecha_vencimiento.lte = parseYMDFinDiaLima(fecha_hasta);
+    }
+
+    const cuotas = await prisma.tbl_cobros_cuotas.findMany({
+      where,
+      orderBy: { fecha_vencimiento: 'asc' },
+      include: {
+        facturas: true,
+        cobro: {
+          include: {
+            cliente: true,
+            facturas: true,
+            servicio: {
+              include: {
+                tipo_servicio: true,
+                ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } }
+              }
+            },
+            mantenimiento_plan: {
+              include: {
+                tipo_servicio: true,
+                ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Solo las cuotas que aún no están cubiertas por ninguna factura activa.
+    let filas = cuotas
+      .filter(cu => {
+        const facturasCobro = cu.cobro?.facturas || [];
+        const tieneGeneral = facturasCobro.some(f => (f.id_cuota === null || f.id_cuota === undefined) && esFacturaActiva(f));
+        if (tieneGeneral) return false;
+        return !(cu.facturas || []).some(esFacturaActiva);
+      })
+      .map(cu => {
+        const cobro = cu.cobro;
+        const servicio = cobro?.servicio;
+        const plan = cobro?.mantenimiento_plan;
+        const asc = servicio?.ascensores || plan?.ascensores || [];
+        const edificio = asc.map(a => a.ascensor?.edificio?.nombre).find(Boolean) || null;
+        // ¿el cobro ya tiene otras cuotas facturadas? → facturación por cuota en curso.
+        const facturacionParcial = (cobro?.facturas || []).some(f => f.id_cuota != null && esFacturaActiva(f));
+        return {
+          id: cu.id,
+          numero_cuota: cu.numero_cuota,
+          fecha_vencimiento: cu.fecha_vencimiento,
+          fecha_registro: cu.date_time_registration,
+          monto: cu.monto,
+          monto_pagado: cu.monto_pagado,
+          estado_cuota: cu.estado_cuota,
+          cobro: cobro ? {
+            id: cobro.id,
+            numero_cuotas: cobro.numero_cuotas,
+            moneda: cobro.moneda,
+            saldo_pendiente: cobro.saldo_pendiente,
+            estado_cobro: cobro.estado_cobro
+          } : null,
+          cliente: cobro?.cliente ? {
+            id: cobro.cliente.id,
+            nombre: cobro.cliente.nombre,
+            tipo_documento: cobro.cliente.tipo_documento,
+            numero_documento: cobro.cliente.numero_documento
+          } : null,
+          servicio: servicio ? {
+            id: servicio.id,
+            codigo: servicio.codigo,
+            titulo: servicio.titulo,
+            tipo_registro: servicio.tipo_registro,
+            modulo: servicio.tipo_servicio?.modulo_asociado || null
+          } : null,
+          mantenimiento_plan: plan ? { id: plan.id } : null,
+          tipo_servicio: servicio?.tipo_servicio?.nombre || plan?.tipo_servicio?.nombre || null,
+          edificio,
+          facturacion_parcial: facturacionParcial
+        };
+      });
+
+    if (q) {
+      const ql = q.toLowerCase();
+      filas = filas.filter(f =>
+        f.cliente?.nombre?.toLowerCase().includes(ql) ||
+        f.servicio?.codigo?.toLowerCase().includes(ql) ||
+        f.servicio?.titulo?.toLowerCase().includes(ql) ||
+        f.cliente?.numero_documento?.toLowerCase().includes(ql)
+      );
+    }
+    if (tipo_categoria) {
+      filas = filas.filter(f => {
+        if (tipo_categoria === 'proyecto') return f.servicio?.tipo_registro === 'proyecto';
+        if (tipo_categoria === 'correctivo') return f.servicio?.modulo === 'correctivo';
+        if (tipo_categoria === 'preventivo') return f.servicio?.modulo === 'mantenimiento' || (!f.servicio && !!f.mantenimiento_plan);
+        return true;
+      });
+    }
+
+    if (orden) {
+      const dir = direccion === 'desc' ? -1 : 1;
+      const getters = {
+        cliente: f => (f.cliente?.nombre || '').toLowerCase(),
+        proyecto: f => (f.servicio?.titulo || '').toLowerCase(),
+        servicio: f => f.servicio?.codigo || '',
+        vencimiento: f => (f.fecha_vencimiento ? new Date(f.fecha_vencimiento).getTime() : null),
+        monto: f => Number(f.monto || 0),
+        cuota: f => Number(f.numero_cuota || 0)
+      };
+      const getter = getters[orden];
+      if (getter) {
+        const vacio = v => v === null || v === undefined || v === '';
+        filas = filas.slice().sort((a, b) => {
+          const va = getter(a), vb = getter(b);
+          if (vacio(va) && vacio(vb)) return 0;
+          if (vacio(va)) return 1;
+          if (vacio(vb)) return -1;
+          if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
+          return String(va).localeCompare(String(vb)) * dir;
+        });
+      }
+    }
+
+    const resultado = paginarArray(filas, req.query);
+    resultado.resumen = {
+      total_cuotas: filas.length,
+      total_monto: aSoles(filas.reduce((acc, f) => acc + aCentavos(f.monto), 0)),
+      total_por_cobrar: aSoles(filas.reduce((acc, f) => acc + Math.max(0, aCentavos(f.monto) - aCentavos(f.monto_pagado)), 0))
+    };
+    res.json(resultado);
+  } catch (err) {
+    console.error('[cobros.cuotasNoFacturadas]', err);
+    res.status(500).json({ error: 'Error al listar cuotas por facturar' });
+  }
+};
+
+/**
  * Devuelve la lista de proyectos (= servicios con cobro activo) para
  * alimentar el combobox de filtros. Solo IDs + datos visibles, sin metricas.
  */
@@ -933,4 +1101,4 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, listarProyectos, eliminar };
+module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, cuotasNoFacturadas, listarProyectos, eliminar };

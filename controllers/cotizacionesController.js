@@ -1459,6 +1459,9 @@ const aprobar = async (req, res) => {
     // foto es opcional (salvo correctivo), pero al pasar a servicio/proyecto cada
     // ítem debe llevar su foto: el técnico asignado la visualiza en el servicio
     // generado. Aplica a la conversión y a la re-aprobación (ambas usan `version`).
+    // Excepción: cobro sobre servicio existente (id_servicio_cobro). Nace de una
+    // emergencia ya atendida — el servicio se realizó y no se crea uno nuevo, así
+    // que la foto por ítem deja de ser requisito.
     const itemsVersion = await prisma.tbl_cotizaciones_items.findMany({
       where: { id_version: version.id, estado: 1 },
       select: { id: true, id_archivo: true }
@@ -1466,9 +1469,11 @@ const aprobar = async (req, res) => {
     if (itemsVersion.length === 0) {
       return res.status(400).json({ error: 'La versión no tiene ítems para aprobar' });
     }
-    const itemsSinFoto = itemsVersion.filter(it => !it.id_archivo).length;
-    if (itemsSinFoto > 0) {
-      return res.status(400).json({ error: `Cada ítem debe incluir una foto antes de aprobar (faltan ${itemsSinFoto}). Súbelas desde el modal de aprobación.` });
+    if (!cot.id_servicio_cobro) {
+      const itemsSinFoto = itemsVersion.filter(it => !it.id_archivo).length;
+      if (itemsSinFoto > 0) {
+        return res.status(400).json({ error: `Cada ítem debe incluir una foto antes de aprobar (faltan ${itemsSinFoto}). Súbelas desde el modal de aprobación.` });
+      }
     }
 
     // ─── Cobro sobre servicio existente (emergencia ya atendida) ────────────

@@ -133,6 +133,14 @@ async function preciosConfiguradosPorAscensor(idsAscensores, idTipoServicio) {
     };
   }
 
+  // Moneda homogénea: un plan multi-ascensor se factura en un único cobro/cuota
+  // por periodo (suma de todos los ascensores), y una cuota tiene una sola moneda.
+  // No se puede mezclar PEN y USD en el mismo plan.
+  const monedas = [...new Set(precios.map(p => p.moneda || MONEDA_POR_DEFECTO))];
+  if (monedas.length > 1) {
+    return { ok: false, error: 'Todos los ascensores del plan deben usar la misma moneda' };
+  }
+
   const items = ids.map(id => ({ id_ascensor: id, monto: Number(porAscensor.get(id).precio) }));
   const suma = items.reduce((acc, it) => acc + it.monto, 0);
   const moneda = precios[0]?.moneda || MONEDA_POR_DEFECTO;

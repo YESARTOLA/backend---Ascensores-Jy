@@ -10,6 +10,7 @@ router.use(permitirRoles('super_admin', 'admin', 'contabilidad'));
 router.get('/', c.listar);
 router.get('/proyectos', c.listarProyectos);
 router.get('/cuotas-calendario', c.cuotasCalendario);
+router.get('/cuotas-no-facturadas', c.cuotasNoFacturadas);
 router.get('/:id', c.obtener);
 router.put('/:id/plan-cuotas', c.actualizarPlanCuotas);
 router.post('/:id/pagos', c.registrarPago);
