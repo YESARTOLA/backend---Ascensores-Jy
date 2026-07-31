@@ -150,6 +150,12 @@ function sanitizarEconomicoTecnico(servicio, rolCodigo) {
   const clon = { ...servicio };
   delete clon.cobro;
   delete clon.facturas;
+  // El técnico no ve la cotización de origen (ni su código ni el enlace), pero
+  // sí sus ítems y sus fotos: se conservan `versiones` y `archivos`.
+  if (clon.cotizacion) {
+    const { id, codigo, estado_global, ...restoCot } = clon.cotizacion;
+    clon.cotizacion = restoCot;
+  }
   return clon;
 }
 
@@ -249,6 +255,16 @@ const obtener = async (req, res) => {
             codigo: true,
             estado_global: true,
             version_activa: true,
+            // Adjuntos de la cotización (fotos de referencia del trabajo). El
+            // técnico no ve la cotización, pero sí estas imágenes en el servicio.
+            archivos: {
+              where: { estado: 1 },
+              orderBy: { orden: 'asc' },
+              select: {
+                id: true,
+                archivo: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } }
+              }
+            },
             // Versiones con sus ítems (y la foto de cada ítem) para mostrar la
             // lista de ítems en la página del servicio. Los precios se ocultan a
             // los técnicos vía sanitizarPrecio().
@@ -1729,6 +1745,82 @@ const cambiarRequiereFactura = async (req, res) => {
   }
 };
 
+// Valores admitidos para "Cuarto de máquinas". NULL/'' = todavía sin definir.
+const CUARTO_MAQUINAS_VALIDOS = ['Si', 'No'];
+
+/**
+ * Guarda los datos operativos que el coordinador carga desde el card "Datos"
+ * del detalle de servicio: contacto en sitio (nombre + teléfono) y si el
+ * edificio tiene cuarto de máquinas.
+ *
+ * A diferencia de `actualizar` (super_admin/admin y solo en estados pre-campo),
+ * esto lo puede hacer el coordinador y también con el servicio ya en curso: es
+ * información de apoyo para el técnico, no toca precios, fechas ni estados.
+ * Solo se bloquea con el servicio cancelado.
+ */
+const actualizarDatosContacto = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const d = req.body || {};
+    const previo = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: {
+        id: true, estado: true, estado_servicio: true,
+        contacto_nombre: true, contacto_telefono: true, cuarto_maquinas: true
+      }
+    });
+    if (!previo || previo.estado === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (previo.estado_servicio === 'Cancelado') {
+      return res.status(409).json({ error: 'El servicio está cancelado: no se pueden editar sus datos.' });
+    }
+
+    // Cada campo solo se toca si viene en el body (edición parcial). Cadena
+    // vacía = limpiar el dato.
+    const limpiar = (v, max) => {
+      const t = String(v ?? '').trim();
+      return t === '' ? null : t.slice(0, max);
+    };
+    const data = { user_id_modification: req.user.id, date_time_modification: new Date() };
+    if (d.contacto_nombre !== undefined) data.contacto_nombre = limpiar(d.contacto_nombre, 150);
+    if (d.contacto_telefono !== undefined) data.contacto_telefono = limpiar(d.contacto_telefono, 30);
+    if (d.cuarto_maquinas !== undefined) {
+      const valor = limpiar(d.cuarto_maquinas, 2);
+      if (valor !== null && !CUARTO_MAQUINAS_VALIDOS.includes(valor)) {
+        return res.status(400).json({ error: 'Cuarto de máquinas solo admite "Si" o "No"' });
+      }
+      data.cuarto_maquinas = valor;
+    }
+
+    const servicio = await prisma.tbl_servicios_proyectos.update({ where: { id }, data });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: {
+        contacto_nombre: previo.contacto_nombre,
+        contacto_telefono: previo.contacto_telefono,
+        cuarto_maquinas: previo.cuarto_maquinas
+      },
+      valor_nuevo: {
+        contacto_nombre: servicio.contacto_nombre,
+        contacto_telefono: servicio.contacto_telefono,
+        cuarto_maquinas: servicio.cuarto_maquinas
+      },
+      ip: req.ip
+    });
+    res.json({
+      data: {
+        id,
+        contacto_nombre: servicio.contacto_nombre,
+        contacto_telefono: servicio.contacto_telefono,
+        cuarto_maquinas: servicio.cuarto_maquinas
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al guardar los datos del servicio' });
+  }
+};
+
 /**
  * Cambia la duración (días) de un servicio ya programado y regenera su grilla de
  * días + eventos de calendario. A diferencia de `actualizar` (gated a estados
@@ -1797,5 +1889,6 @@ module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
   asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
   promoverBorrador, revisarServicio, cambiarRequiereFactura, cambiarDuracion,
+  actualizarDatosContacto,
   crearGuia, actualizarGuia, eliminarGuia
 };

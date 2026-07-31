@@ -7,6 +7,9 @@ const { sincronizarRecordatorioServicio } = require('./recordatoriosAuto');
 const ESTADO_SERVICIO_FINALIZADO_TECNICO = 'Finalizado por técnico';
 const ESTADO_SERVICIO_FINALIZADO_OBSERVADO = 'Finalizado observado';
 const ESTADO_SERVICIO_CANCELADO = 'Cancelado';
+// El paso a este estado marca el inicio real del trabajo en obra: su primera
+// aparición en el historial es la "fecha de inicio del servicio".
+const ESTADO_SERVICIO_EN_CURSO = 'En curso';
 
 /**
  * Catálogo único de `tbl_servicios_realizados.estado_administrativo` — la etapa
@@ -223,6 +226,7 @@ module.exports = {
   ESTADO_SERVICIO_FINALIZADO_TECNICO,
   ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
   ESTADO_SERVICIO_CANCELADO,
+  ESTADO_SERVICIO_EN_CURSO,
   ESTADOS_SERVICIO,
   ESTADOS_SERVICIO_EDITABLES,
   ESTADOS_SERVICIO_EN_GESTION,

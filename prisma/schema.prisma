@@ -403,6 +403,12 @@ model tbl_servicios_proyectos {
   // correctivo → 1, emergencia → 0. Editable desde el formulario de creación.
   requiere_factura          Int                               @default(1)
   observaciones             String?
+  // Datos operativos que carga el coordinador desde el detalle del servicio
+  // (card "Datos"): a quién contactar en sitio y si el edificio tiene cuarto de
+  // máquinas. `cuarto_maquinas` solo admite 'Si' / 'No' (NULL = sin definir).
+  contacto_nombre           String?                           @db.VarChar(150)
+  contacto_telefono         String?                           @db.VarChar(30)
+  cuarto_maquinas           String?                           @db.VarChar(2)
   estado                    Int                               @default(1)
   user_id_registration      Int?
   date_time_registration    DateTime?                         @default(now()) @db.Timestamptz(6)

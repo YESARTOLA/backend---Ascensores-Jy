@@ -20,6 +20,14 @@ router.post(
   permitirRoles('super_admin', 'admin', 'coordinador'),
   c.materializarEvento
 );
+// Precio del plan: por ascensor y/o global (se reparte proporcional al desglose
+// vigente). Editable mientras haya periodos sin aprobar; los ya aprobados
+// conservan su monto en la cuota del cobro.
+router.put('/:id/precios', permitirRoles('super_admin', 'admin'), c.actualizarPrecios);
+// Precio de UNA ocurrencia concreta del plan (mantenimiento de un ascensor en
+// una fecha), sin tocar el precio pactado del plan.
+router.put('/servicios/:idServicio/precio', permitirRoles('super_admin', 'admin'), c.actualizarPrecioServicio);
+
 // Facturación por PERIODO del plan (unidad = ocurrencia de la frecuencia; una
 // factura y un pago por el total de todos los ascensores de ese periodo).
 router.get('/:id/periodos', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.listarPeriodos);

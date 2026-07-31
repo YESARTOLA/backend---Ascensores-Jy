@@ -15,6 +15,8 @@ router.put('/:id', permitirRoles('super_admin', 'admin'), c.actualizar);
 router.patch('/:id/duracion', permitirRoles('super_admin', 'admin'), c.cambiarDuracion);
 router.patch('/:id/estado', permitirRoles('super_admin', 'admin'), c.cambiarEstado);
 router.patch('/:id/requiere-factura', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.cambiarRequiereFactura);
+// Datos de apoyo que carga el coordinador: contacto en sitio y cuarto de máquinas.
+router.patch('/:id/datos-contacto', permitirRoles('super_admin', 'admin', 'coordinador'), c.actualizarDatosContacto);
 router.post('/:id/asignar', permitirRoles('super_admin', 'admin', 'coordinador'), c.asignarTecnicos);
 router.post('/:id/iniciar', c.iniciarServicio);
 router.post('/:id/finalizar', c.finalizarServicio);

@@ -7,10 +7,10 @@ const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServici
 const { paginar } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
-const { validarPertenenciaAscensores, preciosConfiguradosPorAscensor, repartirParejo } = require('../utils/ascensoresMonto');
+const { validarPertenenciaAscensores, preciosConfiguradosPorAscensor, repartirProporcional } = require('../utils/ascensoresMonto');
 const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
-const { estaServicioFinalizado } = require('../utils/estadoServicio');
+const { estaServicioFinalizado, esServicioEditable } = require('../utils/estadoServicio');
 const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
 const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 
@@ -20,6 +20,7 @@ const esModuloMantenimiento = (tipoServicio) => tipoServicio?.modulo_asociado ==
 const { idTecnicoFiltro, whereServicioGeneradoAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
 const { porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { puedeVerPrecio } = require('../middleware/rbacMiddleware');
 
 const COLOR_MANTENIMIENTO = COLORES.mantenimiento;
 
@@ -534,6 +535,10 @@ async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fecha
         moneda,
         sin_cobro: esGratuito ? 1 : 0,
         es_mantenimiento_gratuito: esGratuito ? 1 : 0,
+        // La factura del plan es ÚNICA por periodo (cuota del cobro del plan):
+        // estos servicios NO se facturan uno a uno, así que no deben contarse
+        // como "pendientes por facturar" en Contabilidad ni en el dashboard.
+        requiere_factura: 0,
         user_id_registration: userId,
         ascensores: {
           create: [{ id_ascensor: a.id_ascensor, monto, moneda, user_id_registration: userId }]
@@ -693,7 +698,10 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
 
   // Ascensores que cubre el plan (junction). El precio total del mantenimiento se
   // reparte entre ellos: por defecto se respetan los montos pactados en el plan;
-  // si llega un override de precio, se reparte parejo entre esos mismos ascensores.
+  // si llega un override de precio (edición del total desde el modal), se reparte
+  // PROPORCIONALMENTE a esos mismos montos pactados, nunca en partes iguales: con
+  // precios distintos por ascensor (100 / 300) un reparto parejo falsearía el
+  // desglose operativo aunque el total global cuadrara.
   const ascensoresPlan = (plan.ascensores || []).filter(a => a.estado === 1);
   if (ascensoresPlan.length === 0) {
     throw new Error('El plan no tiene ascensores asociados');
@@ -707,7 +715,7 @@ async function _materializarEventoEnTx(tx, evento, plan, userId, overrides = {})
       throw new Error('Precio inválido');
     }
     moneda = overrides.moneda || ascensoresPlan[0].moneda || MONEDA_POR_DEFECTO;
-    montosPorAscensor = repartirParejo(precio, ascensoresPlan.length);
+    montosPorAscensor = repartirProporcional(precio, ascensoresPlan.map(a => Number(a.monto)));
   } else {
     montosPorAscensor = ascensoresPlan.map(a => Number(a.monto));
     moneda = ascensoresPlan[0].moneda || MONEDA_POR_DEFECTO;
@@ -980,6 +988,12 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         ascensor_tipo: resumen.ascensor_tipo,
         tipo_servicio: s.tipo_servicio?.nombre || null,
         es_mantenimiento_gratuito: s.es_mantenimiento_gratuito === 1,
+        // Precio de ESTA ocurrencia (el del ascensor que cubre). Se sanitiza por
+        // rol en `listarInstancias`; el técnico nunca lo recibe.
+        precio_interno: Number(s.precio_interno || 0),
+        moneda: s.moneda,
+        sin_cobro: s.sin_cobro,
+        estado_servicio: s.estado_servicio,
         fecha_programada: s.fecha_programada,
         estado_ejecucion: ej.estado_ejecucion,
         fecha_inicio_real: ej.fecha_inicio_real,
@@ -1160,7 +1174,13 @@ const listarInstancias = async (req, res) => {
       ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q,
       id_tecnico_filtro
     });
-    res.json({ data });
+    // El precio de cada ocurrencia solo viaja a los roles que pueden verlo
+    // (mismo criterio que el resto de módulos): el técnico recibe la instancia
+    // sin datos económicos.
+    const salida = puedeVerPrecio(req)
+      ? data
+      : data.map(({ precio_interno, moneda, sin_cobro, ...resto }) => resto);
+    res.json({ data: salida });
   } catch (err) {
     console.error('[mantenimientos.listarInstancias]', err);
     res.status(500).json({ error: 'Error al listar mantenimientos individuales' });
@@ -1658,8 +1678,250 @@ const ajustarPeriodo = async (req, res) => {
   }
 };
 
+/**
+ * Servicios del plan cuyo PRECIO todavía se puede tocar: los que están en estado
+ * pre-campo y cuyo periodo aún NO fue aprobado para facturación (sin cuota en el
+ * cobro del plan). Aprobado el periodo, el monto ya vive en la cuota y el ajuste
+ * corresponde a Cobros (`ajustarPeriodo` / nota de crédito), no aquí.
+ *
+ * @returns {Promise<{ids:Set<number>, periodosBloqueados:number}>}
+ */
+async function _serviciosConPrecioEditable(client, idPlan) {
+  const info = await _periodosDelPlan(client, idPlan);
+  const ids = new Set();
+  let periodosBloqueados = 0;
+  for (const p of info.periodos) {
+    if (p.cuota) { periodosBloqueados++; continue; }
+    for (const s of p.servicios) {
+      if (esServicioEditable(s.estado_servicio)) ids.add(s.id);
+    }
+  }
+  return { ids, periodosBloqueados };
+}
+
+/**
+ * Aplica los montos por ascensor a los servicios ya materializados que aún son
+ * editables. Cada servicio del plan cubre UN ascensor, así que su `precio_interno`
+ * y el monto de su junction pasan a valer lo que se pactó para ese ascensor.
+ *
+ * @param {Map<number, number>} montoPorAscensor  id_ascensor → monto
+ * @returns {Promise<number>} cantidad de servicios actualizados
+ */
+async function _propagarPreciosAServicios(tx, { idPlan, montoPorAscensor, moneda, idsEditables, userId }) {
+  if (idsEditables.size === 0) return 0;
+  const servicios = await tx.tbl_servicios_proyectos.findMany({
+    where: { id: { in: [...idsEditables] }, id_mantenimiento_plan: idPlan, estado: 1 },
+    include: { ascensores: { where: { estado: 1 } } }
+  });
+  const stamp = { user_id_modification: userId, date_time_modification: new Date() };
+  let actualizados = 0;
+  for (const s of servicios) {
+    // Un mantenimiento gratuito no lleva precio: su cupo lo decide el plan.
+    if (s.sin_cobro === 1) continue;
+    const filas = s.ascensores;
+    const montos = filas.map(f => montoPorAscensor.get(f.id_ascensor));
+    if (montos.some(m => m === undefined)) continue; // ascensor ajeno al plan
+    const total = round2(montos.reduce((a, b) => a + b, 0));
+    await tx.tbl_servicios_proyectos.update({
+      where: { id: s.id },
+      data: { precio_interno: total, moneda, ...stamp }
+    });
+    for (let i = 0; i < filas.length; i++) {
+      await tx.tbl_servicios_ascensores.update({
+        where: { id: filas[i].id },
+        data: { monto: montos[i], moneda, ...stamp }
+      });
+    }
+    actualizados++;
+  }
+  return actualizados;
+}
+
+/**
+ * PUT /:id/precios — edita el precio del plan POR ASCENSOR y/o GLOBAL.
+ *
+ * Body (uno de los dos):
+ *   { ascensores: [{ id_ascensor, monto }, ...] }  → precio por ascensor (parcial:
+ *      los ascensores no enviados conservan su monto).
+ *   { precio_total: number }                       → precio global; se reparte
+ *      PROPORCIONALMENTE a los montos vigentes (respeta lo pactado por ascensor).
+ *   { propagar: false } para tocar solo el plan (futuras ocurrencias) y dejar
+ *      intactos los mantenimientos ya generados. Por defecto propaga.
+ *
+ * El nuevo desglose queda en la junction del plan (base de las próximas
+ * ocurrencias) y, salvo `propagar: false`, se aplica también a los mantenimientos
+ * ya materializados que siguen siendo editables y cuyo periodo no fue aprobado.
+ * Los periodos ya aprobados no se tocan: su monto vive en la cuota del cobro.
+ */
+const actualizarPrecios = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { ascensores, precio_total, propagar } = req.body || {};
+
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+      where: { id },
+      include: {
+        ascensores: {
+          where: { estado: 1 },
+          orderBy: { id: 'asc' },
+          include: { ascensor: { select: { id: true, codigo: true } } }
+        }
+      }
+    });
+    if (!plan || plan.estado === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    const filas = plan.ascensores;
+    if (filas.length === 0) return res.status(400).json({ error: 'El plan no tiene ascensores asociados' });
+
+    const moneda = filas[0].moneda || MONEDA_POR_DEFECTO;
+    // Montos finales por fila de la junction (parte del vigente y se sobrescribe).
+    const montoPorFila = new Map(filas.map(f => [f.id, Number(f.monto)]));
+
+    if (Array.isArray(ascensores) && ascensores.length > 0) {
+      const porAscensor = new Map(filas.map(f => [f.id_ascensor, f]));
+      for (const it of ascensores) {
+        const idAsc = Number(it?.id_ascensor);
+        const monto = Number(it?.monto);
+        const fila = porAscensor.get(idAsc);
+        if (!fila) return res.status(400).json({ error: `El ascensor ${idAsc} no pertenece a este plan` });
+        if (!Number.isFinite(monto) || monto < 0) {
+          return res.status(400).json({ error: `Monto inválido para el ascensor ${fila.ascensor?.codigo || idAsc}` });
+        }
+        montoPorFila.set(fila.id, round2(monto));
+      }
+    } else if (precio_total !== undefined && precio_total !== null && precio_total !== '') {
+      const total = Number(precio_total);
+      if (!Number.isFinite(total) || total < 0) return res.status(400).json({ error: 'Precio total inválido' });
+      const montos = repartirProporcional(total, filas.map(f => Number(f.monto)));
+      filas.forEach((f, i) => montoPorFila.set(f.id, montos[i]));
+    } else {
+      return res.status(400).json({ error: 'Indique los montos por ascensor o un precio total' });
+    }
+
+    const montoPorAscensor = new Map(filas.map(f => [f.id_ascensor, montoPorFila.get(f.id)]));
+    const debePropagar = propagar !== false;
+    const editables = debePropagar
+      ? await _serviciosConPrecioEditable(prisma, id)
+      : { ids: new Set(), periodosBloqueados: 0 };
+
+    const anterior = filas.map(f => ({ id_ascensor: f.id_ascensor, codigo: f.ascensor?.codigo, monto: Number(f.monto) }));
+    const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+
+    const resultado = await prisma.$transaction(async (tx) => {
+      for (const f of filas) {
+        const nuevo = montoPorFila.get(f.id);
+        if (round2(Number(f.monto)) === round2(nuevo)) continue;
+        await tx.tbl_mantenimientos_planes_ascensores.update({
+          where: { id: f.id }, data: { monto: nuevo, ...stamp }
+        });
+      }
+      const serviciosActualizados = debePropagar
+        ? await _propagarPreciosAServicios(tx, {
+            idPlan: id, montoPorAscensor, moneda, idsEditables: editables.ids, userId: req.user.id
+          })
+        : 0;
+      return { serviciosActualizados };
+    });
+
+    const nuevoDesglose = filas.map(f => ({
+      id_ascensor: f.id_ascensor, codigo: f.ascensor?.codigo, monto: montoPorFila.get(f.id), moneda
+    }));
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_mantenimientos_planes', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: { precios: anterior },
+      valor_nuevo: { precios: nuevoDesglose, servicios_actualizados: resultado.serviciosActualizados },
+      ip: req.ip
+    });
+
+    res.json({
+      data: {
+        ascensores: nuevoDesglose,
+        total: round2(nuevoDesglose.reduce((a, x) => a + Number(x.monto), 0)),
+        moneda,
+        servicios_actualizados: resultado.serviciosActualizados,
+        periodos_bloqueados: editables.periodosBloqueados
+      }
+    });
+  } catch (err) {
+    console.error('[mantenimientos.actualizarPrecios]', err);
+    res.status(500).json({ error: 'Error al actualizar precios del plan: ' + err.message });
+  }
+};
+
+/**
+ * PUT /servicios/:idServicio/precio — edita el precio de UNA instancia concreta
+ * del plan (el mantenimiento de un ascensor en una fecha), sin alterar el precio
+ * pactado del plan ni el resto de ocurrencias. Es la vía correcta para corregir
+ * el monto de un mantenimiento puntual: el módulo Proyectos no aplica a estos
+ * servicios (su formulario reclasificaría el registro).
+ *
+ * Solo si el servicio sigue en estado pre-campo y su periodo aún no fue aprobado.
+ */
+const actualizarPrecioServicio = async (req, res) => {
+  try {
+    const idServicio = Number(req.params.idServicio);
+    const monto = Number(req.body?.monto);
+    if (!Number.isFinite(monto) || monto < 0) return res.status(400).json({ error: 'Monto inválido' });
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: idServicio },
+      include: { ascensores: { where: { estado: 1 } } }
+    });
+    if (!servicio || servicio.estado === 0) return res.status(404).json({ error: 'Mantenimiento no encontrado' });
+    if (!servicio.id_mantenimiento_plan) {
+      return res.status(400).json({ error: 'El servicio no pertenece a un plan de mantenimiento' });
+    }
+    if (servicio.sin_cobro === 1) {
+      return res.status(400).json({ error: 'Es un mantenimiento gratuito (sin cobro): no lleva precio.' });
+    }
+    if (!esServicioEditable(servicio.estado_servicio)) {
+      return res.status(409).json({
+        error: `No se puede cambiar el precio de un mantenimiento en estado "${servicio.estado_servicio}". Solo antes de salir a campo.`
+      });
+    }
+    const info = await _periodosDelPlan(prisma, servicio.id_mantenimiento_plan);
+    const periodo = info.periodos.find(p => p.servicios.some(s => s.id === idServicio));
+    if (periodo?.cuota) {
+      return res.status(409).json({
+        error: `El periodo N° ${periodo.ordinal} ya fue aprobado para facturación. Ajuste el monto desde el cobro del plan.`
+      });
+    }
+
+    const filas = servicio.ascensores;
+    const montos = repartirProporcional(monto, filas.map(f => Number(f.monto)));
+    const moneda = req.body?.moneda || servicio.moneda || MONEDA_POR_DEFECTO;
+    const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+    const precioAnterior = Number(servicio.precio_interno);
+
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_servicios_proyectos.update({
+        where: { id: idServicio }, data: { precio_interno: round2(monto), moneda, ...stamp }
+      });
+      for (let i = 0; i < filas.length; i++) {
+        await tx.tbl_servicios_ascensores.update({
+          where: { id: filas[i].id }, data: { monto: montos[i], moneda, ...stamp }
+        });
+      }
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: idServicio,
+      accion: 'UPDATE',
+      valor_anterior: { precio_interno: precioAnterior },
+      valor_nuevo: { precio_interno: round2(monto), moneda, origen: 'plan de mantenimiento' },
+      ip: req.ip
+    });
+
+    res.json({ data: { id_servicio: idServicio, precio_interno: round2(monto), moneda } });
+  } catch (err) {
+    console.error('[mantenimientos.actualizarPrecioServicio]', err);
+    res.status(500).json({ error: 'Error al actualizar el precio del mantenimiento: ' + err.message });
+  }
+};
+
 module.exports = {
   listar, crear, actualizar, materializarEvento, listarFrecuencias,
+  actualizarPrecios, actualizarPrecioServicio,
   materializarSiguienteEventoDelPlan, listarInstancias, exportar,
   impactoEliminacion, eliminar,
   listarPeriodos, aprobarPeriodo, ajustarPeriodo,

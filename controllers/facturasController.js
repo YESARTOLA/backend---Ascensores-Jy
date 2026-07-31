@@ -1,6 +1,11 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado } = require('../utils/estadoServicio');
+const {
+  cambiarEstadoServicio,
+  estadoServicioDesdeCobro,
+  estaServicioFinalizado,
+  ESTADO_SERVICIO_EN_CURSO
+} = require('../utils/estadoServicio');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { descartarAlertaFacturarServicio } = require('../utils/recordatoriosAuto');
@@ -16,10 +21,31 @@ const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionElim
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
+/**
+ * Añade a la factura la fecha en que se inició el servicio facturado:
+ *  - `fecha_inicio_servicio`: primer paso a 'En curso' (inicio real en obra) y,
+ *    si el servicio aún no se inició, la fecha programada.
+ *  - `inicio_servicio_es_real`: distingue una de otra para la UI.
+ * En facturas de plan de mantenimiento (sin servicio) se usa el inicio del plan.
+ */
+function conFechaInicioServicio(f) {
+  const inicioReal = f.servicio?.historial_estados?.[0]?.fecha_cambio || null;
+  const programada = f.servicio?.fecha_programada || null;
+  const inicioPlan = !f.servicio ? (f.mantenimiento_plan?.fecha_inicio || null) : null;
+  return {
+    ...f,
+    fecha_inicio_servicio: inicioReal || programada || inicioPlan,
+    inicio_servicio_es_real: !!inicioReal
+  };
+}
+
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio, q, estado_factura, cobertura, desde, hasta } = req.query;
-    const where = { estado: 1 };
+    const { id_cliente, id_servicio, q, estado_factura, cobertura, tipo_categoria, desde, hasta } = req.query;
+    // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
+    // tipo de servicio): asignarlos a where.OR directamente se pisarían.
+    const and = [];
+    const where = { estado: 1, AND: and };
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_servicio) where.id_servicio = Number(id_servicio);
     if (estado_factura) where.estado_factura = estado_factura;
@@ -32,11 +58,26 @@ const listar = async (req, res) => {
       if (desde) where.fecha_emision.gte = parseYMDLima(desde);
       if (hasta) where.fecha_emision.lte = parseYMDFinDiaLima(hasta);
     }
-    if (q) where.OR = [
+    if (q) and.push({ OR: [
       { numero_factura: { contains: q, mode: 'insensitive' } },
       { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+      // RUC / DNI del cliente: contabilidad busca por documento tanto como por nombre.
+      { cliente: { numero_documento: { contains: q, mode: 'insensitive' } } },
       { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
-    ];
+    ] });
+    // Tipo de servicio facturado. Mismo criterio que el filtro de Cobros
+    // (cobrosController.listar): correctivo / preventivo (mantenimiento, incluye
+    // las facturas del cobro del plan) / proyecto.
+    if (tipo_categoria === 'proyecto') {
+      and.push({ servicio: { tipo_registro: 'proyecto' } });
+    } else if (tipo_categoria === 'correctivo') {
+      and.push({ servicio: { tipo_servicio: { modulo_asociado: 'correctivo' } } });
+    } else if (tipo_categoria === 'preventivo') {
+      and.push({ OR: [
+        { servicio: { tipo_servicio: { modulo_asociado: 'mantenimiento' } } },
+        { AND: [{ id_servicio: null }, { id_mantenimiento_plan: { not: null } }] }
+      ] });
+    }
 
     // Orden configurable por columna (whitelist para evitar inyección). El
     // correlativo refleja el orden de creación (id), por eso "correlativo" mapea
@@ -59,9 +100,32 @@ const listar = async (req, res) => {
 
     const result = await paginar(
       prisma.tbl_facturas,
-      { where, orderBy, include: { cliente: true, servicio: true, mantenimiento_plan: { include: { tipo_servicio: true } }, archivo: true, cobro: true, cuota: true } },
+      {
+        where,
+        orderBy,
+        include: {
+          cliente: true,
+          servicio: {
+            include: {
+              tipo_servicio: true,
+              // Primer paso a 'En curso' = inicio real del servicio en obra.
+              historial_estados: {
+                where: { estado_nuevo: ESTADO_SERVICIO_EN_CURSO },
+                orderBy: { fecha_cambio: 'asc' },
+                take: 1,
+                select: { fecha_cambio: true }
+              }
+            }
+          },
+          mantenimiento_plan: { include: { tipo_servicio: true } },
+          archivo: true,
+          cobro: true,
+          cuota: true
+        }
+      },
       req.query
     );
+    if (Array.isArray(result?.data)) result.data = result.data.map(conFechaInicioServicio);
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -73,10 +137,28 @@ const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const f = await prisma.tbl_facturas.findUnique({
-      where: { id }, include: { cliente: true, servicio: true, mantenimiento_plan: { include: { tipo_servicio: true } }, archivo: true, cobro: true, cuota: true }
+      where: { id },
+      include: {
+        cliente: true,
+        servicio: {
+          include: {
+            tipo_servicio: true,
+            historial_estados: {
+              where: { estado_nuevo: ESTADO_SERVICIO_EN_CURSO },
+              orderBy: { fecha_cambio: 'asc' },
+              take: 1,
+              select: { fecha_cambio: true }
+            }
+          }
+        },
+        mantenimiento_plan: { include: { tipo_servicio: true } },
+        archivo: true,
+        cobro: true,
+        cuota: true
+      }
     });
     if (!f) return res.status(404).json({ error: 'No encontrada' });
-    res.json({ data: f });
+    res.json({ data: conFechaInicioServicio(f) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener factura' });
@@ -199,6 +281,15 @@ const crear = async (req, res) => {
       where: { id: Number(d.id_servicio) }, include: { cobro: true, servicio_realizado: true }
     });
     if (!servicio) return res.status(400).json({ error: 'Servicio no existe' });
+    // Servicios de un PLAN de mantenimiento: la facturación es única a nivel de
+    // plan (una factura por periodo, contra la cuota del cobro del plan). Emitir
+    // un comprobante por el mantenimiento de un solo ascensor duplicaría lo que
+    // ya se factura en el total del periodo.
+    if (servicio.id_mantenimiento_plan) {
+      return res.status(400).json({
+        error: 'Este mantenimiento pertenece a un plan: se factura por el total del periodo, no por servicio. Emita la factura desde el cobro del plan.'
+      });
+    }
     // Regla ÚNICA de elegibilidad contable (utils/elegibilidadContable):
     //  - Origen cotización → habilitado por conversión efectiva a servicio.
     //  - Operativo → requiere aprobación administrativa (estado 'Revisado').
@@ -319,12 +410,21 @@ const crear = async (req, res) => {
 const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { estado_factura } = req.body;
+    const { estado_factura, motivo } = req.body;
     if (!esEstadoFacturaValido(estado_factura)) {
       return res.status(400).json({ error: `Estado inválido. Permitidos: ${ESTADOS_FACTURA.join(', ')}` });
     }
     const previo = await prisma.tbl_facturas.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'Factura no encontrada' });
+    if (previo.estado === 0) return res.status(404).json({ error: 'Factura no encontrada' });
+    // Una anulación es definitiva: la factura queda como constancia y el servicio
+    // (o la cuota) vuelve a admitir la emisión de una nueva. Revertirla podría
+    // dejar dos facturas vigentes sobre el mismo concepto.
+    if (previo.estado_factura === ESTADO_FACTURA_ANULADA) {
+      return estado_factura === ESTADO_FACTURA_ANULADA
+        ? res.status(400).json({ error: 'La factura ya está anulada.' })
+        : res.status(400).json({ error: 'Una factura anulada no se puede reactivar. Emita una nueva factura.' });
+    }
     const f = await prisma.tbl_facturas.update({
       where: { id },
       data: { estado_factura, user_id_modification: req.user.id, date_time_modification: new Date() }
@@ -359,7 +459,12 @@ const cambiarEstado = async (req, res) => {
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: id,
-      accion: 'STATUS_CHANGE', valor_anterior: { estado: previo.estado_factura }, valor_nuevo: { estado: estado_factura }, ip: req.ip
+      accion: 'STATUS_CHANGE',
+      valor_anterior: { estado: previo.estado_factura },
+      // El motivo de anulación no tiene columna propia: queda en la auditoría,
+      // que es donde se consulta el porqué de un cambio de estado.
+      valor_nuevo: { estado: estado_factura, ...(motivo ? { motivo: String(motivo).trim() } : {}) },
+      ip: req.ip
     });
     res.json({ data: f });
   } catch (err) {

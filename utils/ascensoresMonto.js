@@ -62,6 +62,34 @@ function repartirParejo(total, n) {
   return Array.from({ length: n }, (_, i) => (base + (i === n - 1 ? sobra : 0)) / 100);
 }
 
+/**
+ * Reparte `total` entre N ascensores RESPETANDO la proporción de sus montos
+ * pactados (`montosBase`). Se usa cuando el usuario edita el precio GLOBAL de un
+ * plan/ocurrencia multi-ascensor: el total manda, pero el desglose por ascensor
+ * mantiene la relación acordada (ej. 100/300 → al subir a 800 queda 200/600).
+ *
+ * Si la base suma 0 (o no hay base), no hay proporción que respetar y cae a
+ * `repartirParejo`. El último ascensor absorbe el sobrante de redondeo para que
+ * la suma cuadre exactamente con el total.
+ *
+ * @param {number} total
+ * @param {number[]} montosBase
+ * @returns {number[]} montos con la misma longitud que `montosBase`
+ */
+function repartirProporcional(total, montosBase) {
+  const base = (montosBase || []).map(m => Number(m) || 0);
+  const n = base.length;
+  if (n === 0) return [];
+  const sumaBase = base.reduce((a, b) => a + b, 0);
+  if (sumaBase <= 0) return repartirParejo(total, n);
+
+  const totalCentavos = Math.round(Number(total || 0) * 100);
+  const montos = base.map(m => Math.floor((totalCentavos * m) / sumaBase));
+  const asignado = montos.reduce((a, b) => a + b, 0);
+  montos[n - 1] += totalCentavos - asignado;
+  return montos.map(c => c / 100);
+}
+
 async function validarAscensores(input, idCliente, precioInterno, monedaServicio) {
   if (!Array.isArray(input) || input.length === 0) {
     return { ok: false, error: 'Debe seleccionar al menos un ascensor' };
@@ -151,6 +179,7 @@ module.exports = {
   validarAscensores,
   validarPertenenciaAscensores,
   repartirParejo,
+  repartirProporcional,
   preciosConfiguradosPorAscensor,
   TOLERANCIA_SUMA_ASCENSORES
 };

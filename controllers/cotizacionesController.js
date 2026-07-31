@@ -181,7 +181,7 @@ async function cargarVersionActiva(idCotizacion) {
 const listar = async (req, res) => {
   try {
     if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta, incluir_anuladas } = req.query;
+    const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = req.query;
     const mostrarAnuladas = incluir_anuladas === '1' || incluir_anuladas === 'true';
 
     const and = [];
@@ -212,6 +212,9 @@ const listar = async (req, res) => {
       and.push(estadosVirtual ? { estado_global: { in: estadosVirtual } } : { estado_global });
     }
     if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
+    // Filtro por ascensor: cotizaciones que incluyen ese ascensor existente.
+    // (Los ascensores "nuevos a instalar" no tienen id y quedan fuera del filtro.)
+    if (id_ascensor) and.push({ ascensores: { some: { estado: 1, id_ascensor: Number(id_ascensor) } } });
     if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
     if (desde || hasta) {
       const rango = {};
@@ -2146,7 +2149,7 @@ const INCLUDE_LISTA = {
 };
 
 function construirWhereCotizaciones(query) {
-  const { q, estado_global, id_cliente, id_tipo_servicio, desde, hasta } = query;
+  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta } = query;
   const where = { estado: 1 };
   if (q) where.OR = [
     // Código de la cotización
@@ -2169,6 +2172,8 @@ function construirWhereCotizaciones(query) {
     where.estado_global = estadosVirtual ? { in: estadosVirtual } : estado_global;
   }
   if (id_cliente) where.id_cliente = Number(id_cliente);
+  // Mismo filtro por ascensor que el listado (para exportar lo que se ve).
+  if (id_ascensor) where.ascensores = { some: { estado: 1, id_ascensor: Number(id_ascensor) } };
   if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
   if (desde || hasta) {
     where.date_time_registration = {};

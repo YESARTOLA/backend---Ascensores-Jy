@@ -125,8 +125,9 @@ const listar = async (req, res) => {
   try {
     const {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
-      id_cliente, id_tecnico, id_tipo_servicio, id_proyecto,
-      tipo_categoria, situacion_cobro, banco,
+      id_cliente, id_tipo_servicio, id_proyecto,
+      tipo_categoria, situacion_cobro, banco, id_cuenta_bancaria,
+      monto_min, monto_max,
       fecha_proximo_desde, fecha_proximo_hasta,
       orden, direccion
     } = req.query;
@@ -143,7 +144,6 @@ const listar = async (req, res) => {
 
     const filtroServicio = {};
     if (id_tipo_servicio) filtroServicio.id_tipo_servicio = Number(id_tipo_servicio);
-    if (id_tecnico) filtroServicio.asignaciones = { some: { id_tecnico: Number(id_tecnico), estado: 1 } };
     if (Object.keys(filtroServicio).length > 0) where.servicio = filtroServicio;
     // Alcance por tipo de edificio (Administrador): el cobro cuelga de un servicio
     // o de un plan de mantenimiento; se muestra si llega a un tipo permitido.
@@ -204,9 +204,24 @@ const listar = async (req, res) => {
         return true;
       });
     }
-    // Filtro por banco: cobros con al menos un pago recibido en una cuenta de ese banco.
-    if (banco) {
+    // Filtro por cuenta bancaria: cobros con al menos un abono recibido en ESA
+    // cuenta (número de cuenta concreto, no solo el banco). `banco` se mantiene
+    // por compatibilidad con enlaces/consumidores previos.
+    if (id_cuenta_bancaria) {
+      const idCuenta = Number(id_cuenta_bancaria);
+      data = data.filter(c => (c.pagos || []).some(p => p.id_cuenta_bancaria === idCuenta));
+    } else if (banco) {
       data = data.filter(c => (c.pagos || []).some(p => p.cuenta_bancaria?.banco === banco));
+    }
+    // Filtro por monto facturado (monto_total del cobro). Rango inclusivo; cada
+    // extremo es opcional. Se compara en centavos para evitar el error del float.
+    if (monto_min !== undefined && monto_min !== '') {
+      const min = aCentavos(monto_min);
+      if (!Number.isNaN(min)) data = data.filter(c => aCentavos(c.monto_total) >= min);
+    }
+    if (monto_max !== undefined && monto_max !== '') {
+      const max = aCentavos(monto_max);
+      if (!Number.isNaN(max)) data = data.filter(c => aCentavos(c.monto_total) <= max);
     }
     // Filtro de situación de cobro (opciones consolidadas).
     if (situacion_cobro) {
