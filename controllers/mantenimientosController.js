@@ -4,7 +4,7 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeFecha, finDelDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, COLORES } = require('../utils/recordatoriosAuto');
-const { paginar } = require('../utils/paginacion');
+const { paginar, paginarArray } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion } = require('../utils/frecuenciaMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarPertenenciaAscensores, preciosConfiguradosPorAscensor, repartirProporcional } = require('../utils/ascensoresMonto');
@@ -1162,6 +1162,12 @@ async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
  * reales y días de ejecución. Usado por la pestaña "Mantenimientos" del módulo.
  *
  * Filtros opcionales por query: id_plan, id_cliente, id_ascensor, estado_ejecucion, desde, hasta.
+ *
+ * Acepta `page`/`pageSize`. Como las ocurrencias futuras son proyecciones que
+ * no existen como filas en la base, el filtrado y el orden ocurren en memoria
+ * y la página se recorta con `paginarArray`. Sin `page` devuelve `{ data }`
+ * con todas las ocurrencias, que es lo que consumen el detalle de un plan y
+ * los reportes.
  */
 const listarInstancias = async (req, res) => {
   try {
@@ -1169,18 +1175,19 @@ const listarInstancias = async (req, res) => {
     const ids_cliente = _normalizarIds(id_cliente);
     const ids_ascensor = _normalizarIds(id_ascensor);
     const id_tecnico_filtro = idTecnicoFiltro(req.user);
-    const data = await _obtenerInstanciasMantenimiento({
+    const todas = await _obtenerInstanciasMantenimiento({
       id_plan: id_plan ? Number(id_plan) : null,
       ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q,
       id_tecnico_filtro
     });
+    const resultado = paginarArray(todas, req.query);
     // El precio de cada ocurrencia solo viaja a los roles que pueden verlo
     // (mismo criterio que el resto de módulos): el técnico recibe la instancia
-    // sin datos económicos.
-    const salida = puedeVerPrecio(req)
-      ? data
-      : data.map(({ precio_interno, moneda, sin_cobro, ...resto }) => resto);
-    res.json({ data: salida });
+    // sin datos económicos. Se sanea solo la página devuelta.
+    if (!puedeVerPrecio(req)) {
+      resultado.data = resultado.data.map(({ precio_interno, moneda, sin_cobro, ...resto }) => resto);
+    }
+    res.json(resultado);
   } catch (err) {
     console.error('[mantenimientos.listarInstancias]', err);
     res.status(500).json({ error: 'Error al listar mantenimientos individuales' });
