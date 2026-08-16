@@ -4,11 +4,14 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const {
   cambiarEstadoServicio,
+  cambiarEstadoServicioSiEstaEn,
   esServicioEditable,
   esServicioPostRevision,
   estaServicioFinalizado,
   ESTADO_SERVICIO_FINALIZADO_TECNICO,
   ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
+  ESTADO_SERVICIO_EN_CURSO,
+  ESTADOS_SERVICIO,
   ESTADO_ADMIN_REVISADO,
   ESTADO_ADMIN_OBSERVADO,
   ESTADO_ADMIN_RECHAZADO,
@@ -47,7 +50,19 @@ const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere, servicioVisiblePor
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
 const { _recalcEstadoChecklist } = require('./checklistController');
 const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
+const { datosSitioParaServicio, normalizarCuartoMaquinas } = require('../utils/datosSitioAscensor');
 const { ensureChecklistFinalizacion } = require('./checklistFinalizacionController');
+const configuracion = require('../utils/configuracion');
+const { estadoPlazoCierre } = require('../utils/plazoCierre');
+
+/**
+ * Estado del plazo que tiene el técnico para cerrar el servicio, leyendo el
+ * parámetro configurable SERVICIO_CIERRE_PLAZO_DIAS.
+ */
+async function plazoCierreDeServicio(servicio) {
+  const dias = await configuracion.obtener('SERVICIO_CIERRE_PLAZO_DIAS');
+  return estadoPlazoCierre(servicio, dias);
+}
 
 /**
  * Resuelve la lista de ascensores de un proyecto a ids concretos, dentro de una
@@ -343,6 +358,10 @@ const obtener = async (req, res) => {
       sanitizarPrecio(servicio, req.user.rol_codigo),
       req.user.rol_codigo
     );
+    // Plazo que tiene el técnico para registrar el cierre (y si el super admin ya
+    // lo habilitó fuera de plazo). Lo consume el panel del técnico para explicar
+    // el bloqueo y el detalle del servicio para ofrecer la habilitación.
+    data.plazo_cierre = await plazoCierreDeServicio(servicio);
     res.json({ data });
   } catch (err) {
     console.error(err);
@@ -414,6 +433,9 @@ const crear = async (req, res) => {
         // reparto del precio global entre todos ellos.
         idsAscensores = await resolverAscensoresProyectoEnTx(tx, d.ascensores, d.id_cliente, req.user.id);
         const montos = repartirParejo(precioProyecto, idsAscensores.length);
+        // Contacto en sitio y cuarto de máquinas: se heredan de la ficha del
+        // ascensor para que el técnico los tenga sin recargarlos a mano.
+        const datosSitio = await datosSitioParaServicio(tx, idsAscensores, d);
         const s = await tx.tbl_servicios_proyectos.create({
           data: {
             codigo,
@@ -433,6 +455,7 @@ const crear = async (req, res) => {
             moneda: monedaProyecto,
             sin_cobro: d.sin_cobro ? 1 : 0,
             observaciones: d.observaciones || null,
+            ...datosSitio,
             user_id_registration: req.user.id,
             ascensores: {
               create: idsAscensores.map((idAsc, i) => ({
@@ -776,6 +799,23 @@ const cambiarEstado = async (req, res) => {
     const { estado_servicio } = req.body;
     const previo = await prisma.tbl_servicios_proyectos.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (!ESTADOS_SERVICIO.includes(estado_servicio)) {
+      return res.status(400).json({ error: `Estado inválido. Use: ${ESTADOS_SERVICIO.join(', ')}` });
+    }
+    // Este endpoint genérico no puede usarse para cerrar ni para reabrir:
+    //  - marcar "Finalizado …" a mano se saltaría la guía, las evidencias, la
+    //    OT, el folder de revisión y el cobro que crea POST /:id/finalizar;
+    //  - devolver a un estado operativo un servicio ya finalizado volvería a
+    //    mostrar el botón "Finalizar" (doble finalización). Para devolverlo a
+    //    corrección está la revisión administrativa (observar / rechazar).
+    if (estado_servicio.startsWith('Finalizado')) {
+      return res.status(400).json({ error: 'Para finalizar un servicio use la acción Finalizar (registra guía, evidencias y OT)' });
+    }
+    if (estaServicioFinalizado(previo.estado_servicio) && !estaServicioFinalizado(estado_servicio)) {
+      return res.status(400).json({
+        error: `El servicio está ${previo.estado_servicio}: no se puede devolver a ${estado_servicio}. Use la revisión administrativa para observarlo o rechazarlo.`
+      });
+    }
 
     // cambiarEstadoServicio registra historial, sincroniza recordatorio y
     // sincroniza estado_global de la cotización origen (si la hay).
@@ -970,8 +1010,16 @@ const iniciarServicio = async (req, res) => {
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-    if (servicio.estado_servicio === 'Cancelado' || servicio.estado_servicio.startsWith('Finalizado')) {
-      return res.status(400).json({ error: 'Servicio no se puede iniciar' });
+    // Un servicio ya finalizado (por técnico / observado) o que pasó al circuito
+    // administrativo-contable (revisión, cobro, facturación, cerrado) NO se
+    // vuelve a poner en marcha por esta vía: reabrirlo dejaría otra vez visible
+    // el botón "Finalizar" y permitiría finalizarlo dos veces. La única
+    // reapertura legítima es la revisión administrativa cuando observa o
+    // rechaza el servicio (`revisarServicio`).
+    if (servicio.estado_servicio === 'Cancelado' || estaServicioFinalizado(servicio.estado_servicio)) {
+      return res.status(400).json({
+        error: `El servicio está ${servicio.estado_servicio}: ya no se puede volver a poner en curso`
+      });
     }
 
     // Validar checklist completo si la acción es iniciar_servicio
@@ -1030,7 +1078,17 @@ const finalizarServicio = async (req, res) => {
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-    if (servicio.estado_servicio !== 'En curso') {
+    // Un servicio solo se finaliza UNA vez. Si ya lo cerró el técnico (o ya
+    // avanzó a revisión / cobro / facturación) se corta aquí con 409 para que la
+    // UI recargue y deje de ofrecer el botón. El chequeo definitivo, a prueba de
+    // peticiones simultáneas, es el "claim" atómico de más abajo.
+    if (estaServicioFinalizado(servicio.estado_servicio)) {
+      return res.status(409).json({
+        error: `El servicio ya fue finalizado (${servicio.estado_servicio}): no se puede volver a finalizar`,
+        estado: servicio.estado_servicio
+      });
+    }
+    if (servicio.estado_servicio !== ESTADO_SERVICIO_EN_CURSO) {
       return res.status(400).json({ error: 'El servicio debe estar en curso para finalizarlo' });
     }
     const sinGuia = !id_archivo_guia && servicio.guias.length === 0;
@@ -1073,6 +1131,20 @@ const finalizarServicio = async (req, res) => {
       return res.status(403).json({ error: 'Solo Admin o Super Admin pueden finalizar como observado sin guía' });
     }
 
+    // Plazo de cierre: el técnico dispone de SERVICIO_CIERRE_PLAZO_DIAS días
+    // calendario desde el último día programado. Vencido el plazo, solo puede
+    // cerrar si el super administrador habilitó ESTE servicio. Admin y super
+    // admin cierran siempre (son quienes destraban el caso).
+    if (req.user.rol_codigo === 'tecnico') {
+      const plazo = await plazoCierreDeServicio(servicio);
+      if (!plazo.puede_cerrar_tecnico) {
+        return res.status(403).json({
+          error: `El plazo para registrar el cierre venció el ${plazo.fecha_limite} (${plazo.plazo_dias} día(s) desde la fecha programada). Solicita al super administrador que habilite el cierre de este servicio.`,
+          plazo_cierre: plazo
+        });
+      }
+    }
+
     // Permiso: técnico responsable documental o admin
     if (req.user.rol_codigo === 'tecnico') {
       const esResponsable = servicio.asignaciones.find(a => a.id_tecnico === req.user.id_tecnico && a.responsable_documentacion === 1);
@@ -1085,6 +1157,29 @@ const finalizarServicio = async (req, res) => {
 
     const responsableDoc = servicio.asignaciones.find(a => a.responsable_documentacion === 1) || servicio.asignaciones[0];
     const responsablePrincipal = servicio.asignaciones.find(a => a.responsable_principal === 1) || responsableDoc;
+
+    // CLAIM de la finalización. Pasa el servicio a su estado final ANTES de
+    // escribir guía, evidencias, folder y cobro, y solo si sigue 'En curso'.
+    // Dos peticiones simultáneas (doble clic, dos pestañas, reintento de red,
+    // dos usuarios a la vez) leerían ambas 'En curso' en las validaciones de
+    // arriba; aquí solo una gana el UPDATE condicional y la otra se corta con
+    // 409, sin duplicar guías, evidencias, historial ni cobro.
+    // (cambiarEstadoServicioSiEstaEn registra el historial, sincroniza el
+    // recordatorio y el estado_global de la cotización origen.)
+    const estadoFinal = (sinGuia && finalizar_observado) ? ESTADO_SERVICIO_FINALIZADO_OBSERVADO : ESTADO_SERVICIO_FINALIZADO_TECNICO;
+    const claim = await cambiarEstadoServicioSiEstaEn(
+      id, [ESTADO_SERVICIO_EN_CURSO], estadoFinal, req.user.id,
+      (sinGuia && finalizar_observado) ? 'Finalización observada por admin' : null
+    );
+    if (!claim) {
+      const actual = await prisma.tbl_servicios_proyectos.findUnique({
+        where: { id }, select: { estado_servicio: true }
+      });
+      return res.status(409).json({
+        error: `El servicio ya fue finalizado (${actual?.estado_servicio}): no se puede volver a finalizar`,
+        estado: actual?.estado_servicio
+      });
+    }
 
     // Crear guía si llegó id_archivo o se está marcando observado
     if (id_archivo_guia || codigo_guia || (sinGuia && finalizar_observado)) {
@@ -1121,13 +1216,7 @@ const finalizarServicio = async (req, res) => {
       }
     }
 
-    // Actualizar estado servicio (cambiarEstadoServicio registra historial,
-    // recordatorios y sincroniza estado_global de cotización).
-    const estadoFinal = (sinGuia && finalizar_observado) ? ESTADO_SERVICIO_FINALIZADO_OBSERVADO : ESTADO_SERVICIO_FINALIZADO_TECNICO;
-    await cambiarEstadoServicio(
-      id, estadoFinal, req.user.id,
-      (sinGuia && finalizar_observado) ? 'Finalización observada por admin' : null
-    );
+    // El estado final ya se fijó arriba, en el claim.
 
     // Si el cobro ya existe (servicio aprobado desde cotización), heredamos
     // su estado para no pisar pagos/facturas que ya pudieron haberse
@@ -1214,9 +1303,14 @@ const finalizarServicio = async (req, res) => {
         idUsuario: req.user.id
       });
     }
-    // Transición a "En revisión administrativa" (gate previo al envío a cobros)
+    // Transición a "En revisión administrativa" (gate previo al envío a cobros).
+    // Condicionada al estado que dejó el claim: si algo movió el servicio entre
+    // medias, no lo pisamos.
     if (estadoFinal === ESTADO_SERVICIO_FINALIZADO_TECNICO) {
-      await cambiarEstadoServicio(id, 'En revisión administrativa', req.user.id, 'Servicio pendiente de revisión administrativa');
+      await cambiarEstadoServicioSiEstaEn(
+        id, [ESTADO_SERVICIO_FINALIZADO_TECNICO], 'En revisión administrativa',
+        req.user.id, 'Servicio pendiente de revisión administrativa'
+      );
     }
 
     // Liberar técnicos
@@ -1278,6 +1372,15 @@ const finalizarServicio = async (req, res) => {
     await prisma.tbl_calendario_eventos.updateMany({
       where: { id_servicio: id }, data: { estado_evento: ESTADO_EVENTO_FINALIZADO }
     });
+
+    // La habilitación de cierre fuera de plazo es un permiso PUNTUAL: se consume
+    // al cerrarse el servicio (si se reabre, hay que volver a habilitarlo).
+    if (servicio.cierre_fuera_plazo_habilitado) {
+      await prisma.tbl_servicios_proyectos.update({
+        where: { id },
+        data: { cierre_fuera_plazo_habilitado: false, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+    }
 
     // Alertas de "servicio finalizado" para el calendario. Se sincronizan AQUÍ
     // (no al generar el informe) porque recién en este punto el servicio está en
@@ -1745,9 +1848,6 @@ const cambiarRequiereFactura = async (req, res) => {
   }
 };
 
-// Valores admitidos para "Cuarto de máquinas". NULL/'' = todavía sin definir.
-const CUARTO_MAQUINAS_VALIDOS = ['Si', 'No'];
-
 /**
  * Guarda los datos operativos que el coordinador carga desde el card "Datos"
  * del detalle de servicio: contacto en sitio (nombre + teléfono) y si el
@@ -1784,11 +1884,9 @@ const actualizarDatosContacto = async (req, res) => {
     if (d.contacto_nombre !== undefined) data.contacto_nombre = limpiar(d.contacto_nombre, 150);
     if (d.contacto_telefono !== undefined) data.contacto_telefono = limpiar(d.contacto_telefono, 30);
     if (d.cuarto_maquinas !== undefined) {
-      const valor = limpiar(d.cuarto_maquinas, 2);
-      if (valor !== null && !CUARTO_MAQUINAS_VALIDOS.includes(valor)) {
-        return res.status(400).json({ error: 'Cuarto de máquinas solo admite "Si" o "No"' });
-      }
-      data.cuarto_maquinas = valor;
+      const cm = normalizarCuartoMaquinas(d.cuarto_maquinas);
+      if (cm.error) return res.status(400).json({ error: cm.error });
+      data.cuarto_maquinas = cm.valor;
     }
 
     const servicio = await prisma.tbl_servicios_proyectos.update({ where: { id }, data });
@@ -1885,10 +1983,66 @@ const cambiarDuracion = async (req, res) => {
   }
 };
 
+/**
+ * Habilita (o revoca) el cierre fuera de plazo de UN servicio. Solo super admin.
+ *
+ * El técnico tiene SERVICIO_CIERRE_PLAZO_DIAS días desde el último día programado
+ * para registrar el cierre; vencido el plazo queda bloqueado y necesita esta
+ * habilitación puntual, que se consume cuando el servicio se finaliza.
+ *
+ * Body: { habilitar: true | false }  (default true)
+ */
+const habilitarCierreFueraPlazo = async (req, res) => {
+  try {
+    if (req.user.rol_codigo !== 'super_admin') {
+      return res.status(403).json({ error: 'Solo el super administrador puede habilitar un cierre fuera de plazo' });
+    }
+    const id = Number(req.params.id);
+    const habilitar = req.body?.habilitar === undefined ? true : Boolean(req.body.habilitar);
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: {
+        id: true, codigo: true, estado: true, estado_servicio: true,
+        fecha_programada: true, duracion_dias: true,
+        cierre_fuera_plazo_habilitado: true
+      }
+    });
+    if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (estaServicioFinalizado(servicio.estado_servicio)) {
+      return res.status(409).json({ error: `El servicio ya fue finalizado (${servicio.estado_servicio})` });
+    }
+
+    await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: {
+        cierre_fuera_plazo_habilitado: habilitar,
+        cierre_habilitado_por: habilitar ? req.user.id : null,
+        cierre_habilitado_en: habilitar ? new Date() : null,
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      }
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: { cierre_fuera_plazo_habilitado: servicio.cierre_fuera_plazo_habilitado },
+      valor_nuevo: { cierre_fuera_plazo_habilitado: habilitar }, ip: req.ip
+    });
+
+    const plazo = await plazoCierreDeServicio({ ...servicio, cierre_fuera_plazo_habilitado: habilitar });
+    res.json({ ok: true, plazo_cierre: plazo });
+  } catch (err) {
+    console.error('[servicios.habilitarCierreFueraPlazo]', err);
+    res.status(500).json({ error: 'Error al habilitar el cierre: ' + err.message });
+  }
+};
+
 module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
   asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
   promoverBorrador, revisarServicio, cambiarRequiereFactura, cambiarDuracion,
-  actualizarDatosContacto,
+  actualizarDatosContacto, habilitarCierreFueraPlazo,
   crearGuia, actualizarGuia, eliminarGuia
 };

@@ -7,6 +7,8 @@ const c = require('../controllers/ascensoresController');
 router.use(verificarToken);
 
 router.get('/', c.listar);
+// Antes de '/:id' para que 'exportar' no se interprete como un id.
+router.get('/exportar', c.exportar);
 router.get('/:id', c.obtener);
 router.get('/:id/historial', c.historial);
 router.post('/', permitirRoles('super_admin', 'admin', 'coordinador', 'vendedora'), c.crear);

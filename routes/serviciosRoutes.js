@@ -18,8 +18,16 @@ router.patch('/:id/requiere-factura', permitirRoles('super_admin', 'admin', 'coo
 // Datos de apoyo que carga el coordinador: contacto en sitio y cuarto de máquinas.
 router.patch('/:id/datos-contacto', permitirRoles('super_admin', 'admin', 'coordinador'), c.actualizarDatosContacto);
 router.post('/:id/asignar', permitirRoles('super_admin', 'admin', 'coordinador'), c.asignarTecnicos);
-router.post('/:id/iniciar', c.iniciarServicio);
-router.post('/:id/finalizar', c.finalizarServicio);
+// Puesta en marcha: admin y el técnico asignado; el coordinador también la mueve
+// desde la pantalla de Asignaciones.
+router.post('/:id/iniciar', permitirRoles('super_admin', 'admin', 'coordinador', 'tecnico'), c.iniciarServicio);
+// Cierre del servicio: solo quien lo ejecuta (técnico responsable) o admin. El
+// controlador valida además que el técnico sea el responsable documental y que
+// el servicio siga 'En curso' (no se finaliza dos veces).
+router.post('/:id/finalizar', permitirRoles('super_admin', 'admin', 'tecnico'), c.finalizarServicio);
+// Habilita el cierre de un servicio cuyo plazo (SERVICIO_CIERRE_PLAZO_DIAS) venció.
+// Permiso puntual y exclusivo del super administrador; se consume al finalizarse.
+router.patch('/:id/habilitar-cierre', permitirRoles('super_admin'), c.habilitarCierreFueraPlazo);
 router.post('/:id/cancelar', permitirRoles('super_admin', 'admin'), c.cancelar);
 router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 router.post('/:id/promover', permitirRoles('super_admin', 'admin', 'coordinador'), c.promoverBorrador);

@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
 const { registrarAuditoria } = require('../utils/auditoria');
@@ -155,6 +156,8 @@ const convertir = async (req, res) => {
     const fecha = d.fecha_programada ? parseYMDLima(d.fecha_programada) : new Date();
 
     const resultado = await prisma.$transaction(async (tx) => {
+      // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
+      const datosSitio = await datosSitioParaServicio(tx, [d.id_ascensor], d);
       const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo,
@@ -170,6 +173,7 @@ const convertir = async (req, res) => {
           precio_interno: d.precio_interno,
           moneda: d.moneda || 'PEN',
           observaciones: d.observaciones || null,
+          ...datosSitio,
           user_id_registration: req.user.id,
           ascensores: {
             create: [{

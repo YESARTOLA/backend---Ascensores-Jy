@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioEmergencia, sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
@@ -159,6 +160,8 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'No hay un subtipo de servicio vinculado al módulo Emergencias. Créelo en Tipos de servicio.' });
     }
     const { tipo_registro: tipoRegistroEm } = clasificarTipoServicio(tipoEmergencia);
+    // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
+    const datosSitio = await datosSitioParaServicio(prisma, [d.id_ascensor], d);
 
     const servicio = await prisma.tbl_servicios_proyectos.create({
       data: {
@@ -179,6 +182,7 @@ const crear = async (req, res) => {
         sin_cobro: sinCobro ? 1 : 0,
         requiere_factura: requiereFactura,
         observaciones: d.observaciones || null,
+        ...datosSitio,
         user_id_registration: req.user.id,
         ascensores: {
           create: [{
@@ -361,7 +365,8 @@ const actualizar = async (req, res) => {
           id_ascensor: nuevoIdAscensor,
           motivo: nuevoMotivo,
           nivel_urgencia: nuevoNivel,
-          estado_emergencia: d.estado_emergencia ?? previo.estado_emergencia,
+          // `estado_emergencia` no se edita: lo deriva el servicio que atiende la
+          // emergencia (ver sincronizarEstadoEmergencia en utils/estadoServicio.js).
           observaciones: d.observaciones ?? previo.observaciones,
           user_id_modification: req.user.id, date_time_modification: new Date()
         }

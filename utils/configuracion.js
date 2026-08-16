@@ -1,8 +1,8 @@
 /**
  * Lectura de configuración del sistema desde tbl_configuracion.
  *
- * - Centraliza valores que antes podrían estar hardcodeados (IGV, validez por defecto,
- *   datos de empresa para PDF, etc.).
+ * - Centraliza valores que antes podrían estar hardcodeados (IGV, términos de
+ *   cotización, datos de empresa para PDF, etc.).
  * - Cache en memoria con TTL corto para no martillar la BD en cada request.
  * - Fallback a env vars y luego a defaults explícitos si la clave no existe en BD.
  */
@@ -14,14 +14,17 @@ const cache = new Map(); // clave -> { valor, hasta }
 
 const DEFAULTS = Object.freeze({
   IGV_RATE: '0.18',
-  COTIZACION_VALIDEZ_DIAS: '15',
-  COTIZACION_TERMINOS: 'Cotización válida hasta la fecha indicada. Precios en soles, incluyen IGV. Forma de pago se acuerda al confirmar el servicio.',
+  COTIZACION_TERMINOS: 'Precios en soles, incluyen IGV. Forma de pago se acuerda al confirmar el servicio.',
   EMPRESA_RAZON_SOCIAL: 'Ascensores Jy S.A.C.',
   EMPRESA_RUC: '20000000000',
   EMPRESA_DIRECCION: 'Lima, Perú',
   EMPRESA_TELEFONO: '',
   EMPRESA_CORREO: '',
   CLIENTES_DIAS_AVISO_VENCIMIENTO_CONTRATO: '30',
+  // Días CALENDARIO que tiene el técnico, contados desde el último día programado
+  // del servicio, para registrar el cierre. Vencido el plazo solo puede cerrar si
+  // el super administrador habilita ese servicio. Ver utils/plazoCierre.js.
+  SERVICIO_CIERRE_PLAZO_DIAS: '3',
   // Centro y zoom por defecto para el mapa de ubicación de clientes.
   // Lima Metropolitana (Plaza Mayor). Se leen tanto en el formulario de
   // creación/edición como en las vistas read-only cuando un cliente todavía
@@ -33,7 +36,6 @@ const DEFAULTS = Object.freeze({
 
 const TIPOS = Object.freeze({
   IGV_RATE: 'number',
-  COTIZACION_VALIDEZ_DIAS: 'number',
   COTIZACION_TERMINOS: 'string',
   EMPRESA_RAZON_SOCIAL: 'string',
   EMPRESA_RUC: 'string',
@@ -41,6 +43,7 @@ const TIPOS = Object.freeze({
   EMPRESA_TELEFONO: 'string',
   EMPRESA_CORREO: 'string',
   CLIENTES_DIAS_AVISO_VENCIMIENTO_CONTRATO: 'number',
+  SERVICIO_CIERRE_PLAZO_DIAS: 'number',
   MAPA_CENTRO_LAT: 'number',
   MAPA_CENTRO_LNG: 'number',
   MAPA_ZOOM_DEFAULT: 'number'

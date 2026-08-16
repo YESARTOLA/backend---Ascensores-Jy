@@ -1,10 +1,12 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima } = require('../utils/tiempo');
+const { parseYMDLima, ymdLima } = require('../utils/tiempo');
+const { CLASIFICACIONES_CODIGOS, normalizarClasificacion } = require('../utils/catalogosClientes');
 const { bajaAscensorCascadaEnTx } = require('../utils/bajaAscensorCascada');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { MONEDAS_CODIGOS, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { normalizarDatosSitio } = require('../utils/datosSitioAscensor');
 const {
   aplicaAlcance,
   aplicaAlcanceEdificio,
@@ -75,54 +77,125 @@ async function reemplazarPreciosAscensor(tx, idAscensor, payload, idUsuario) {
   }
 }
 
+/**
+ * Construye el `where` Prisma del listado de ascensores. Centralizado para que
+ * listar() y exportar() apliquen exactamente los mismos criterios.
+ *
+ * Filtros soportados:
+ *   q                — texto libre sobre código / ubicación / marca / edificio / cliente
+ *   id_edificio      — ascensores de ese edificio (tiene prioridad sobre id_cliente)
+ *   id_cliente       — ascensores del cliente, resueltos a través de su edificio
+ *   tipo             — tipo de ascensor (catálogo)
+ *   estado_operativo — Operativo | En observación | … | Inactivo
+ *   clasificacion    — código del catálogo compartido con clientes
+ *   estado           — '1' activos (por defecto) | '0' inactivos | 'todos'
+ *
+ * `user` aplica el ámbito (Servicios/Proyectos) y el alcance por tipo de edificio.
+ */
+function construirWhereAscensores(query, user) {
+  const { q, id_cliente, id_edificio, estado_operativo, tipo, clasificacion, estado } = query;
+  // Por defecto solo activos; 'todos' desactiva el filtro y '0' lista las bajas.
+  const where = {};
+  if (estado === '0' || estado === '1') where.estado = Number(estado);
+  else if (estado !== 'todos') where.estado = 1;
+
+  if (q) {
+    where.OR = [
+      { codigo: { contains: q, mode: 'insensitive' } },
+      { ubicacion: { contains: q, mode: 'insensitive' } },
+      { marca: { contains: q, mode: 'insensitive' } },
+      { edificio: { is: { nombre: { contains: q, mode: 'insensitive' } } } },
+      { edificio: { is: { cliente: { is: { nombre: { contains: q, mode: 'insensitive' } } } } } }
+    ];
+  }
+  // El ascensor pertenece a un edificio; el filtro por cliente se resuelve a
+  // través del edificio.
+  if (id_edificio) where.id_edificio = Number(id_edificio);
+  else if (id_cliente) where.edificio = { is: { id_cliente: Number(id_cliente) } };
+  if (estado_operativo) where.estado_operativo = estado_operativo;
+  if (tipo) where.tipo = tipo;
+  if (clasificacion && CLASIFICACIONES_CODIGOS.includes(clasificacion)) where.clasificacion = clasificacion;
+
+  // Ámbito del usuario: solo ascensores de clientes dentro del ámbito. Se aplica
+  // vía AND para no pisar el filtro por edificio/cliente de arriba.
+  conAlcance(where, ascensorAlcanceWhere(user));
+  // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+  conAlcance(where, ascensorEdificioAlcanceWhere(user));
+  return where;
+}
+
+// Ordenamiento por columna (cabeceras clickables del listado): campo permitido
+// + dirección; si no viene, orden por defecto (más recientes primero).
+function ordenAscensores({ sort, dir }) {
+  const direccion = dir === 'asc' ? 'asc' : 'desc';
+  const ORDEN = {
+    codigo: { codigo: direccion },
+    edificio: { edificio: { nombre: direccion } },
+    tipo: { tipo: direccion },
+    ubicacion: { ubicacion: direccion },
+    // Ubicación geográfica y naturaleza (Edificio/Obra): viven en el edificio.
+    distrito: { edificio: { distrito: direccion } },
+    tipo_edificio: { edificio: { tipo: direccion } },
+    clasificacion: { clasificacion: direccion },
+    estado: { estado_operativo: direccion },
+    proximo_mantenimiento: { proximo_mantenimiento: direccion }
+  };
+  return ORDEN[sort] || { id: 'desc' };
+}
+
 const listar = async (req, res) => {
   try {
-    const { q, id_cliente, id_edificio, estado_operativo, tipo, sort, dir } = req.query;
-    const where = { estado: 1 };
-    if (q) {
-      where.OR = [
-        { codigo: { contains: q, mode: 'insensitive' } },
-        { ubicacion: { contains: q, mode: 'insensitive' } },
-        { marca: { contains: q, mode: 'insensitive' } },
-        { edificio: { is: { nombre: { contains: q, mode: 'insensitive' } } } },
-        { edificio: { is: { cliente: { is: { nombre: { contains: q, mode: 'insensitive' } } } } } }
-      ];
-    }
-    // El ascensor pertenece a un edificio; el filtro por cliente se resuelve a
-    // través del edificio.
-    if (id_edificio) where.id_edificio = Number(id_edificio);
-    else if (id_cliente) where.edificio = { is: { id_cliente: Number(id_cliente) } };
-    if (estado_operativo) where.estado_operativo = estado_operativo;
-    if (tipo) where.tipo = tipo;
-
-    // Ámbito del usuario: solo ascensores de clientes dentro del ámbito. Se aplica
-    // vía AND para no pisar el filtro por edificio/cliente de arriba.
-    conAlcance(where, ascensorAlcanceWhere(req.user));
-    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
-    conAlcance(where, ascensorEdificioAlcanceWhere(req.user));
-
-    // Ordenamiento por columna (cabeceras clickables del listado). Campo permitido
-    // + dirección; si no viene, orden por defecto (más recientes primero).
-    const direccion = dir === 'asc' ? 'asc' : 'desc';
-    const ORDEN = {
-      codigo: { codigo: direccion },
-      edificio: { edificio: { nombre: direccion } },
-      tipo: { tipo: direccion },
-      ubicacion: { ubicacion: direccion },
-      estado: { estado_operativo: direccion },
-      proximo_mantenimiento: { proximo_mantenimiento: direccion }
-    };
-    const orderBy = ORDEN[sort] || { id: 'desc' };
-
+    const where = construirWhereAscensores(req.query, req.user);
     const result = await paginar(
       prisma.tbl_ascensores,
-      { where, orderBy, include: { ...INCLUDE_EDIFICIO, precios: INCLUDE_PRECIOS } },
+      { where, orderBy: ordenAscensores(req.query), include: { ...INCLUDE_EDIFICIO, precios: INCLUDE_PRECIOS } },
       req.query
     );
     res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar ascensores' });
+  }
+};
+
+/**
+ * Exporta el listado de ascensores en Excel o PDF respetando exactamente los
+ * filtros aplicados en pantalla (mismo `where` que listar).
+ */
+const exportar = async (req, res) => {
+  try {
+    const formato = String(req.query.formato || 'excel').toLowerCase();
+    if (!['excel', 'pdf'].includes(formato)) {
+      return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
+    }
+    const where = construirWhereAscensores(req.query, req.user);
+    const ascensores = await prisma.tbl_ascensores.findMany({
+      where,
+      orderBy: ordenAscensores(req.query),
+      include: {
+        ...INCLUDE_EDIFICIO,
+        // Con el nombre del subtipo: el reporte imprime el precio legible, no ids.
+        precios: { ...INCLUDE_PRECIOS, include: { tipo_servicio: { select: { nombre: true } } } }
+      }
+    });
+
+    const { generarExcelAscensores, generarPdfAscensores } = require('../utils/ascensoresExport');
+    const stamp = ymdLima();
+
+    if (formato === 'excel') {
+      const buffer = await generarExcelAscensores(ascensores);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="ascensores-${stamp}.xlsx"`);
+      return res.end(buffer);
+    }
+
+    const buffer = await generarPdfAscensores(ascensores);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ascensores-${stamp}.pdf"`);
+    return res.end(buffer);
+  } catch (err) {
+    console.error('[ascensores.exportar]', err);
+    res.status(500).json({ error: 'Error al exportar ascensores: ' + err.message });
   }
 };
 
@@ -244,6 +317,11 @@ const crear = async (req, res) => {
     const existente = await prisma.tbl_ascensores.findUnique({ where: { codigo: data.codigo } });
     if (existente) return res.status(400).json({ error: 'Código de ascensor duplicado' });
 
+    // Datos de sitio (contacto + cuarto de máquinas): los heredan los servicios
+    // que se creen sobre este ascensor. Ver utils/datosSitioAscensor.js.
+    const sitio = normalizarDatosSitio(data);
+    if (sitio.error) return res.status(400).json({ error: sitio.error });
+
     const ascensor = await prisma.$transaction(async (tx) => {
       const creado = await tx.tbl_ascensores.create({
         data: {
@@ -256,11 +334,13 @@ const crear = async (req, res) => {
           capacidad: data.capacidad || null,
           pisos: data.pisos ? Number(data.pisos) : null,
           anio_aproximado: data.anio_aproximado ? Number(data.anio_aproximado) : null,
+          clasificacion: normalizarClasificacion(data.clasificacion),
           estado_operativo: data.estado_operativo || 'Operativo',
           // 'Inactivo' es baja lógica: nace con estado = 0.
           estado: (data.estado_operativo || 'Operativo') === 'Inactivo' ? 0 : 1,
           fecha_instalacion: data.fecha_instalacion ? parseYMDLima(data.fecha_instalacion) : null,
           proximo_mantenimiento: data.proximo_mantenimiento ? parseYMDLima(data.proximo_mantenimiento) : null,
+          ...sitio.data,
           observaciones: data.observaciones || null,
           user_id_registration: req.user.id
         }
@@ -316,6 +396,10 @@ const actualizar = async (req, res) => {
       return res.status(400).json({ error: 'El edificio / obra está inactivo: el ascensor solo puede quedar en estado Inactivo.' });
     }
 
+    // Datos de sitio: edición parcial (lo que no viene en el payload se conserva).
+    const sitio = normalizarDatosSitio(data, previo);
+    if (sitio.error) return res.status(400).json({ error: sitio.error });
+
     const wasabiKeys = [];
     const tecnicoIds = [];
     const ascensor = await prisma.$transaction(async (tx) => {
@@ -331,6 +415,9 @@ const actualizar = async (req, res) => {
           capacidad: data.capacidad ?? previo.capacidad,
           pisos: data.pisos !== undefined ? Number(data.pisos) : previo.pisos,
           anio_aproximado: data.anio_aproximado !== undefined ? Number(data.anio_aproximado) : previo.anio_aproximado,
+          clasificacion: Object.prototype.hasOwnProperty.call(data, 'clasificacion')
+            ? normalizarClasificacion(data.clasificacion)
+            : previo.clasificacion,
           estado_operativo: estadoOperativoFinal,
           // Si pasa a inactivo, la baja (estado = 0) y la cascada de planes las
           // hace bajaAscensorCascadaEnTx, que necesita ver estado = 1 para actuar;
@@ -338,6 +425,7 @@ const actualizar = async (req, res) => {
           estado: pasaAInactivo ? previo.estado : nuevoEstado,
           fecha_instalacion: data.fecha_instalacion ? parseYMDLima(data.fecha_instalacion) : previo.fecha_instalacion,
           proximo_mantenimiento: data.proximo_mantenimiento ? parseYMDLima(data.proximo_mantenimiento) : previo.proximo_mantenimiento,
+          ...sitio.data,
           observaciones: data.observaciones ?? previo.observaciones,
           user_id_modification: req.user.id,
           date_time_modification: new Date()
@@ -469,9 +557,31 @@ const cambiarEstado = async (req, res) => {
       return res.json({ data: ascensor });
     }
 
+    // Reactivar: no se puede dentro de un edificio / obra dado de baja (misma
+    // regla que al editar el ascensor).
+    const edificio = await prisma.tbl_edificios.findUnique({ where: { id: previo.id_edificio }, select: { estado: true } });
+    if (edificio && edificio.estado === 0) {
+      return res.status(400).json({ error: 'El edificio / obra está inactivo: reactive primero el edificio.' });
+    }
+
+    // 'Inactivo' es el estado operativo que acompaña a la baja lógica: al
+    // reactivar hay que sacarlo de ahí o quedaría activo y marcado Inactivo.
     const ascensor = await prisma.tbl_ascensores.update({
       where: { id },
-      data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
+      data: {
+        estado,
+        ...(previo.estado_operativo === 'Inactivo' ? { estado_operativo: 'Operativo' } : {}),
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      }
+    });
+    await prisma.tbl_ascensores_historial.create({
+      data: {
+        id_ascensor: id,
+        tipo_evento: 'reactivacion',
+        descripcion: `Ascensor ${ascensor.codigo} reactivado`,
+        creado_por: req.user.id
+      }
     });
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_ascensores', id_entidad: id,
@@ -484,4 +594,4 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, historial, crear, actualizar, guardarPrecio, cambiarEstado };
+module.exports = { listar, exportar, obtener, historial, crear, actualizar, guardarPrecio, cambiarEstado };

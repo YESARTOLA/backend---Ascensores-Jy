@@ -40,8 +40,13 @@ const obtener = async (req, res) => {
   }
 };
 
+// Claves que SOLO edita el super administrador (el resto: super_admin/admin).
+// SERVICIO_CIERRE_PLAZO_DIAS define el plazo del técnico para cerrar un servicio
+// y es el mismo rol que luego habilita los cierres vencidos caso por caso.
+const CLAVES_SOLO_SUPER_ADMIN = ['SERVICIO_CIERRE_PLAZO_DIAS'];
+
 /**
- * Actualiza una clave. Solo super_admin/admin.
+ * Actualiza una clave. Solo super_admin/admin (algunas claves, solo super_admin).
  */
 const actualizar = async (req, res) => {
   try {
@@ -49,6 +54,9 @@ const actualizar = async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
     const clave = String(req.params.clave || '');
+    if (CLAVES_SOLO_SUPER_ADMIN.includes(clave) && req.user.rol_codigo !== 'super_admin') {
+      return res.status(403).json({ error: 'Solo el super administrador puede modificar este parámetro' });
+    }
     const valor = req.body?.valor;
     if (valor === undefined || valor === null) return res.status(400).json({ error: 'Valor obligatorio' });
 

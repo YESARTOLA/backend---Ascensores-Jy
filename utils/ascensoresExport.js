@@ -1,14 +1,20 @@
 /**
- * Generación de reportes del listado de cotizaciones en Excel (XLSX) y PDF
- * (A4 horizontal). Devuelven Buffer para que el controller los streamee en la
- * respuesta HTTP. Datos de cabecera (razón social, RUC, etc.) salen de
- * tbl_configuracion — sin hardcodeo. Espejo del patrón de `clientesExport.js`.
+ * Generación de reportes de listado de ascensores en Excel (XLSX) y PDF (A4 horizontal).
+ *
+ * Devuelven Buffer para que el controller los streamee en la respuesta HTTP.
+ * Datos de cabecera (razón social, RUC, etc.) salen de tbl_configuracion — sin hardcodeo.
+ *
+ * El controller ya aplicó los filtros de pantalla y el ámbito del usuario: aquí
+ * solo se formatea lo que llega.
  */
 
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
+const { CLASIFICACIONES } = require('./catalogosClientes');
+
+const CLASIFICACION_MAP = Object.fromEntries(CLASIFICACIONES.map(c => [c.codigo, c.etiqueta]));
 
 const PALETA = {
   acento: '#e8853a',
@@ -23,63 +29,64 @@ function fechaISO(d) {
   return new Date(d).toISOString().slice(0, 10);
 }
 
-function fmtMonto(n) {
-  if (n == null || n === '') return '';
-  return Number(n).toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
 const COLUMNAS = [
-  { header: 'Código',            key: 'codigo',            width: 17 },
-  { header: 'Cliente',           key: 'cliente',           width: 32 },
-  { header: 'Teléfono',          key: 'telefono',          width: 14 },
-  { header: 'Edificio / Obra',   key: 'edificios',         width: 28 },
-  { header: 'Tipo de servicio',  key: 'tipo',              width: 26 },
-  { header: 'Categoría',         key: 'categoria',         width: 13 },
-  { header: 'Estado',            key: 'estado_global',     width: 13 },
-  { header: 'Versión',           key: 'version',           width: 9 },
-  { header: 'Estado versión',    key: 'estado_version',    width: 15 },
-  { header: 'Moneda',            key: 'moneda',            width: 9 },
-  { header: 'Monto total',       key: 'monto_total',       width: 15, numFmt: '#,##0.00' },
-  { header: 'Servicio generado', key: 'servicio_generado', width: 18 },
-  { header: 'Creado por',        key: 'creado_por',        width: 22 },
-  { header: 'Registrado',        key: 'registrado',        width: 12 }
+  { header: 'Código',              key: 'codigo',                width: 16 },
+  { header: 'Edificio / Obra',     key: 'edificio',              width: 30 },
+  { header: 'Cliente',             key: 'cliente',               width: 32 },
+  { header: 'Distrito',            key: 'distrito',              width: 16 },
+  { header: 'Tipo',                key: 'tipo',                  width: 16 },
+  { header: 'Clasificación',       key: 'clasificacion',         width: 14 },
+  { header: 'Marca',               key: 'marca',                 width: 16 },
+  { header: 'Modelo',              key: 'modelo',                width: 16 },
+  { header: 'Capacidad',           key: 'capacidad',             width: 16 },
+  { header: 'Pisos',               key: 'pisos',                 width: 8 },
+  { header: 'Año aprox.',          key: 'anio_aproximado',       width: 11 },
+  { header: 'Ubicación',           key: 'ubicacion',             width: 24 },
+  { header: 'Estado operativo',    key: 'estado_operativo',      width: 18 },
+  { header: 'Registro',            key: 'registro',              width: 11 },
+  { header: 'Instalación',         key: 'fecha_instalacion',     width: 13 },
+  { header: 'Próx. mantenimiento', key: 'proximo_mantenimiento', width: 17 },
+  { header: 'Precios por servicio',key: 'precios',               width: 40 },
+  { header: 'Observaciones',       key: 'observaciones',         width: 30 },
+  { header: 'Registrado',          key: 'registrado',            width: 12 }
 ];
 
-function mapearFila(cot) {
-  const v = Array.isArray(cot.versiones) ? cot.versiones[0] : null;
-  const asc = Array.isArray(cot.ascensores) ? cot.ascensores : [];
-  const edificios = [...new Set(asc.map(a => a.ascensor?.edificio?.nombre).filter(Boolean))].join(', ');
-  const servicios = (Array.isArray(cot.servicios) ? cot.servicios : [])
-    .map(s => s.codigo).filter(Boolean).join(', ');
-  const monto = v && v.monto_total != null ? Number(v.monto_total) : null;
+function mapearFila(a) {
+  const precios = Array.isArray(a.precios) ? a.precios : [];
   return {
-    codigo: cot.codigo || '',
-    cliente: cot.cliente?.nombre || '',
-    telefono: cot.cliente?.telefono || '',
-    edificios,
-    tipo: cot.subtipo_servicio?.nombre || cot.tipo_servicio?.nombre || '',
-    categoria: cot.tipo_servicio?.categoria_funcional || '',
-    estado_global: cot.estado_global || '',
-    version: v ? `v${v.numero_version}` : '',
-    estado_version: v?.estado_version || '',
-    moneda: v?.moneda || '',
-    monto_total: monto,
-    // Forma lista para el PDF: "PEN 1,200.00" (en Excel el monto va numérico).
-    monto_fmt: monto != null ? `${v?.moneda || ''} ${fmtMonto(monto)}`.trim() : '',
-    servicio_generado: servicios,
-    creado_por: cot.creado_por?.nombres || '',
-    registrado: fechaISO(cot.date_time_registration)
+    codigo: a.codigo || '',
+    edificio: a.edificio?.nombre || '',
+    cliente: a.edificio?.cliente?.nombre || '',
+    distrito: a.edificio?.distrito || '',
+    tipo: a.tipo || '',
+    clasificacion: a.clasificacion ? (CLASIFICACION_MAP[a.clasificacion] || a.clasificacion) : '',
+    marca: a.marca || '',
+    modelo: a.modelo || '',
+    capacidad: a.capacidad || '',
+    pisos: a.pisos ?? '',
+    anio_aproximado: a.anio_aproximado ?? '',
+    ubicacion: a.ubicacion || '',
+    estado_operativo: a.estado_operativo || '',
+    // `estado` es la baja lógica; el listado permite exportar activos e inactivos.
+    registro: a.estado === 0 ? 'Inactivo' : 'Activo',
+    fecha_instalacion: fechaISO(a.fecha_instalacion),
+    proximo_mantenimiento: fechaISO(a.proximo_mantenimiento),
+    precios: precios
+      .map(p => `${p.tipo_servicio?.nombre || `Subtipo #${p.id_tipo_servicio}`}: ${p.moneda} ${Number(p.precio).toFixed(2)}`)
+      .join(' · '),
+    observaciones: a.observaciones || '',
+    registrado: fechaISO(a.date_time_registration)
   };
 }
 
-async function generarExcelCotizaciones(cotizaciones) {
+async function generarExcelAscensores(ascensores) {
   const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
   const hoy = ymdLima();
 
   const wb = new ExcelJS.Workbook();
   wb.creator = empresa.EMPRESA_RAZON_SOCIAL || 'ERP';
   wb.created = new Date();
-  const ws = wb.addWorksheet('Cotizaciones', {
+  const ws = wb.addWorksheet('Ascensores', {
     views: [{ state: 'frozen', ySplit: 4 }]
   });
 
@@ -90,12 +97,12 @@ async function generarExcelCotizaciones(cotizaciones) {
   ws.getCell('A1').alignment = { vertical: 'middle' };
 
   ws.mergeCells('A2', String.fromCharCode(64 + COLUMNAS.length) + '2');
-  const subtitulo = [`RUC: ${empresa.EMPRESA_RUC || '—'}`, `Exportado: ${hoy}`, `${cotizaciones.length} cotización(es)`].join('   •   ');
+  const subtitulo = [`RUC: ${empresa.EMPRESA_RUC || '—'}`, `Exportado: ${hoy}`, `${ascensores.length} ascensor(es)`].join('   •   ');
   ws.getCell('A2').value = subtitulo;
   ws.getCell('A2').font = { size: 9, color: { argb: 'FF6B7280' } };
 
   // Encabezados de tabla en fila 4
-  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width, style: c.numFmt ? { numFmt: c.numFmt } : undefined }));
+  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width }));
   const headerRow = ws.getRow(4);
   COLUMNAS.forEach((c, i) => {
     const cell = headerRow.getCell(i + 1);
@@ -113,8 +120,8 @@ async function generarExcelCotizaciones(cotizaciones) {
   headerRow.height = 22;
 
   // Filas
-  cotizaciones.forEach((cot, idx) => {
-    const fila = ws.addRow(mapearFila(cot));
+  ascensores.forEach((a, idx) => {
+    const fila = ws.addRow(mapearFila(a));
     fila.alignment = { vertical: 'middle', wrapText: true };
     fila.font = { size: 10 };
     if (idx % 2 === 1) {
@@ -133,7 +140,7 @@ async function generarExcelCotizaciones(cotizaciones) {
   return wb.xlsx.writeBuffer().then(b => Buffer.from(b));
 }
 
-async function generarPdfCotizaciones(cotizaciones) {
+async function generarPdfAscensores(ascensores) {
   const empresa = await configuracion.obtenerVarios([
     'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION', 'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
   ]);
@@ -156,27 +163,29 @@ async function generarPdfCotizaciones(cotizaciones) {
     if (empresa.EMPRESA_DIRECCION) doc.text(empresa.EMPRESA_DIRECCION, x0 + 10, y + 38);
 
     doc.fillColor(PALETA.acento).font('Helvetica-Bold').fontSize(12)
-      .text('LISTADO DE COTIZACIONES', x0, y + 8, { align: 'right', width: ancho - 10 });
+      .text('LISTADO DE ASCENSORES', x0, y + 8, { align: 'right', width: ancho - 10 });
     doc.font('Helvetica').fontSize(8).fillColor(PALETA.gris)
-      .text(`Exportado: ${hoy}   •   ${cotizaciones.length} cotización(es)`, x0, y + 28, { align: 'right', width: ancho - 10 });
+      .text(`Exportado: ${hoy}   •   ${ascensores.length} ascensor(es)`, x0, y + 28, { align: 'right', width: ancho - 10 });
     return y + 65;
   }
 
   // Columnas a renderizar en PDF (subset orientado a impresión)
   const cols = [
-    { titulo: 'Código',        key: 'codigo',           w: 70 },
-    { titulo: 'Cliente',       key: 'cliente',          w: 110 },
-    { titulo: 'Edificio / Obra',key: 'edificios',       w: 90 },
-    { titulo: 'Tipo',          key: 'tipo',             w: 90 },
-    { titulo: 'Estado',        key: 'estado_global',    w: 55 },
-    { titulo: 'Ver.',          key: 'version',          w: 28 },
-    { titulo: 'Estado ver.',   key: 'estado_version',   w: 60 },
-    { titulo: 'Monto total',   key: 'monto_fmt',        w: 75, align: 'right' },
-    { titulo: 'Servicio',      key: 'servicio_generado',w: 70 }
+    { titulo: 'Código',        key: 'codigo',                w: 75 },
+    { titulo: 'Edificio / Obra', key: 'edificio',            w: 95 },
+    { titulo: 'Cliente',       key: 'cliente',               w: 100 },
+    { titulo: 'Distrito',      key: 'distrito',              w: 55 },
+    { titulo: 'Tipo',          key: 'tipo',                  w: 60 },
+    { titulo: 'Clasif.',       key: 'clasificacion',         w: 55 },
+    { titulo: 'Marca',         key: 'marca',                 w: 55 },
+    { titulo: 'Ubicación',     key: 'ubicacion',             w: 70 },
+    { titulo: 'Estado oper.',  key: 'estado_operativo',      w: 65 },
+    { titulo: 'Registro',      key: 'registro',              w: 45 },
+    { titulo: 'Próx. mant.',   key: 'proximo_mantenimiento', w: 55 }
   ];
   // Distribuye el ancho remanente al primer item flexible (cliente) para llenar la página
   const usado = cols.reduce((a, c) => a + c.w, 0);
-  if (usado < ancho) cols[1].w += (ancho - usado);
+  if (usado < ancho) cols[2].w += (ancho - usado);
   let acc = x0;
   for (const c of cols) { c.x = acc; acc += c.w; }
 
@@ -194,8 +203,9 @@ async function generarPdfCotizaciones(cotizaciones) {
 
   doc.font('Helvetica').fontSize(8).fillColor(PALETA.texto);
   let alterna = false;
-  for (const cot of cotizaciones) {
-    const fila = mapearFila(cot);
+  for (const ascensor of ascensores) {
+    const fila = mapearFila(ascensor);
+    // calcular altura por el texto más largo de la fila
     const alturas = cols.map(c => doc.heightOfString(String(fila[c.key] ?? ''), { width: c.w - 8 }));
     const altura = Math.max(14, Math.max(...alturas) + 6);
 
@@ -220,4 +230,4 @@ async function generarPdfCotizaciones(cotizaciones) {
   return cerrado;
 }
 
-module.exports = { generarExcelCotizaciones, generarPdfCotizaciones };
+module.exports = { generarExcelAscensores, generarPdfAscensores };

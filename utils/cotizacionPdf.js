@@ -99,6 +99,7 @@ async function generarPdfCotizacion(ctx) {
     'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
   ]);
   const terminos = ctx.version.terminos || (await configuracion.obtener('COTIZACION_TERMINOS'));
+  const garantia = (ctx.version.garantia || '').trim();
   const cuentasBancarias = await obtenerCuentasBancariasPdf(ctx.version.cuentas_pdf);
   // Fotos por ítem (las jaladas desde observaciones del técnico). Se descargan
   // una sola vez aquí; el render de la tabla es síncrono.
@@ -194,9 +195,9 @@ async function generarPdfCotizacion(ctx) {
 
   y += 10;
 
-  // Fechas y validez
+  // Fecha de emisión
   doc.font('Helvetica').fontSize(9).fillColor(PALETA.gris);
-  doc.text(`Fecha de emisión: ${formatearFecha(ctx.version.fecha_envio || new Date())}    Validez: ${formatearFecha(ctx.version.fecha_validez)}`, x0, y);
+  doc.text(`Fecha de emisión: ${formatearFecha(ctx.version.fecha_envio || new Date())}`, x0, y);
   y += 16;
 
   // Tabla de items
@@ -325,6 +326,20 @@ async function generarPdfCotizacion(ctx) {
     doc.font('Helvetica-Oblique').fontSize(8).fillColor(PALETA.gris)
       .text('* El plan de pagos es referencial y se confirma al momento de la aprobación de la cotización.', x0, y, { width: ancho });
     y += 14;
+  }
+
+  // Garantía (texto libre de la versión). Se omite si no se declaró.
+  if (garantia) {
+    y += 24;
+    const altoGarantia = doc.font('Helvetica').fontSize(9).heightOfString(`Garantía: ${garantia}`, { width: ancho });
+    if (y + altoGarantia > doc.page.height - doc.page.margins.bottom - 20) {
+      doc.addPage();
+      y = doc.page.margins.top;
+    }
+    doc.font('Helvetica-Bold').fontSize(9).fillColor(PALETA.texto)
+      .text('Garantía: ', x0, y, { width: ancho, continued: true });
+    doc.font('Helvetica').fillColor(PALETA.gris).text(garantia, { width: ancho });
+    y = doc.y;
   }
 
   // Términos

@@ -1,5 +1,11 @@
 const prisma = require('../config/prisma');
 const { sincronizarRecordatorioServicio } = require('./recordatoriosAuto');
+// Tramos de ejecución en campo (arranque y cierre del trabajo del técnico). Se
+// reutilizan aquí para derivar el estado de la emergencia sin repetir la lista.
+const {
+  ESTADOS_INICIO: ESTADOS_INICIO_EJECUCION,
+  ESTADOS_FIN: ESTADOS_FIN_EJECUCION
+} = require('./ejecucionFechas');
 
 // Estados nominados que se referencian explícitamente desde la lógica de negocio
 // (transiciones de cierre, regularización de guías). Cualquier flujo que cambie
@@ -143,7 +149,10 @@ function esServicioPostRevision(estadoServicio) {
 }
 
 // Catálogos de estados de los registros asociados a un servicio.
-const ESTADOS_EMERGENCIA = ['Reportada', 'En atención', 'Atendida', 'Cerrada'];
+// El estado de la emergencia NO se lleva a mano: lo deriva el servicio que la
+// atiende (ver estadoEmergenciaDesdeServicio), así que la lista es también el
+// recorrido posible de ese ciclo.
+const ESTADOS_EMERGENCIA = ['Reportada', 'En atención', 'Atendida', 'Cerrada', 'Cancelada'];
 const ESTADOS_CORRECTIVO = ['Reportado', 'En atención', 'Resuelto', 'Cerrado'];
 const ESTADOS_ATENCION_RAPIDA = ['nueva', 'convertida', 'descartada'];
 
@@ -173,9 +182,92 @@ async function cambiarEstadoServicio(id_servicio, nuevoEstado, idUsuario, observ
     where: { id: id_servicio },
     data: { estado_servicio: nuevoEstado, user_id_modification: idUsuario, date_time_modification: new Date() }
   });
+  await registrarCambioEstado(previo, nuevoEstado, idUsuario, observaciones);
+  return actualizado;
+}
+
+/**
+ * Variante ATÓMICA de `cambiarEstadoServicio`: solo cambia el estado si el
+ * servicio TODAVÍA está en uno de `estadosEsperados`. Devuelve el servicio
+ * actualizado, o `null` si ya no estaba en ese estado (otra petición se
+ * adelantó).
+ *
+ * Existe para cerrar la ventana de carrera de la finalización: leer el estado,
+ * validar y después escribir deja pasar dos peticiones simultáneas (doble clic,
+ * dos pestañas, reintento de red, dos usuarios a la vez) que finalizaban el
+ * mismo servicio dos veces, duplicando guía, evidencias, historial y cobro. El
+ * `updateMany` con el estado esperado en el WHERE hace que solo una gane.
+ */
+async function cambiarEstadoServicioSiEstaEn(id_servicio, estadosEsperados, nuevoEstado, idUsuario, observaciones = null) {
+  const previo = await prisma.tbl_servicios_proyectos.findUnique({ where: { id: id_servicio } });
+  if (!previo) return null;
+  const { count } = await prisma.tbl_servicios_proyectos.updateMany({
+    where: { id: id_servicio, estado_servicio: { in: estadosEsperados } },
+    data: { estado_servicio: nuevoEstado, user_id_modification: idUsuario, date_time_modification: new Date() }
+  });
+  if (count === 0) return null;
+  await registrarCambioEstado(previo, nuevoEstado, idUsuario, observaciones);
+  return prisma.tbl_servicios_proyectos.findUnique({ where: { id: id_servicio } });
+}
+
+/**
+ * Estado que le corresponde a una emergencia según el servicio que la atiende.
+ *
+ * La emergencia y su servicio son la misma realidad vista dos veces, así que el
+ * estado de la emergencia se DERIVA y no se teclea: antes había que moverlo a
+ * mano y se quedaba congelado en "Reportada" / "En atención" aunque el técnico
+ * ya hubiera terminado.
+ *
+ * @param {object|null} servicio       Servicio asociado (null si aún no existe).
+ * @param {boolean}     tieneTecnicos  Si ya hay técnicos asignados: distingue
+ *                                     "Reportada" (sin nadie) de "En atención".
+ */
+function estadoEmergenciaDesdeServicio(servicio, { tieneTecnicos = false } = {}) {
+  const estado = servicio?.estado_servicio;
+  if (!estado) return tieneTecnicos ? 'En atención' : 'Reportada';
+  if (estado === ESTADO_SERVICIO_CANCELADO) return 'Cancelada';
+  if (estado === 'Cerrado') return 'Cerrada';
+  // Todo lo que va de "finalizado por el técnico" en adelante (revisión, cobro,
+  // facturación) es trabajo ya atendido en campo.
+  if (ESTADOS_FIN_EJECUCION.includes(estado)) return 'Atendida';
+  if (ESTADOS_INICIO_EJECUCION.includes(estado)) return 'En atención';
+  return tieneTecnicos ? 'En atención' : 'Reportada';
+}
+
+/**
+ * Alinea el estado de la emergencia de un servicio con su estado real. No hace
+ * nada si el servicio no viene de una emergencia o si ya estaba al día.
+ */
+async function sincronizarEstadoEmergencia(idServicio) {
+  const emergencia = await prisma.tbl_emergencias.findFirst({
+    where: { id_servicio: idServicio, estado: 1 },
+    select: { id: true, estado_emergencia: true }
+  });
+  if (!emergencia) return null;
+
+  const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+    where: { id: idServicio },
+    select: { estado_servicio: true }
+  });
+  const tieneTecnicos = await prisma.tbl_servicios_asignaciones.count({
+    where: { id_servicio: idServicio, estado: 1 }
+  }) > 0;
+
+  const nuevo = estadoEmergenciaDesdeServicio(servicio, { tieneTecnicos });
+  if (nuevo === emergencia.estado_emergencia) return emergencia.estado_emergencia;
+
+  await prisma.tbl_emergencias.update({
+    where: { id: emergencia.id },
+    data: { estado_emergencia: nuevo, date_time_modification: new Date() }
+  });
+  return nuevo;
+}
+
+// Historial + sincronizaciones que acompañan a todo cambio de estado.
+async function registrarCambioEstado(previo, nuevoEstado, idUsuario, observaciones) {
   await prisma.tbl_servicios_estados_historial.create({
     data: {
-      id_servicio,
+      id_servicio: previo.id,
       estado_anterior: previo.estado_servicio,
       estado_nuevo: nuevoEstado,
       cambiado_por: idUsuario,
@@ -183,15 +275,17 @@ async function cambiarEstadoServicio(id_servicio, nuevoEstado, idUsuario, observ
     }
   });
   // Sincroniza recordatorio (los estados terminales lo descartan)
-  sincronizarRecordatorioServicio(id_servicio).catch(err => console.error('Error sync recordatorio servicio:', err));
+  sincronizarRecordatorioServicio(previo.id).catch(err => console.error('Error sync recordatorio servicio:', err));
+
+  // Si el servicio nació de una emergencia, su estado sigue al del servicio.
+  sincronizarEstadoEmergencia(previo.id).catch(err =>
+    console.error('Error sync estado_emergencia:', err));
 
   if (previo.id_cotizacion) {
     const { sincronizarEstadoGlobal } = require('../controllers/cotizacionesController');
     sincronizarEstadoGlobal(previo.id_cotizacion).catch(err =>
       console.error('Error sync estado_global cotización:', err));
   }
-
-  return actualizado;
 }
 
 /**
@@ -216,11 +310,14 @@ function estadoServicioDesdeCobro({ estado_cobro, total_abonado, saldo_pendiente
 
 module.exports = {
   cambiarEstadoServicio,
+  cambiarEstadoServicioSiEstaEn,
   estadoServicioDesdeCobro,
   estaServicioFinalizado,
   esServicioEditable,
   esServicioPostRevision,
   esEmergenciaCerrada,
+  estadoEmergenciaDesdeServicio,
+  sincronizarEstadoEmergencia,
   esCorrectivoCerrado,
   esAtencionRapidaConvertida,
   ESTADO_SERVICIO_FINALIZADO_TECNICO,

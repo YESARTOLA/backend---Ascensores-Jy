@@ -1,12 +1,30 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, combinarFechaHoraLima } = require('../utils/tiempo');
 const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
+const { conAlcance } = require('../utils/alcanceUsuario');
+const {
+  ROL_VENDEDORA,
+  soloSusLeads,
+  leadAlcanceWhere,
+  puedeVerLead
+} = require('../utils/accesoLeads');
+const {
+  MAX_DOCUMENTOS,
+  INCLUDE_DOCUMENTOS,
+  COUNT_DOCUMENTOS,
+  puedeGestionarDocumentos,
+  vincularDocumentosEnTx,
+  keyDocumento
+} = require('../utils/documentosLead');
+const { eliminarObjeto } = require('../utils/storage');
+const { registrarAuditoria } = require('../utils/auditoria');
 const {
   ESTADO_LEAD_CONSULTA,
   ESTADO_LEAD_COTIZADO,
@@ -50,7 +68,7 @@ const CAMPOS_EDITABLES_LEAD = [
   { campo: 'id_tipo_servicio_solicitado', etiqueta: 'Tipo de servicio solicitado', valor: l => l.tipo_servicio?.nombre ?? null },
   { campo: 'cliente_existente', etiqueta: '¿Cliente existente?', valor: l => (l.cliente_existente ? 'Sí' : 'No') },
   { campo: 'id_cliente', etiqueta: 'Cliente asociado', valor: l => l.cliente?.nombre ?? null },
-  { campo: 'id_vendedor', etiqueta: 'Vendedor', valor: l => l.vendedor?.nombres ?? null },
+  { campo: 'id_vendedor', etiqueta: 'Vendedora asignada', valor: l => l.vendedor?.nombres ?? null },
   { campo: 'observaciones', etiqueta: 'Observaciones', valor: l => l.observaciones }
 ];
 
@@ -61,6 +79,37 @@ function resolverMotivoDescarte(estado_lead, motivo) {
   const limpio = (motivo || '').trim();
   if (!limpio) return { error: 'El motivo de descarte es obligatorio' };
   return { motivo_descarte: limpio };
+}
+
+// La Vendedora asignada es quien decide la visibilidad del lead: solo ella lo
+// ve y solo ella puede convertirlo. Por eso el campo se valida contra usuarios
+// ACTIVOS con rol Vendedora (vacío = lead sin asignar, visible solo para la
+// Central de ventas y administración).
+// `actual` = asignación vigente del lead: se acepta tal cual aunque hoy no
+// cumpla el criterio (leads históricos asignados a usuarios de otro rol), para
+// que editar cualquier otro dato no obligue a reasignar el lead.
+async function resolverVendedorAsignado(valor, actual = null) {
+  if (valor === undefined) return { omitido: true };
+  if (valor === null || valor === '') return { id_vendedor: null };
+  const id = Number(valor);
+  if (!id) return { error: 'La vendedora asignada no es válida' };
+  if (actual !== null && id === actual) return { id_vendedor: actual };
+  const usuario = await prisma.tbl_usuarios.findFirst({
+    where: { id, estado: 1, rol: { is: { codigo: ROL_VENDEDORA } } },
+    select: { id: true }
+  });
+  if (!usuario) return { error: 'La vendedora asignada no existe o no está activa' };
+  return { id_vendedor: id };
+}
+
+// Carga un lead comprobando el alcance del usuario: la Vendedora solo accede a
+// los suyos. Se responde 404 (y no 403) para no revelar la existencia de leads
+// de otras vendedoras.
+async function cargarLeadPermitido(req, id, include = undefined) {
+  const lead = await prisma.tbl_leads.findUnique({ where: { id }, include });
+  if (!lead || lead.estado !== 1) return { error: 'Lead no encontrado' };
+  if (!puedeVerLead(req.user, lead)) return { error: 'Lead no encontrado' };
+  return { lead };
 }
 
 // Valida y normaliza los campos comerciales del lead (ubicación por ubigeo,
@@ -148,10 +197,12 @@ function construirWhereLeads(query) {
 
 const listar = async (req, res) => {
   try {
+    // Alcance por usuario: la Vendedora solo ve los leads que tiene asignados.
+    const where = conAlcance(construirWhereLeads(req.query), leadAlcanceWhere(req.user));
     const result = await paginar(
       prisma.tbl_leads,
       {
-        where: construirWhereLeads(req.query),
+        where,
         orderBy: { id: 'desc' },
         include: {
           cliente: true,
@@ -159,7 +210,10 @@ const listar = async (req, res) => {
           ubigeo: true,
           tipo_ascensor: { select: { id: true, nombre: true } },
           usuario_registrador: { select: { id: true, nombres: true } },
-          vendedor: { select: { id: true, nombres: true } }
+          vendedor: { select: { id: true, nombres: true } },
+          // Solo el CONTADOR de documentos: la tabla pinta un chip con el
+          // número y el detalle se pide al abrir el modal.
+          _count: COUNT_DOCUMENTOS
         }
       },
       req.query
@@ -207,6 +261,9 @@ const crear = async (req, res) => {
     }
     const comerciales = await resolverCamposComerciales(d, { requeridos: true });
     if (comerciales.error) return res.status(400).json({ error: comerciales.error });
+    // Vendedora asignada: determina quién podrá ver y convertir este lead.
+    const vendedor = await resolverVendedorAsignado(d.id_vendedor);
+    if (vendedor.error) return res.status(400).json({ error: vendedor.error });
     const lead = await prisma.tbl_leads.create({
       data: {
         nombre_contacto: d.nombre_contacto,
@@ -215,7 +272,7 @@ const crear = async (req, res) => {
         id_tipo_servicio_solicitado: d.id_tipo_servicio_solicitado ? Number(d.id_tipo_servicio_solicitado) : null,
         cliente_existente: d.cliente_existente ? 1 : 0,
         id_cliente: d.id_cliente ? Number(d.id_cliente) : null,
-        id_vendedor: d.id_vendedor ? Number(d.id_vendedor) : null,
+        id_vendedor: vendedor.id_vendedor ?? null,
         estado_lead: ESTADO_LEAD_CONSULTA,
         observaciones: d.observaciones || null,
         ...comerciales.data,
@@ -237,10 +294,18 @@ const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const d = req.body;
-    const previo = await prisma.tbl_leads.findUnique({ where: { id }, include: INCLUDE_EDICION });
-    if (!previo || previo.estado !== 1) return res.status(404).json({ error: 'Lead no encontrado' });
+    const acceso = await cargarLeadPermitido(req, id, INCLUDE_EDICION);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+    const previo = acceso.lead;
     const comerciales = await resolverCamposComerciales(d, { requeridos: false });
     if (comerciales.error) return res.status(400).json({ error: comerciales.error });
+    // La asignación de vendedora la decide la Central de ventas / administración:
+    // la Vendedora conserva la suya (si pudiera cambiarla, se quitaría el lead a
+    // sí misma o se lo pasaría a otra sin control).
+    const vendedor = soloSusLeads(req.user)
+      ? { id_vendedor: previo.id_vendedor }
+      : await resolverVendedorAsignado(d.id_vendedor, previo.id_vendedor);
+    if (vendedor.error) return res.status(400).json({ error: vendedor.error });
 
     // Campos opcionales se normalizan a null cuando vienen vacíos (igual que en
     // `crear`): así un campo vacío equivale a "sin valor" y un guardado sin
@@ -253,7 +318,8 @@ const actualizar = async (req, res) => {
       id_tipo_servicio_solicitado: d.id_tipo_servicio_solicitado ? Number(d.id_tipo_servicio_solicitado) : null,
       cliente_existente: d.cliente_existente ? 1 : 0,
       id_cliente: d.id_cliente ? Number(d.id_cliente) : null,
-      id_vendedor: d.id_vendedor ? Number(d.id_vendedor) : null,
+      // `omitido` = el payload no trae el campo (update parcial): se conserva.
+      id_vendedor: vendedor.omitido ? previo.id_vendedor : (vendedor.id_vendedor ?? null),
       observaciones: d.observaciones || null,
       ...comerciales.data
     };
@@ -338,11 +404,10 @@ const convertir = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const d = req.body;
-    const lead = await prisma.tbl_leads.findUnique({
-      where: { id },
-      include: { ubigeo: true, tipo_ascensor: { select: { nombre: true } } }
-    });
-    if (!lead) return res.status(404).json({ error: 'Lead no encontrado' });
+    // Solo la Vendedora asignada convierte su lead (administración ve todos).
+    const acceso = await cargarLeadPermitido(req, id, { ubigeo: true, tipo_ascensor: { select: { nombre: true } } });
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+    const lead = acceso.lead;
     if (lead.estado_lead === ESTADO_LEAD_DESCARTADO) {
       return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de convertirlo' });
     }
@@ -381,6 +446,8 @@ const convertir = async (req, res) => {
     // El ascensor se vincula por la tabla puente tbl_servicios_ascensores (el
     // servicio no tiene columna id_ascensor). El monto de la línea es el precio.
     const servicio = await prisma.$transaction(async (tx) => {
+      // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
+      const datosSitio = await datosSitioParaServicio(tx, [d.id_ascensor], d);
       const s = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo,
@@ -397,6 +464,7 @@ const convertir = async (req, res) => {
           precio_interno: precioInterno,
           moneda,
           observaciones: d.observaciones || null,
+          ...datosSitio,
           user_id_registration: req.user.id,
           ascensores: {
             create: [{
@@ -458,6 +526,9 @@ const convertir = async (req, res) => {
     });
     sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));
 
+    // Los documentos libres del lead (tbl_leads_archivos) NO se copian ni se
+    // mueven al cliente/servicio: son el expediente comercial del prospecto y
+    // se quedan en el lead, que sigue consultable con estado "Ingresado".
     await prisma.tbl_leads.update({
       where: { id },
       data: {
@@ -483,8 +554,8 @@ const cambiarEstado = async (req, res) => {
     }
     const motivo = resolverMotivoDescarte(estado_lead, motivo_descarte);
     if (motivo.error) return res.status(400).json({ error: motivo.error });
-    const previo = await prisma.tbl_leads.findUnique({ where: { id } });
-    if (!previo) return res.status(404).json({ error: 'Lead no encontrado' });
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
     const lead = await prisma.tbl_leads.update({
       where: { id },
       data: {
@@ -507,6 +578,8 @@ const cambiarEstado = async (req, res) => {
 const listarCotizaciones = async (req, res) => {
   try {
     const id = Number(req.params.id);
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
     const data = await prisma.tbl_leads_cotizaciones.findMany({
       where: { id_lead: id, estado: 1 },
       orderBy: { version: 'desc' },
@@ -528,8 +601,9 @@ const subirCotizacion = async (req, res) => {
     const idArchivo = Number(req.body.id_archivo);
     if (!idArchivo) return res.status(400).json({ error: 'El archivo de la cotización es obligatorio' });
 
-    const lead = await prisma.tbl_leads.findUnique({ where: { id } });
-    if (!lead || lead.estado !== 1) return res.status(404).json({ error: 'Lead no encontrado' });
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+    const lead = acceso.lead;
     if (lead.estado_lead === ESTADO_LEAD_DESCARTADO) {
       return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de adjuntar una cotización' });
     }
@@ -578,13 +652,106 @@ const subirCotizacion = async (req, res) => {
   }
 };
 
+// --- Documentos libres del lead -------------------------------------------
+// Expediente comercial del prospecto: la Central de ventas sube cualquier
+// documento (PDF, imágenes, videos, Office…) y la Vendedora asignada los
+// consulta desde su lead. Al convertir el lead NO se copian ni se mueven: se
+// quedan aquí (ver `convertir`). Las reglas viven en utils/documentosLead.
+
+const listarDocumentos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+    const data = await prisma.tbl_leads_archivos.findMany({
+      ...INCLUDE_DOCUMENTOS,
+      where: { ...INCLUDE_DOCUMENTOS.where, id_lead: id }
+    });
+    res.json({
+      data,
+      meta: { max: MAX_DOCUMENTOS, puede_gestionar: puedeGestionarDocumentos(req.user) }
+    });
+  } catch (err) {
+    console.error('[leads.listarDocumentos]', err);
+    res.status(500).json({ error: 'Error al listar los documentos del lead' });
+  }
+};
+
+const agregarDocumentos = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+    if (acceso.lead.estado_lead === ESTADO_LEAD_DESCARTADO) {
+      return res.status(400).json({ error: 'El lead está descartado; reactívalo antes de adjuntar documentos' });
+    }
+
+    const creados = await vincularDocumentosEnTx(prisma, id, req.body?.documentos, req.user.id);
+    if (creados === 0) return res.status(400).json({ error: 'No se recibió ningún archivo válido' });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_leads_archivos', id_entidad: id,
+      accion: 'CREATE', valor_nuevo: { id_lead: id, documentos: creados }, ip: req.ip
+    });
+
+    const data = await prisma.tbl_leads_archivos.findMany({
+      ...INCLUDE_DOCUMENTOS,
+      where: { ...INCLUDE_DOCUMENTOS.where, id_lead: id }
+    });
+    res.status(201).json({ data });
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[leads.agregarDocumentos]', err);
+    res.status(500).json({ error: 'Error al adjuntar los documentos' });
+  }
+};
+
+const eliminarDocumento = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const idVinculo = Number(req.params.idVinculo);
+    const acceso = await cargarLeadPermitido(req, id);
+    if (acceso.error) return res.status(404).json({ error: acceso.error });
+
+    const vinculo = await prisma.tbl_leads_archivos.findFirst({
+      where: { id: idVinculo, id_lead: id, estado: 1 },
+      include: { archivo: { select: { id: true, ruta_almacenamiento: true } } }
+    });
+    if (!vinculo) return res.status(404).json({ error: 'Documento no encontrado' });
+
+    const marca = { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() };
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_leads_archivos.update({ where: { id: idVinculo }, data: marca });
+      await tx.tbl_archivos.updateMany({ where: { id: vinculo.id_archivo, estado: 1 }, data: marca });
+    });
+
+    // Purga del bucket TRAS el commit: si falla, el registro ya quedó dado de
+    // baja y el objeto se limpia después — nunca al revés.
+    const key = keyDocumento(vinculo.archivo);
+    if (key) {
+      try { await eliminarObjeto(key); }
+      catch (e) { console.warn('[leads.eliminarDocumento] no se pudo borrar del bucket:', e.message); }
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_leads_archivos', id_entidad: idVinculo,
+      accion: 'DELETE', valor_anterior: vinculo, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[leads.eliminarDocumento]', err);
+    res.status(500).json({ error: 'Error al eliminar el documento' });
+  }
+};
+
 // Vendedores que realmente figuran en algún lead, para poblar el filtro de la
 // lista. Se deriva de los datos (no de /usuarios, que es solo super_admin) para
 // que admin y coordinador también puedan filtrar por vendedor.
-const listarVendedores = async (_req, res) => {
+const listarVendedores = async (req, res) => {
   try {
     const ids = await prisma.tbl_leads.findMany({
-      where: { estado: 1, id_vendedor: { not: null } },
+      // Mismo alcance que la lista: una Vendedora solo se ve a sí misma.
+      where: conAlcance({ estado: 1, id_vendedor: { not: null } }, leadAlcanceWhere(req.user)),
       distinct: ['id_vendedor'],
       select: { id_vendedor: true }
     });
@@ -601,4 +768,9 @@ const listarVendedores = async (_req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar, historial, convertir, cambiarEstado, listarCotizaciones, subirCotizacion, listarVendedores };
+module.exports = {
+  listar, crear, actualizar, historial, convertir, cambiarEstado,
+  listarCotizaciones, subirCotizacion,
+  listarDocumentos, agregarDocumentos, eliminarDocumento,
+  listarVendedores
+};

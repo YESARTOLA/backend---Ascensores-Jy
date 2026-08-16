@@ -4,6 +4,7 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const { generarCodigoCotizacion } = require('../utils/codigoCotizacion');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { calcularTotalesVersion, normalizarPlanCuotas } = require('../utils/cotizacionCalculos');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
@@ -40,7 +41,8 @@ const {
   ESTADOS_GLOBALES,
   ESTADOS_VERSION_LISTA,
   FILTROS_GLOBALES,
-  resolverFiltroGlobal
+  resolverFiltroGlobal,
+  rangoEsPorFechaAceptacion
 } = require('../utils/estadoCotizacion');
 
 function puedeVer(req) {
@@ -55,6 +57,13 @@ function hoyDate() {
   // Inicio del día actual en Lima TZ — evita corrimiento de día cuando el
   // servidor corre en UTC (Railway) y el reloj de Lima va atrás 5 h.
   return inicioDelDiaLima();
+}
+
+// Texto opcional: '' / '   ' se guardan como NULL (así el PDF omite el bloque).
+function trimOrNull(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s.length > 0 ? s : null;
 }
 
 /**
@@ -178,6 +187,33 @@ async function cargarVersionActiva(idCotizacion) {
   return { cotizacion: cot, version: ver };
 }
 
+// Condición de rango de fechas del listado / exportación.
+//
+// Devuelve null si no se pidió rango. Sobre qué fecha se aplica depende del
+// filtro de estado (ver `rangoEsPorFechaAceptacion`):
+//   - filtros del embudo aceptado ('Aceptado', 'Ejecución', 'Pendiente',
+//     'Terminado' y el virtual 'Aprobadas') → FECHA DE ACEPTACIÓN, es decir
+//     `fecha_aprobacion` de la versión aprobada. Un rango 01/08–31/08 devuelve
+//     todas las que se aceptaron en agosto, sin importar cuándo se cotizaron ni
+//     en qué etapa estén hoy.
+//   - resto de filtros (o sin filtro) → fecha de creación de la cotización.
+function condicionRangoFechas({ estado_global, desde, hasta }) {
+  if (!desde && !hasta) return null;
+  const rango = {};
+  if (desde) rango.gte = parseYMDLima(desde);
+  if (hasta) rango.lte = parseYMDFinDiaLima(hasta);
+  if (!rangoEsPorFechaAceptacion(estado_global)) return { date_time_registration: rango };
+  return {
+    versiones: {
+      some: {
+        estado: 1,
+        estado_version: ESTADOS_VERSION.APROBADO,
+        fecha_aprobacion: rango
+      }
+    }
+  };
+}
+
 const listar = async (req, res) => {
   try {
     if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
@@ -216,12 +252,8 @@ const listar = async (req, res) => {
     // (Los ascensores "nuevos a instalar" no tienen id y quedan fuera del filtro.)
     if (id_ascensor) and.push({ ascensores: { some: { estado: 1, id_ascensor: Number(id_ascensor) } } });
     if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
-    if (desde || hasta) {
-      const rango = {};
-      if (desde) rango.gte = parseYMDLima(desde);
-      if (hasta) rango.lte = parseYMDFinDiaLima(hasta);
-      and.push({ date_time_registration: rango });
-    }
+    const rangoFechas = condicionRangoFechas({ estado_global, desde, hasta });
+    if (rangoFechas) and.push(rangoFechas);
     // Ámbito: un usuario de área (servicios/proyectos) solo ve las cotizaciones
     // cuyo tipo de servicio pertenece a su categoría funcional.
     const catsAmbito = categoriasFuncionalesDeAmbito(req.user);
@@ -248,7 +280,7 @@ const listar = async (req, res) => {
             take: 1,
             select: {
               id: true, numero_version: true, estado_version: true,
-              monto_total: true, moneda: true, fecha_validez: true
+              monto_total: true, moneda: true
             }
           },
           servicios: {
@@ -545,7 +577,6 @@ const crear = async (req, res) => {
 
     if (!d.id_cliente) return res.status(400).json({ error: 'Cliente obligatorio' });
     if (!d.id_subtipo_servicio) return res.status(400).json({ error: 'Subtipo de servicio obligatorio' });
-    if (!d.fecha_validez) return res.status(400).json({ error: 'Fecha de validez obligatoria' });
 
     // Resolver y validar la coherencia padre ↔ subtipo. El subtipo determina la
     // clasificación; el padre se deriva de él (o se valida si vino en el body).
@@ -583,10 +614,9 @@ const crear = async (req, res) => {
     const items = Array.isArray(d.items) ? d.items : [];
     if (items.length === 0) return res.status(400).json({ error: 'Debe agregar al menos un item' });
 
-    // En cotizaciones del módulo correctivo, la foto de cada ítem es obligatoria.
-    if (subtipoCot.modulo_asociado === 'correctivo' && items.some(it => !it.id_archivo)) {
-      return res.status(400).json({ error: 'En una cotización de correctivo, cada ítem debe incluir una foto.' });
-    }
+    // La foto por ítem NO se exige al cotizar (tampoco en correctivos): es
+    // requisito al APROBAR, cuando la cotización se convierte en servicio
+    // (ver `aprobarVersion`). Así se puede cotizar sin tener aún las fotos.
 
     if (d.id_lead) {
       const lead = await prisma.tbl_leads.findUnique({ where: { id: Number(d.id_lead) } });
@@ -678,7 +708,6 @@ const crear = async (req, res) => {
         data: {
           id_cotizacion: cot.id,
           numero_version: 1,
-          fecha_validez: parseYMDLima(d.fecha_validez),
           moneda: d.moneda || 'PEN',
           subtotal: totales.subtotal,
           igv: totales.igv,
@@ -688,6 +717,7 @@ const crear = async (req, res) => {
           motivo_cambio: null,
           observaciones: d.observaciones || null,
           terminos: d.terminos || (await configuracion.obtener('COTIZACION_TERMINOS')),
+          garantia: trimOrNull(d.garantia),
           tiene_cuotas: tieneCuotas,
           plan_cuotas: planCuotas,
           saldo_variable: saldoVariable,
@@ -864,15 +894,7 @@ const actualizarVersion = async (req, res) => {
     const igvTasa = await configuracion.obtener('IGV_RATE');
     const { calcularImporteLinea } = require('../utils/cotizacionCalculos');
 
-    // Foto obligatoria por ítem en cotizaciones de correctivo (al reemplazar items).
-    if (items) {
-      const cotSub = await prisma.tbl_cotizaciones.findUnique({
-        where: { id }, select: { subtipo_servicio: { select: { modulo_asociado: true } } }
-      });
-      if (cotSub?.subtipo_servicio?.modulo_asociado === 'correctivo' && items.some(it => !it.id_archivo)) {
-        return res.status(400).json({ error: 'En una cotización de correctivo, cada ítem debe incluir una foto.' });
-      }
-    }
+    // Editar los ítems no exige foto: se pide al aprobar (ver `aprobarVersion`).
 
     const nuevoSinIgv = Object.prototype.hasOwnProperty.call(d, 'sin_igv')
       ? Boolean(d.sin_igv) : version.sin_igv;
@@ -927,10 +949,11 @@ const actualizarVersion = async (req, res) => {
 
     const actualizada = await prisma.$transaction(async (tx) => {
       const dataUpdate = {
-        fecha_validez: d.fecha_validez ? parseYMDLima(d.fecha_validez) : version.fecha_validez,
         moneda: d.moneda ?? version.moneda,
         observaciones: d.observaciones ?? version.observaciones,
         terminos: d.terminos ?? version.terminos,
+        // Solo se toca si el cliente la envía; vaciarla ('') la borra.
+        ...(Object.prototype.hasOwnProperty.call(d, 'garantia') ? { garantia: trimOrNull(d.garantia) } : {}),
         tiene_cuotas: nuevoTieneCuotas,
         plan_cuotas: nuevoPlanCuotas,
         saldo_variable: nuevoSaldoVariable,
@@ -1022,17 +1045,11 @@ const crearNuevaVersion = async (req, res) => {
       return res.status(400).json({ error: 'Solo se versiona desde una versión Rechazado o Aprobado (tras reapertura)' });
     }
 
-    const validezDias = await configuracion.obtener('COTIZACION_VALIDEZ_DIAS');
-    // Sumar N días en TZ Lima a partir del inicio del día actual en Lima.
-    // Lima no observa DST, así que sumar N*86400000 ms es exacto.
-    const nuevaValidez = new Date(inicioDelDiaLima().getTime() + Number(validezDias || 15) * 86400000);
-
     const nueva = await prisma.$transaction(async (tx) => {
       const ver = await tx.tbl_cotizaciones_versiones.create({
         data: {
           id_cotizacion: id,
           numero_version: ultima.numero_version + 1,
-          fecha_validez: nuevaValidez,
           moneda: ultima.moneda,
           subtotal: ultima.subtotal,
           igv: ultima.igv,
@@ -1042,6 +1059,7 @@ const crearNuevaVersion = async (req, res) => {
           motivo_cambio: motivo,
           observaciones: ultima.observaciones,
           terminos: ultima.terminos,
+          garantia: ultima.garantia,
           tiene_cuotas: ultima.tiene_cuotas,
           plan_cuotas: ultima.plan_cuotas,
           saldo_variable: ultima.saldo_variable,
@@ -1732,6 +1750,8 @@ const aprobar = async (req, res) => {
         where: { ascensores: { some: { id: { in: idsResueltos } } } },
         select: { nombre: true }
       });
+      // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
+      const datosSitio = await datosSitioParaServicio(tx, idsResueltos, d);
       const servicio = await tx.tbl_servicios_proyectos.create({
         data: {
           codigo: codigoSrv,
@@ -1752,6 +1772,7 @@ const aprobar = async (req, res) => {
           precio_interno: version.monto_total,
           moneda: version.moneda,
           observaciones: d.observaciones || null,
+          ...datosSitio,
           user_id_registration: req.user.id,
           ascensores: {
             create: idsResueltos.map((idAsc, idx) => {
@@ -2138,7 +2159,7 @@ const INCLUDE_LISTA = {
     take: 1,
     select: {
       id: true, numero_version: true, estado_version: true,
-      monto_total: true, moneda: true, fecha_validez: true
+      monto_total: true, moneda: true
     }
   },
   servicios: {
@@ -2175,11 +2196,10 @@ function construirWhereCotizaciones(query) {
   // Mismo filtro por ascensor que el listado (para exportar lo que se ve).
   if (id_ascensor) where.ascensores = { some: { estado: 1, id_ascensor: Number(id_ascensor) } };
   if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
-  if (desde || hasta) {
-    where.date_time_registration = {};
-    if (desde) where.date_time_registration.gte = parseYMDLima(desde);
-    if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
-  }
+  // Mismo criterio de rango que el listado (creación vs. aceptación según el
+  // filtro de estado), para exportar exactamente lo que se ve en pantalla.
+  const rangoFechas = condicionRangoFechas({ estado_global, desde, hasta });
+  if (rangoFechas) Object.assign(where, rangoFechas);
   return where;
 }
 

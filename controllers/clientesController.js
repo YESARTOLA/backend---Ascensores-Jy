@@ -3,22 +3,15 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
-const { CLASIFICACIONES, CLASIFICACIONES_CODIGOS } = require('../utils/catalogosClientes');
 const {
-  aplicaAlcance,
+  CLASIFICACIONES, CLASIFICACIONES_CODIGOS, normalizarClasificacion,
+  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, AREA_AMBAS
+} = require('../utils/catalogosClientes');
+const {
   tiposRegistroPermitidos,
   puedeVerTipoRegistro,
   clienteAlcanceWhere,
 } = require('../utils/alcanceUsuario');
-
-// Áreas de clasificación de los adjuntos del cliente (mapea 1:1 al ámbito).
-const AREAS_ARCHIVO = ['servicio', 'proyecto'];
-
-const normalizarClasificacion = (v) => {
-  if (v === undefined || v === null || v === '') return null;
-  const s = String(v).trim();
-  return CLASIFICACIONES_CODIGOS.includes(s) ? s : null;
-};
 
 const parseFechaContrato = (valor) => {
   if (valor === undefined || valor === null || valor === '') return null;
@@ -55,7 +48,7 @@ async function reemplazarArchivosCliente(tx, idCliente, data, idUsuario, user) {
       : (Array.isArray(data.archivos) ? data.archivos : undefined),
     proyecto: Array.isArray(data.archivos_proyecto) ? data.archivos_proyecto : undefined
   };
-  for (const area of AREAS_ARCHIVO) {
+  for (const area of AREAS_CLIENTE) {
     const payload = porArea[area];
     if (!Array.isArray(payload)) continue;                     // área no enviada → intacta
     if (user && !puedeVerTipoRegistro(user, area)) continue;   // sin permiso sobre el área → intacta
@@ -98,6 +91,18 @@ function includeArchivos(user) {
   };
 }
 
+/**
+ * Include de los contratos ya reemplazados, filtrado por el ÁMBITO del usuario:
+ * un usuario acotado a un área solo ve el historial de contratos de esa área.
+ * Del más reciente al más antiguo.
+ */
+function includeContratosHistorial(user) {
+  const tipos = tiposRegistroPermitidos(user); // null = sin restricción
+  const where = { estado: 1 };
+  if (tipos) where.area = { in: tipos.length ? tipos : ['__sin_ambito__'] };
+  return { where, orderBy: { fecha_reemplazo: 'desc' } };
+}
+
 // Edificios activos del cliente (con su conteo de ascensores). Reemplaza la
 // antigua relación directa cliente→ascensores en el detalle y la vista 360.
 const INCLUDE_EDIFICIOS = {
@@ -121,6 +126,34 @@ const INCLUDE_EDIFICIOS_360 = {
 };
 
 /**
+ * Condición Prisma sobre tbl_ascensores para el buscador libre de clientes.
+ * Un ascensor coincide por su código (identificador que usa el técnico en campo),
+ * su ubicación dentro del edificio, o su marca / modelo.
+ */
+const matchAscensorBusqueda = (q) => ({
+  estado: 1,
+  OR: [
+    { codigo: { contains: q, mode: 'insensitive' } },
+    { ubicacion: { contains: q, mode: 'insensitive' } },
+    { marca: { contains: q, mode: 'insensitive' } },
+    { modelo: { contains: q, mode: 'insensitive' } }
+  ]
+});
+
+/**
+ * Condición Prisma sobre tbl_edificios para el buscador libre: el edificio/obra
+ * coincide por su nombre o su dirección, o bien tiene algún ascensor que coincide.
+ */
+const matchEdificioBusqueda = (q) => ({
+  estado: 1,
+  OR: [
+    { nombre: { contains: q, mode: 'insensitive' } },
+    { direccion: { contains: q, mode: 'insensitive' } },
+    { ascensores: { some: matchAscensorBusqueda(q) } }
+  ]
+});
+
+/**
  * Construye el `where` Prisma para tbl_clientes a partir de los filtros de querystring.
  * Centralizado para que listar() y exportar() apliquen exactamente los mismos criterios.
  *
@@ -130,19 +163,22 @@ const INCLUDE_EDIFICIOS_360 = {
  *
  * Filtros soportados:
  *   q                — texto libre sobre nombre / nº documento / teléfono (del cliente o
- *                      de su contacto principal) / nombre de edificio
+ *                      de su contacto principal), nombre o dirección de edificio/obra, y
+ *                      código / ubicación / marca / modelo de sus ascensores
  *   distrito         — clientes con algún edificio en ese distrito
  *   tipo_ascensor    — clientes con algún edificio que tenga un ascensor de ese tipo
  *   clasificacion    — match exacto
  *   estado           — 0 | 1 (activo/inactivo)
  *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato
  *   con_contrato     — '1' | '0' filtra si tiene archivo de contrato adjunto
+ *   area_contrato    — servicio | proyecto | ambos: área cuyos datos de contrato
+ *                      y documentación registra el cliente (inclusivo)
  *
  * `user` aplica el ámbito (Servicios/Proyectos): si el rol está acotado, solo
- * devuelve clientes con al menos un registro del ámbito permitido.
+ * devuelve los clientes de su(s) área(s) (ver clienteAlcanceWhere).
  */
 async function construirWhereClientes(query, user) {
-  const { q, distrito, tipo_ascensor, clasificacion, estado, estado_contrato, con_contrato } = query;
+  const { q, distrito, tipo_ascensor, clasificacion, estado, estado_contrato, con_contrato, area_contrato } = query;
   const where = { estado: 1 };
   if (q) {
     where.OR = [
@@ -150,7 +186,7 @@ async function construirWhereClientes(query, user) {
       { numero_documento: { contains: q, mode: 'insensitive' } },
       { telefono: { contains: q, mode: 'insensitive' } },
       { contacto_principal_telefono: { contains: q, mode: 'insensitive' } },
-      { edificios: { some: { estado: 1, nombre: { contains: q, mode: 'insensitive' } } } }
+      { edificios: { some: matchEdificioBusqueda(q) } }
     ];
   }
   const edificioFilter = {};
@@ -168,10 +204,10 @@ async function construirWhereClientes(query, user) {
   // ver (según su ámbito). Si ve ambas, un cliente coincide si CUALQUIERA cumple.
   // Se usa where.AND para no pisar el where.OR del buscador `q`.
   const tiposContrato = tiposRegistroPermitidos(user);
-  const areasContrato = (tiposContrato && tiposContrato.length) ? tiposContrato : ['servicio', 'proyecto'];
-  const colInicio = (a) => a === 'servicio' ? 'contrato_servicio_inicio' : 'contrato_proyecto_inicio';
-  const colFin = (a) => a === 'servicio' ? 'contrato_servicio_fin' : 'contrato_proyecto_fin';
-  const colArch = (a) => a === 'servicio' ? 'id_archivo_contrato_servicio' : 'id_archivo_contrato_proyecto';
+  const areasContrato = (tiposContrato && tiposContrato.length) ? tiposContrato : AREAS_CLIENTE;
+  const colInicio = (a) => CAMPOS_CONTRATO_AREA[a].inicio;
+  const colFin = (a) => CAMPOS_CONTRATO_AREA[a].fin;
+  const colArch = (a) => CAMPOS_CONTRATO_AREA[a].archivo;
   const pushAnd = (cond) => { (where.AND = where.AND || []).push(cond); };
 
   if (estado_contrato) {
@@ -189,6 +225,14 @@ async function construirWhereClientes(query, user) {
   }
   if (con_contrato === '1') pushAnd({ OR: areasContrato.map(a => ({ [colArch(a)]: { not: null } })) });
   else if (con_contrato === '0') pushAnd({ AND: areasContrato.map(a => ({ [colArch(a)]: null })) });
+
+  // Área cuyos datos de contrato y documentación registra el cliente. Un área
+  // cuenta cuando tiene contrato registrado (inicio y fin), el mismo criterio
+  // que exige el alta y que usa el ámbito. Es inclusivo: pedir un área devuelve
+  // también a los clientes que registran las dos.
+  const conContratoDe = (a) => ({ [colInicio(a)]: { not: null }, [colFin(a)]: { not: null } });
+  if (area_contrato === AREA_AMBAS) pushAnd({ AND: AREAS_CLIENTE.map(conContratoDe) });
+  else if (AREAS_CLIENTE.includes(area_contrato)) pushAnd(conContratoDe(area_contrato));
 
   // Ámbito del usuario: limita a clientes de su(s) área(s). Se agrega como una
   // cláusula AND (no con Object.assign) para no pisar el where.OR del buscador `q`.
@@ -248,9 +292,9 @@ const listar = async (req, res) => {
   try {
     const where = await construirWhereClientes(req.query, req.user);
 
-    // Cuando hay búsqueda libre, además del contador traemos los edificios cuyo
-    // nombre coincide con el término, para que el listado pueda señalar de forma
-    // discreta que la coincidencia provino del nombre de un edificio.
+    // Cuando hay búsqueda libre, además del contador traemos los edificios y
+    // ascensores que coinciden con el término, para que el listado pueda señalar
+    // de forma discreta de dónde vino la coincidencia (edificio/obra o ascensor).
     const q = (req.query.q || '').trim();
     const include = {
       _count: { select: { edificios: true, servicios: true, archivos: true } },
@@ -259,8 +303,15 @@ const listar = async (req, res) => {
     };
     if (q) {
       include.edificios = {
-        where: { estado: 1, nombre: { contains: q, mode: 'insensitive' } },
-        select: { id: true, nombre: true },
+        where: matchEdificioBusqueda(q),
+        select: {
+          id: true, nombre: true, direccion: true,
+          ascensores: {
+            where: matchAscensorBusqueda(q),
+            select: { id: true, codigo: true, ubicacion: true },
+            orderBy: { codigo: 'asc' }
+          }
+        },
         orderBy: { nombre: 'asc' }
       };
     }
@@ -272,9 +323,22 @@ const listar = async (req, res) => {
     );
 
     if (q) {
+      // El include trae los edificios que coinciden por sus propios datos Y los que
+      // solo entraron por tener un ascensor coincidente: se separan aquí para no
+      // marcar como "coincide el edificio" lo que en realidad coincidió por ascensor.
+      const term = q.toLowerCase();
+      const coincideEdificio = (e) =>
+        (e.nombre || '').toLowerCase().includes(term) || (e.direccion || '').toLowerCase().includes(term);
       result.data = result.data.map(c => {
         const { edificios, ...resto } = c;
-        return { ...resto, edificios_coincidentes: edificios || [] };
+        const lista = edificios || [];
+        return {
+          ...resto,
+          edificios_coincidentes: lista.filter(coincideEdificio).map(({ id, nombre }) => ({ id, nombre })),
+          ascensores_coincidentes: lista.flatMap(e =>
+            (e.ascensores || []).map(a => ({ ...a, edificio: e.nombre }))
+          )
+        };
       });
     }
 
@@ -344,17 +408,14 @@ const exportar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (aplicaAlcance(req.user)) {
-      const enAmbito = await prisma.tbl_clientes.findFirst({
-        where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
-      });
-      if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
-    }
-    const cliente = await prisma.tbl_clientes.findUnique({
-      where: { id },
+    // El ámbito va en el propio where: un cliente de otra área no existe para
+    // este usuario, tampoco entrando por URL directa.
+    const cliente = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) },
       include: {
         edificios: INCLUDE_EDIFICIOS,
         ...INCLUDE_CONTRATOS,
+        contratos_historial: includeContratosHistorial(req.user),
         archivos: includeArchivos(req.user)
       }
     });
@@ -378,19 +439,13 @@ const vista360 = async (req, res) => {
     const filtroCategoria = tipos
       ? { categoria_funcional: { in: tipos.length ? tipos.map(t => (t === 'proyecto' ? 'PROYECTOS' : 'SERVICIOS')) : ['__sin_ambito__'] } }
       : {};
-    if (aplicaAlcance(req.user)) {
-      const enAmbito = await prisma.tbl_clientes.findFirst({
-        where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
-      });
-      if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
-    }
-
-    const cliente = await prisma.tbl_clientes.findUnique({
-      where: { id },
+    const cliente = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) },
       include: {
         edificios: INCLUDE_EDIFICIOS_360,
         archivos: includeArchivos(req.user),
         ...INCLUDE_CONTRATOS,
+        contratos_historial: includeContratosHistorial(req.user),
         servicios: {
           where: { estado: 1, ...filtroServicio },
           orderBy: { id: 'desc' },
@@ -424,7 +479,7 @@ const vista360 = async (req, res) => {
               where: { estado: 1 },
               orderBy: { numero_version: 'desc' },
               take: 1,
-              select: { numero_version: true, estado_version: true, monto_total: true, moneda: true, fecha_validez: true }
+              select: { numero_version: true, estado_version: true, monto_total: true, moneda: true }
             }
           }
         },
@@ -470,13 +525,6 @@ const vista360 = async (req, res) => {
   }
 };
 
-// Columnas del contrato por área y etiqueta legible.
-const CAMPOS_CONTRATO = {
-  servicio: { inicio: 'contrato_servicio_inicio', fin: 'contrato_servicio_fin', archivo: 'id_archivo_contrato_servicio' },
-  proyecto: { inicio: 'contrato_proyecto_inicio', fin: 'contrato_proyecto_fin', archivo: 'id_archivo_contrato_proyecto' }
-};
-const ETIQUETA_AREA = { servicio: 'Servicios', proyecto: 'Proyectos' };
-
 // Include de los documentos de contrato de ambas áreas.
 const INCLUDE_CONTRATOS = {
   archivo_contrato_servicio: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true, fecha_subida: true } },
@@ -493,8 +541,8 @@ const INCLUDE_CONTRATOS = {
 function resolverContratosPorArea(data, previo, user) {
   const valores = {};
   const completos = {};
-  for (const area of AREAS_ARCHIVO) {
-    const c = CAMPOS_CONTRATO[area];
+  for (const area of AREAS_CLIENTE) {
+    const c = CAMPOS_CONTRATO_AREA[area];
     const gestiona = !user || puedeVerTipoRegistro(user, area);
     let inicio = previo[c.inicio] ?? null;
     let fin = previo[c.fin] ?? null;
@@ -593,7 +641,11 @@ const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const data = req.body;
-    const previo = await prisma.tbl_clientes.findUnique({ where: { id } });
+    // Mismo criterio que `obtener`: un cliente fuera del ámbito no existe para
+    // este usuario, tampoco para editarlo por ID.
+    const previo = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) }
+    });
     if (!previo) return res.status(404).json({ error: 'Cliente no encontrado' });
 
     if (data.numero_documento && data.numero_documento !== previo.numero_documento) {
@@ -658,10 +710,112 @@ const actualizar = async (req, res) => {
   }
 };
 
+/**
+ * Registra un CONTRATO NUEVO para un área del cliente (renovación).
+ *
+ * El contrato que estaba vigente en esa área deja de estarlo: sus fechas se
+ * archivan en tbl_clientes_contratos_historial y el cliente queda con la nueva
+ * vigencia, de modo que el listado y los filtros por estado de contrato siempre
+ * miran el vigente. El documento NO se historiza: el PDF es uno solo por área y
+ * el nuevo reemplaza al anterior (si no se adjunta uno, se conserva el actual).
+ *
+ * Body: { area, fecha_inicio, fecha_fin, id_archivo?, observaciones? }
+ */
+const registrarContrato = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { area, fecha_inicio, fecha_fin, id_archivo, observaciones } = req.body;
+
+    if (!AREAS_CLIENTE.includes(area)) {
+      return res.status(400).json({ error: 'Área de contrato inválida' });
+    }
+    // Ámbito: además de ver al cliente, el usuario debe gestionar esa área.
+    if (!puedeVerTipoRegistro(req.user, area)) {
+      return res.status(403).json({ error: `No tiene acceso al área de ${ETIQUETA_AREA[area]}` });
+    }
+
+    const campos = CAMPOS_CONTRATO_AREA[area];
+    const previo = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) }
+    });
+    if (!previo) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    const inicio = parseFechaContrato(fecha_inicio);
+    const fin = parseFechaContrato(fecha_fin);
+    if (inicio === undefined || fin === undefined) {
+      return res.status(400).json({ error: 'Fechas de vigencia inválidas' });
+    }
+    if (!inicio || !fin) {
+      return res.status(400).json({ error: 'Indique el inicio y el fin de la nueva vigencia' });
+    }
+    if (fin < inicio) {
+      return res.status(400).json({ error: 'La fecha fin no puede ser anterior al inicio' });
+    }
+
+    // Sin archivo en el payload → se conserva el documento actual del área.
+    const archivoNuevo = (id_archivo === undefined || id_archivo === null || id_archivo === '')
+      ? previo[campos.archivo]
+      : Number(id_archivo);
+
+    const cliente = await prisma.$transaction(async (tx) => {
+      // El anterior solo se archiva si estaba completo; un área sin contrato
+      // previo (o a medio llenar) no deja rastro porque no había nada vigente.
+      if (previo[campos.inicio] && previo[campos.fin]) {
+        await tx.tbl_clientes_contratos_historial.create({
+          data: {
+            id_cliente: id,
+            area,
+            fecha_inicio: previo[campos.inicio],
+            fecha_fin: previo[campos.fin],
+            observaciones: trimOrNull(observaciones),
+            user_id_registration: req.user.id
+          }
+        });
+      }
+      await tx.tbl_clientes.update({
+        where: { id },
+        data: {
+          [campos.inicio]: inicio,
+          [campos.fin]: fin,
+          [campos.archivo]: archivoNuevo,
+          user_id_modification: req.user.id,
+          date_time_modification: new Date()
+        }
+      });
+      return tx.tbl_clientes.findUnique({
+        where: { id },
+        include: { ...INCLUDE_CONTRATOS, contratos_historial: includeContratosHistorial(req.user) }
+      });
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_clientes', id_entidad: id,
+      accion: 'CONTRATO_NUEVO',
+      valor_anterior: {
+        area,
+        [campos.inicio]: previo[campos.inicio],
+        [campos.fin]: previo[campos.fin],
+        [campos.archivo]: previo[campos.archivo]
+      },
+      valor_nuevo: { area, [campos.inicio]: inicio, [campos.fin]: fin, [campos.archivo]: archivoNuevo },
+      ip: req.ip
+    });
+
+    res.status(201).json({ data: cliente });
+  } catch (err) {
+    console.error('[clientes.registrarContrato]', err);
+    res.status(500).json({ error: 'Error al registrar el contrato' });
+  }
+};
+
 const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { estado } = req.body;
+    const enAmbito = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
+    });
+    if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = await prisma.tbl_clientes.update({
       where: { id },
       data: { estado: Number(estado), user_id_modification: req.user.id, date_time_modification: new Date() }
@@ -677,4 +831,4 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, listarTiposAscensor, listarClasificaciones, buscarPorDocumento, exportar, obtener, vista360, crear, actualizar, cambiarEstado };
+module.exports = { listar, listarTiposAscensor, listarClasificaciones, buscarPorDocumento, exportar, obtener, vista360, crear, actualizar, registrarContrato, cambiarEstado };

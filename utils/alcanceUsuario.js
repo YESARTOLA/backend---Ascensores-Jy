@@ -7,7 +7,7 @@
  * tbl_servicios_proyectos: Servicios → 'servicio', Proyectos → 'proyecto'.
  *
  * A partir de ese mapeo, un usuario acotado solo ve:
- *   - clientes que tengan al menos un registro de su(s) ámbito(s),
+ *   - clientes de su(s) ámbito(s) (ver clienteAlcanceWhere),
  *   - ascensores de esos clientes,
  *   - servicios/proyectos y datos derivados de su(s) ámbito(s),
  *   - los módulos correspondientes (los demás se bloquean por ruta).
@@ -20,20 +20,16 @@
 
 const { TIPO_REGISTRO } = require('./clasificacionServicio');
 const { TIPOS_EDIFICIO } = require('./catalogosEdificios');
+const { CAMPOS_CONTRATO_AREA } = require('./catalogosClientes');
 
 // Roles cuyo acceso se acota por los flags de ámbito. Único lugar donde se define.
+// Incluye la lista de clientes: un usuario acotado solo ve los clientes de su(s)
+// área(s), igual que el resto de módulos.
 const ROLES_CON_ALCANCE = ['admin', 'coordinador'];
 
 // Roles cuyo acceso se acota por TIPO de edificio (Edificio / Obra). A diferencia
 // del ámbito Servicios/Proyectos, esta restricción aplica solo al Administrador.
 const ROLES_CON_ALCANCE_EDIFICIOS = ['admin'];
-
-// Roles acotados en la LISTA MAESTRA de clientes. El Administrador ve SIEMPRE
-// todos los clientes (dato maestro compartido) aunque su ámbito limite los
-// módulos de Servicios/Proyectos; solo el Coordinador acotado ve únicamente los
-// clientes de su(s) ámbito(s). Por eso este conjunto es más estrecho que
-// ROLES_CON_ALCANCE.
-const ROLES_CON_ALCANCE_CLIENTES = ['coordinador'];
 
 // Conjunto completo de ámbitos. Tener TODOS habilitados equivale a no estar acotado.
 const TODOS_LOS_TIPOS = Object.values(TIPO_REGISTRO);
@@ -47,12 +43,6 @@ function aplicaAlcance(user) {
   return !!user && ROLES_CON_ALCANCE.includes(user.rol_codigo);
 }
 
-/** ¿La lista/acceso a CLIENTES de este usuario se filtra por ámbito?
- *  El Administrador no (ve todos los clientes); solo el Coordinador acotado. */
-function aplicaAlcanceClientes(user) {
-  return !!user && ROLES_CON_ALCANCE_CLIENTES.includes(user.rol_codigo);
-}
-
 /**
  * Lista de `tipo_registro` que el usuario puede ver.
  *   - rol no acotado → null (sin restricción).
@@ -61,7 +51,7 @@ function aplicaAlcanceClientes(user) {
  * como habilitado (!= 0) para no bloquear sesiones existentes.
  * Si el usuario tiene habilitados TODOS los ámbitos no está acotado: devuelve
  * null (sin restricción), igual que un rol no acotado, para que vea también los
- * clientes/ascensores sin registros asociados.
+ * clientes/ascensores que aún no tienen registros asociados.
  */
 function tiposRegistroPermitidos(user) {
   if (!aplicaAlcance(user)) return null;
@@ -92,15 +82,31 @@ function servicioAlcanceWhere(user) {
 }
 
 /**
- * Fragmento Prisma para tbl_clientes: solo clientes con registros del ámbito.
- * El Administrador no se acota aquí (ve todos los clientes); solo el Coordinador
- * acotado queda limitado a los clientes de su(s) ámbito(s).
+ * Fragmento Prisma para tbl_clientes: solo los clientes del/de los ámbito(s) del
+ * usuario. Un cliente pertenece a un área si cumple CUALQUIERA de estas señales:
+ *
+ *   1. Tiene contrato de esa área (inicio y fin registrados). Es la marca
+ *      explícita y la que existe desde el minuto uno: al crear un cliente es
+ *      obligatorio registrar el contrato de al menos un área, y un usuario
+ *      acotado solo puede llenar la suya. Así un cliente recién creado no
+ *      desaparece de la lista de quien lo creó.
+ *   2. Tiene al menos un servicio/proyecto de esa área. Cubre a los clientes con
+ *      historial cuyo contrato quedó registrado solo en la otra área.
+ *
+ * Un cliente con contrato (o actividad) en ambas áreas lo ven los dos ámbitos,
+ * que es lo correcto: es cliente de las dos.
  */
 function clienteAlcanceWhere(user) {
-  if (!aplicaAlcanceClientes(user)) return {};
   const tipos = tiposRegistroPermitidos(user);
   if (tipos === null) return {};
-  return { servicios: { some: { estado: 1, tipo_registro: inTipos(tipos) } } };
+  const condiciones = tipos.map(t => {
+    const campos = CAMPOS_CONTRATO_AREA[t];
+    return { [campos.inicio]: { not: null }, [campos.fin]: { not: null } };
+  });
+  // Con `tipos` vacío esta condición usa el centinela y no devuelve nada, que es
+  // el resultado esperado para un usuario acotado que quedara sin ámbitos.
+  condiciones.push({ servicios: { some: { estado: 1, tipo_registro: inTipos(tipos) } } });
+  return { OR: condiciones };
 }
 
 /** Fragmento Prisma para tbl_ascensores: solo ascensores de clientes del ámbito (vía edificio). */
@@ -280,10 +286,8 @@ function requiereAlcance(tipoRegistro) {
 
 module.exports = {
   ROLES_CON_ALCANCE,
-  ROLES_CON_ALCANCE_CLIENTES,
   ROLES_CON_ALCANCE_EDIFICIOS,
   aplicaAlcance,
-  aplicaAlcanceClientes,
   tiposRegistroPermitidos,
   puedeVerTipoRegistro,
   servicioAlcanceWhere,

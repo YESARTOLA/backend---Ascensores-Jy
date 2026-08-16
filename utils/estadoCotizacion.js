@@ -86,6 +86,28 @@ function resolverFiltroGlobal(valor) {
   return f ? f.estados : null;
 }
 
+// ----------------------------------------------------------------------------
+// Semántica del rango de fechas del listado.
+//
+// Por defecto el rango filtra por FECHA DE CREACIÓN de la cotización. Pero
+// cuando se está mirando el embudo ya aceptado, lo que interesa es CUÁNDO SE
+// ACEPTÓ, no cuándo se registró: "aceptadas de agosto" son las que el cliente
+// aprobó en agosto, sin importar que hoy estén en ejecución, pendientes o ya
+// terminadas (ni en qué mes se cotizaron). Para esos filtros el rango se aplica
+// sobre `fecha_aprobacion` de la versión aprobada.
+const ESTADOS_GLOBALES_POST_ACEPTACION = [
+  ESTADO_GLOBAL.ACEPTADO,
+  ESTADO_GLOBAL.EJECUCION,
+  ESTADO_GLOBAL.PENDIENTE,
+  ESTADO_GLOBAL.TERMINADO
+];
+
+function rangoEsPorFechaAceptacion(valorFiltroGlobal) {
+  if (!valorFiltroGlobal) return false;
+  return valorFiltroGlobal === FILTRO_GLOBAL_APROBADAS
+    || ESTADOS_GLOBALES_POST_ACEPTACION.includes(valorFiltroGlobal);
+}
+
 function esEstadoGlobalValido(estado) {
   return ESTADOS_GLOBALES.includes(estado);
 }
@@ -101,7 +123,9 @@ module.exports = {
   ESTADOS_VERSION_LISTA,
   FILTRO_GLOBAL_APROBADAS,
   FILTROS_GLOBALES,
+  ESTADOS_GLOBALES_POST_ACEPTACION,
   resolverFiltroGlobal,
+  rangoEsPorFechaAceptacion,
   esEstadoGlobalValido,
   esEstadoVersionValido
 };

@@ -74,6 +74,12 @@ const healthHandler = (_req, res) =>
 app.get('/health', healthHandler);
 app.get('/api/health', healthHandler);
 
+// Confinamiento de roles acotados a un solo módulo (p. ej. Central de ventas →
+// Leads): lista blanca aplicada antes de montar la API, para que ningún endpoint
+// —presente o futuro— quede accesible por omisión. Ver middleware/confinamientoMiddleware.
+const { confinarRoles } = require('./middleware/confinamientoMiddleware');
+app.use('/api', confinarRoles);
+
 // Rutas
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/usuarios', require('./routes/usuariosRoutes'));

@@ -82,7 +82,8 @@ async function main() {
   const rolCoord = await upsertRol('coordinador', 'Coordinador', 'Coordinación diaria de servicios');
   const rolTec = await upsertRol('tecnico', 'Técnico', 'Ejecución técnica en campo');
   const rolCont = await upsertRol('contabilidad', 'Contabilidad', 'Cobros y facturación');
-  const rolVend = await upsertRol('vendedora', 'Vendedora', 'Captación comercial: registro y conversión de leads');
+  const rolVend = await upsertRol('vendedora', 'Vendedora', 'Seguimiento y conversión de los leads que tiene asignados');
+  const rolCentral = await upsertRol('central_ventas', 'Central de ventas', 'Captura de leads y asignación a la vendedora responsable');
 
   // ═════════════════════════════════════════════════════════════════
   // 2. PERMISOS DEL SISTEMA (recurso.accion)
@@ -153,15 +154,25 @@ async function main() {
     'emergencias.ver', 'mantenimientos.ver', 'entregas.ver'
   ]);
 
-  // Vendedora: solo trabaja leads y su conversión a cliente. Para el wizard de
-  // conversión necesita además crear cliente/ascensor y ver técnicos. No ve
-  // precios ni accede a ningún otro módulo (enforcement por rol_codigo en las
-  // rutas).
+  // Vendedora: trabaja SOLO los leads que la Central de ventas le asigna
+  // (id_vendedor) y los convierte en cliente. Para el wizard de conversión
+  // necesita además crear cliente/ascensor y ver técnicos. No da de alta leads,
+  // no ve precios ni accede a ningún otro módulo (enforcement por rol_codigo en
+  // las rutas + alcance por lead en utils/accesoLeads.js).
   await asignarPermisos(rolVend.id, permisos, [
-    'leads.ver', 'leads.crear',
+    'leads.ver', 'leads.editar',
     'clientes.ver', 'clientes.crear',
     'ascensores.ver', 'ascensores.crear',
     'tecnicos.ver', 'tipos_servicio.ver'
+  ]);
+
+  // Central de ventas: punto de captura del lead. Registra, asigna la vendedora
+  // responsable, edita y gestiona el ciclo comercial (estado, descarte,
+  // cotizaciones adjuntas). NO convierte (eso es de la Vendedora asignada) y no
+  // tiene acceso a ningún otro módulo del sistema.
+  await asignarPermisos(rolCentral.id, permisos, [
+    'leads.ver', 'leads.crear', 'leads.editar',
+    'clientes.ver', 'tipos_servicio.ver'
   ]);
 
   // ═════════════════════════════════════════════════════════════════
@@ -195,8 +206,7 @@ async function main() {
   //    Mantener sincronizado con utils/configuracion.js (DEFAULTS / TIPOS).
   // ═════════════════════════════════════════════════════════════════
   await upsertConfig('IGV_RATE', '0.18', 'number', 'Tasa de IGV (decimal, ej. 0.18 = 18%)');
-  await upsertConfig('COTIZACION_VALIDEZ_DIAS', '15', 'number', 'Días de validez por defecto de una cotización');
-  await upsertConfig('COTIZACION_TERMINOS', 'Cotización válida hasta la fecha indicada. Precios en soles, incluyen IGV. Forma de pago se acuerda al confirmar el servicio.', 'string', 'Términos por defecto impresos en el PDF de cotización');
+  await upsertConfig('COTIZACION_TERMINOS', 'Precios en soles, incluyen IGV. Forma de pago se acuerda al confirmar el servicio.', 'string', 'Términos por defecto impresos en el PDF de cotización');
   await upsertConfig('EMPRESA_RAZON_SOCIAL', 'Ascensores Jy S.A.C.', 'string', 'Razón social mostrada en cabeceras y PDFs');
   await upsertConfig('EMPRESA_RUC', '20000000000', 'string', 'RUC de la empresa');
   await upsertConfig('EMPRESA_DIRECCION', 'Lima, Perú', 'string', 'Dirección fiscal de la empresa');

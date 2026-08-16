@@ -2,6 +2,7 @@ const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, ymdLima, ymdDeFecha, finDelDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, COLORES } = require('../utils/recordatoriosAuto');
 const { paginar, paginarArray } = require('../utils/paginacion');
@@ -517,6 +518,9 @@ async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fecha
     // Título por servicio: distingue el ascensor para que el coordinador asigne
     // el técnico al servicio correcto. Sin código de ascensor, cae a tituloBase.
     const titulo = a.codigo ? `${tituloBase} · ${a.codigo}` : tituloBase;
+    // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor:
+    // cada servicio de la ocurrencia cubre un ascensor, así que toma los suyos.
+    const datosSitio = await datosSitioParaServicio(tx, [a.id_ascensor]);
     const s = await tx.tbl_servicios_proyectos.create({
       data: {
         codigo,
@@ -539,6 +543,7 @@ async function _crearServiciosOcurrencia(tx, { plan, tituloBase, ascItems, fecha
         // estos servicios NO se facturan uno a uno, así que no deben contarse
         // como "pendientes por facturar" en Contabilidad ni en el dashboard.
         requiere_factura: 0,
+        ...datosSitio,
         user_id_registration: userId,
         ascensores: {
           create: [{ id_ascensor: a.id_ascensor, monto, moneda, user_id_registration: userId }]

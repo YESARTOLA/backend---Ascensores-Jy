@@ -29,6 +29,7 @@ const { generarInformeFinalizacionPdf, descargarArchivoImagen } = require('../ut
 const { subirObjeto, rutaDesdeKey, urlPresigned, keyDesdeRuta } = require('../utils/storage');
 const { construirKey } = require('../middleware/uploadMiddleware');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
+const { estaServicioFinalizado } = require('../utils/estadoServicio');
 
 const CATEGORIAS_VALIDAS = ['mantenimiento', 'correctivo', 'emergencia'];
 const RESPUESTAS_VALIDAS = ['si', 'no', 'na'];
@@ -464,6 +465,14 @@ const generarInforme = async (req, res) => {
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
     if (!puedeEditarChecklist(req.user, servicio)) {
       return res.status(403).json({ error: 'Solo el técnico responsable puede generar el informe' });
+    }
+    // El informe se genera al cerrar el servicio. Si ya fue finalizado, no se
+    // regenera: sobrescribiría el PDF que quedó adjunto al cierre.
+    if (estaServicioFinalizado(servicio.estado_servicio)) {
+      return res.status(409).json({
+        error: `El servicio ya fue finalizado (${servicio.estado_servicio}): el informe no se regenera`,
+        estado: servicio.estado_servicio
+      });
     }
 
     // El checklist de finalización es OPCIONAL. Si la categoría no tiene plantilla

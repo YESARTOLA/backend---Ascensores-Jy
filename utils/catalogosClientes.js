@@ -18,10 +18,51 @@ const CLASIFICACIONES = [
 
 const CLASIFICACIONES_CODIGOS = CLASIFICACIONES.map(c => c.codigo);
 
+/**
+ * Normaliza una clasificación recibida por API: devuelve el código si pertenece
+ * al catálogo y null en cualquier otro caso (vacío, desconocido o ausente). La
+ * comparten cliente y ascensor, que clasifican con el mismo catálogo.
+ */
+function normalizarClasificacion(valor) {
+  if (valor === undefined || valor === null || valor === '') return null;
+  const codigo = String(valor).trim();
+  return CLASIFICACIONES_CODIGOS.includes(codigo) ? codigo : null;
+}
+
 // El tipo Edificio/Obra ahora vive en el edificio, no en el cliente. Ver
 // utils/catalogosEdificios.js (TIPOS_EDIFICIO).
 
+/**
+ * Contrato del cliente POR ÁREA. Las claves son los `tipo_registro` de
+ * tbl_servicios_proyectos ('servicio' | 'proyecto'), de modo que el área de un
+ * cliente mapea 1:1 al ámbito del usuario (acceso_servicios / acceso_proyectos).
+ *
+ * Es la SSoT del mapeo área → columnas: la usan el controlador (validar y
+ * guardar los contratos) y utils/alcanceUsuario.js (decidir qué clientes ve
+ * cada usuario según su ámbito). Como al crear un cliente es obligatorio
+ * registrar el contrato de al menos un área, estas columnas son la marca
+ * explícita de a qué área pertenece cada cliente.
+ */
+const CAMPOS_CONTRATO_AREA = {
+  servicio: { inicio: 'contrato_servicio_inicio', fin: 'contrato_servicio_fin', archivo: 'id_archivo_contrato_servicio' },
+  proyecto: { inicio: 'contrato_proyecto_inicio', fin: 'contrato_proyecto_fin', archivo: 'id_archivo_contrato_proyecto' }
+};
+
+const ETIQUETA_AREA = { servicio: 'Servicios', proyecto: 'Proyectos' };
+
+// Áreas del cliente, en orden de presentación. Misma clave que el ámbito del
+// usuario y que el `tipo_registro` del servicio/proyecto.
+const AREAS_CLIENTE = Object.keys(CAMPOS_CONTRATO_AREA);
+
+// Valor extra del filtro por área: el cliente registra las dos.
+const AREA_AMBAS = 'ambos';
+
 module.exports = {
   CLASIFICACIONES,
-  CLASIFICACIONES_CODIGOS
+  CLASIFICACIONES_CODIGOS,
+  normalizarClasificacion,
+  CAMPOS_CONTRATO_AREA,
+  ETIQUETA_AREA,
+  AREAS_CLIENTE,
+  AREA_AMBAS
 };

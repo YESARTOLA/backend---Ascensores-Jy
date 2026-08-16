@@ -79,6 +79,7 @@ async function main() {
     { nombres: 'Rosa Díaz', correo: 'coordinador@ascensoresjy.com', id_rol: roles.coordinador },
     { nombres: 'Marta Ruiz', correo: 'contabilidad@ascensoresjy.com', id_rol: roles.contabilidad },
     { nombres: 'Sofía Vargas', correo: 'vendedora@ascensoresjy.com', id_rol: roles.vendedora },
+    { nombres: 'Lucía Mendoza', correo: 'central@ascensoresjy.com', id_rol: roles.central_ventas },
     // El usuario técnico se vincula a su ficha de técnico (id_tecnico es @unique).
     { nombres: 'Carlos Ramírez', correo: 'carlos@ascensoresjy.com', id_rol: roles.tecnico, id_tecnico: tecnicos[0].id }
   ];

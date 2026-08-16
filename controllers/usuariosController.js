@@ -163,6 +163,35 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
+/**
+ * Catálogo mínimo de usuarios ACTIVOS para poblar selectores de personas
+ * (responsable de una atención rápida, vendedor de un lead, …).
+ *
+ * Existe aparte de `listar` porque ese endpoint es de gestión de usuarios y
+ * está restringido a super_admin: admin y coordinador recibían 403 y los
+ * selectores quedaban vacíos. Aquí solo se exponen id, nombres y rol — nada de
+ * correo, contraseña ni flags de acceso.
+ *
+ * Filtro opcional `?rol=` (código de rol, admite lista separada por comas).
+ */
+const catalogo = async (req, res) => {
+  try {
+    const rolParam = String(req.query.rol || '').trim();
+    const codigos = rolParam ? rolParam.split(',').map(r => r.trim()).filter(Boolean) : [];
+    const where = { estado: 1 };
+    if (codigos.length > 0) where.rol = { codigo: { in: codigos } };
+    const list = await prisma.tbl_usuarios.findMany({
+      where,
+      select: { id: true, nombres: true, rol: { select: { id: true, codigo: true, nombre: true } } },
+      orderBy: { nombres: 'asc' }
+    });
+    res.json({ data: list });
+  } catch (err) {
+    console.error('[usuarios.catalogo]', err);
+    res.status(500).json({ error: 'Error al listar el catálogo de usuarios' });
+  }
+};
+
 const roles = async (_req, res) => {
   try {
     const list = await prisma.tbl_roles.findMany({ where: { estado: 1 } });
@@ -181,4 +210,4 @@ const permisos = async (_req, res) => {
   }
 };
 
-module.exports = { listar, crear, actualizar, cambiarEstado, roles, permisos };
+module.exports = { listar, catalogo, crear, actualizar, cambiarEstado, roles, permisos };

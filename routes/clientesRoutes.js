@@ -17,6 +17,9 @@ router.get('/:id', c.obtener);
 router.get('/:id/360', c.vista360);
 router.post('/', permitirRoles('super_admin', 'admin', 'coordinador', 'vendedora'), c.crear);
 router.put('/:id', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.actualizar);
+// Registrar un contrato nuevo (renovación) de un área: archiva la vigencia
+// anterior en el historial y deja la nueva como vigente.
+router.post('/:id/contrato', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.registrarContrato);
 router.patch('/:id/estado', permitirRoles('super_admin', 'admin'), c.cambiarEstado);
 
 module.exports = router;

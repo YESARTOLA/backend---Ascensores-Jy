@@ -92,6 +92,7 @@ model tbl_usuarios {
   leads_registrados      tbl_leads[]   @relation("LeadRegistrador")
   leads_como_vendedor    tbl_leads[]   @relation("LeadVendedor")
   leads_cotizaciones_subidas tbl_leads_cotizaciones[] @relation("LeadCotizacionRegistrador")
+  leads_documentos_subidos   tbl_leads_archivos[]     @relation("LeadArchivoRegistrador")
   atenciones_responsable tbl_atenciones_rapidas[] @relation("AtencionResponsable")
 }
 
@@ -145,8 +146,37 @@ model tbl_clientes {
   correctivos                   tbl_correctivos[]
   cotizaciones                  tbl_cotizaciones[]
   archivos                      tbl_clientes_archivos[]
+  contratos_historial           tbl_clientes_contratos_historial[]
   archivo_contrato_servicio     tbl_archivos?               @relation("ClienteContratoServicio", fields: [id_archivo_contrato_servicio], references: [id])
   archivo_contrato_proyecto     tbl_archivos?               @relation("ClienteContratoProyecto", fields: [id_archivo_contrato_proyecto], references: [id])
+}
+
+// Contratos YA REEMPLAZADOS de un cliente, por área. Al registrar un contrato
+// nuevo (renovación) las fechas vigentes del área pasan aquí y el cliente queda
+// con las nuevas: tbl_clientes siempre tiene el contrato VIGENTE y esta tabla el
+// rastro de los anteriores.
+//
+// No guarda el documento: el PDF del contrato es uno solo por área y el nuevo
+// reemplaza al anterior (decisión de negocio). Por eso aquí solo quedan las
+// fechas de vigencia, cuándo se reemplazó y quién lo hizo.
+model tbl_clientes_contratos_historial {
+  id                     Int          @id @default(autoincrement())
+  id_cliente             Int
+  // Área del contrato: 'servicio' | 'proyecto' (ver CAMPOS_CONTRATO_AREA).
+  area                   String       @db.VarChar(20)
+  fecha_inicio           DateTime     @db.Date
+  fecha_fin              DateTime     @db.Date
+  // Momento en que este contrato dejó de ser el vigente.
+  fecha_reemplazo        DateTime     @default(now()) @db.Timestamptz(6)
+  observaciones          String?
+  estado                 Int          @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?    @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?    @db.Timestamptz(6)
+  cliente                tbl_clientes @relation(fields: [id_cliente], references: [id], onDelete: Cascade)
+
+  @@index([id_cliente, area])
 }
 
 // Edificio u obra de un cliente: la ubicación física que agrupa ascensores.
@@ -235,9 +265,21 @@ model tbl_ascensores {
   capacidad              String?                     @db.VarChar(50)
   pisos                  Int?
   anio_aproximado        Int?
+  // Mismo catálogo que la clasificación del cliente (utils/catalogosClientes.js).
+  // Se registra por ascensor: un cliente puede tener ascensores de distinta
+  // clasificación comercial.
+  clasificacion          String?                     @db.VarChar(20)
   estado_operativo       String                      @default("Operativo") @db.VarChar(50)
   fecha_instalacion      DateTime?                   @db.Date
   proximo_mantenimiento  DateTime?                   @db.Date
+  // Datos de sitio del ascensor: a quién contactar al llegar y si tiene cuarto
+  // de máquinas ('Si' / 'No'; NULL = sin definir). Se registran una sola vez en
+  // la ficha y cada servicio/proyecto nuevo sobre este ascensor los hereda
+  // (utils/datosSitioAscensor.js), de modo que el técnico asignado los ve en su
+  // servicio sin que nadie los recargue a mano.
+  contacto_nombre        String?                     @db.VarChar(150)
+  contacto_telefono      String?                     @db.VarChar(30)
+  cuarto_maquinas        String?                     @db.VarChar(2)
   observaciones          String?
   estado                 Int                         @default(1)
   user_id_registration   Int?
@@ -409,6 +451,13 @@ model tbl_servicios_proyectos {
   contacto_nombre           String?                           @db.VarChar(150)
   contacto_telefono         String?                           @db.VarChar(30)
   cuarto_maquinas           String?                           @db.VarChar(2)
+  // Cierre fuera de plazo: el técnico tiene SERVICIO_CIERRE_PLAZO_DIAS días desde
+  // el último día programado para finalizar. Vencido ese plazo, el super
+  // administrador habilita el cierre de ESTE servicio con este flag (permiso
+  // puntual: se consume al finalizarse). Ver utils/plazoCierre.js.
+  cierre_fuera_plazo_habilitado Boolean                        @default(false)
+  cierre_habilitado_por     Int?
+  cierre_habilitado_en      DateTime?                         @db.Timestamptz(6)
   estado                    Int                               @default(1)
   user_id_registration      Int?
   date_time_registration    DateTime?                         @default(now()) @db.Timestamptz(6)
@@ -888,6 +937,7 @@ model tbl_leads {
   vendedor                    tbl_usuarios?       @relation("LeadVendedor", fields: [id_vendedor], references: [id])
   cotizaciones                tbl_cotizaciones[]
   cotizaciones_adjuntas       tbl_leads_cotizaciones[]
+  documentos                  tbl_leads_archivos[]
 }
 
 // PDFs de cotización adjuntos al lead, versionados de forma incremental.
@@ -906,6 +956,31 @@ model tbl_leads_cotizaciones {
   usuario_registrador    tbl_usuarios? @relation("LeadCotizacionRegistrador", fields: [user_id_registration], references: [id])
 
   @@unique([id_lead, version])
+}
+
+// Documentos libres del lead (PDF, imágenes, videos, Office…) que la CENTRAL DE
+// VENTAS carga durante la etapa comercial para que la VENDEDORA asignada los
+// consulte. Es un expediente propio del lead: al convertirlo en cliente/servicio
+// los documentos NO se copian ni se mueven — se quedan en el lead, que sigue
+// consultable con estado "Ingresado".
+// Distinto de tbl_leads_cotizaciones (PDF versionado que respalda el estado
+// "Cotizado") y de tbl_clientes_archivos (expediente del cliente ya convertido).
+model tbl_leads_archivos {
+  id                     Int           @id @default(autoincrement())
+  id_lead                Int
+  id_archivo             Int
+  descripcion            String?       @db.VarChar(200)
+  orden                  Int           @default(0)
+  estado                 Int           @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?     @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?     @db.Timestamptz(6)
+  lead                   tbl_leads     @relation(fields: [id_lead], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos  @relation(fields: [id_archivo], references: [id])
+  usuario_registrador    tbl_usuarios? @relation("LeadArchivoRegistrador", fields: [user_id_registration], references: [id])
+
+  @@index([id_lead])
 }
 
 // ---------------------------------------------------------------------
@@ -1096,6 +1171,7 @@ model tbl_archivos {
   servicios_observaciones tbl_servicios_observaciones[]
   finalizacion_informes   tbl_servicios_finalizacion_checklist[]
   leads_cotizaciones      tbl_leads_cotizaciones[]
+  leads_documentos        tbl_leads_archivos[]
   cotizaciones_items      tbl_cotizaciones_items[]
   emergencias_archivos    tbl_emergencias_archivos[]
 }
@@ -1286,7 +1362,6 @@ model tbl_cotizaciones_versiones {
   id_cotizacion          Int
   numero_version         Int
   fecha_envio            DateTime?                @db.Date
-  fecha_validez          DateTime                 @db.Date
   subtotal               Decimal                  @default(0) @db.Decimal(12, 2)
   igv                    Decimal                  @default(0) @db.Decimal(12, 2)
   igv_tasa               Decimal                  @default(0) @db.Decimal(5, 4)
@@ -1296,6 +1371,9 @@ model tbl_cotizaciones_versiones {
   motivo_cambio          String?
   observaciones          String?
   terminos               String?
+  // Texto libre de la garantía ofrecida en esta versión. Se imprime en el PDF
+  // como "Garantía: <texto>". NULL / vacío = no se muestra el bloque.
+  garantia               String?
   id_archivo_pdf         Int?
   fecha_aprobacion       DateTime?                @db.Timestamptz(6)
   aprobada_por           Int?

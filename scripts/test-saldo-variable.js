@@ -57,8 +57,6 @@ async function main() {
     id_cliente: cliente.id,
     id_tipo_servicio: tipo.id,
     ascensores: [{ id_ascensor: ascensor.id }],
-    titulo: 'API E2E - Adelanto 300 + saldo variable',
-    fecha_validez: '2026-06-30',
     items: [{ descripcion: 'Servicio de prueba', cantidad: 1, unidad: 'Unidad', precio_unitario: 1000, descuento_porcentaje: 0 }],
     tiene_cuotas: true,
     plan_cuotas: [

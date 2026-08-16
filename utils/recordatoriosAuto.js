@@ -394,6 +394,29 @@ async function descartarAlertaObservacion(idObservacion) {
 }
 
 /**
+ * Domingo no se trabaja: ninguna alerta debe quedar agendada ese día. Si la
+ * fecha cae domingo, se corre al lunes siguiente (día hábil más cercano hacia
+ * adelante). Respeta el tipo de dato de origen: las columnas `@db.Date` llegan
+ * como medianoche UTC, así que se opera en UTC para no desplazar el día.
+ */
+function correrSiEsDomingo(fecha) {
+  const d = new Date(fecha);
+  if (isNaN(d.getTime())) return fecha;
+  // Una `@db.Date` llega como medianoche UTC: su día de semana se lee en UTC.
+  // Un instante real (el fallback `new Date()`) se lee en hora de Lima, que es
+  // el día que muestra el calendario.
+  const esFechaPura = d.getUTCHours() === 0 && d.getUTCMinutes() === 0
+    && d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0;
+  const diaSemana = esFechaPura
+    ? d.getUTCDay()
+    : new Date(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Lima' }).format(d) + 'T00:00:00.000Z').getUTCDay();
+  if (diaSemana !== 0) return d;
+  if (esFechaPura) d.setUTCDate(d.getUTCDate() + 1);
+  else d.setDate(d.getDate() + 1);
+  return d;
+}
+
+/**
  * Crea (idempotente) una alerta tipo 'cotizacion_urgente' SOLO cuando el
  * servicio tiene al menos una observación técnica registrada (activa) — es lo
  * que se cotizaría. Se dispara únicamente al registrar/eliminar observaciones
@@ -428,9 +451,12 @@ async function sincronizarRecordatorioCotizacionUrgente(idServicio) {
     : '';
   const descripcion = `Servicio con observación técnica registrada. Revisar y emitir cotización.${detalleCliente ? ` · ${detalleCliente}` : ''}`;
   // Se registra en la fecha en que el técnico tiene agendado el servicio
-  // (fecha_programada). Como no se agenda trabajo los domingos, nunca cae en
-  // domingo. Si por algún motivo no hubiera fecha programada, se usa hoy.
-  const fechaRecordatorio = s.fecha_programada || new Date();
+  // (fecha_programada), NO en la fecha real de cierre: si el técnico cierra
+  // tarde, la alerta igual aparece el día en que estaba programado el trabajo.
+  // Como no se agenda trabajo los domingos, así nunca cae en domingo; el
+  // `correrSiEsDomingo` cubre el fallback (servicio sin fecha programada) y
+  // cualquier dato heredado que sí cayera domingo.
+  const fechaRecordatorio = correrSiEsDomingo(s.fecha_programada || new Date());
   return upsertAuto({
     filtro: { tipo: 'cotizacion_urgente', id_servicio: idServicio },
     datos: {

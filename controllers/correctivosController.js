@@ -17,6 +17,7 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
@@ -157,6 +158,8 @@ const crear = async (req, res) => {
     }
     const { tipo_registro: tipoRegistroCor } = clasificarTipoServicio(tipoCorrectivo);
     const nivelUrgencia = d.nivel_urgencia || 'media';
+    // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
+    const datosSitio = await datosSitioParaServicio(prisma, [d.id_ascensor], d);
 
     const servicio = await prisma.tbl_servicios_proyectos.create({
       data: {
@@ -179,6 +182,7 @@ const crear = async (req, res) => {
         sin_cobro: sinCobro ? 1 : 0,
         requiere_factura: requiereFactura,
         observaciones: d.observaciones || null,
+        ...datosSitio,
         user_id_registration: req.user.id,
         ascensores: {
           create: [{
