@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { inicioDelDiaLima, finDelDiaLima, inicioMesLima, finMesLima } = require('../utils/tiempo');
+const { puedeVerFinanzasReq } = require('../utils/visibilidadFinanzas');
 const {
   ESTADO_FACTURACION_SIN,
   ESTADOS_FACTURACION_COMPLETA
@@ -35,8 +36,8 @@ const resumen = async (req, res) => {
       proyectosActivos, proyectosFinalizados
     ] = await Promise.all([
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'Pendiente', estado: 1 } }),
-      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: { in: ['Asignado', 'Checklist de salida pendiente', 'Listo para salida'] }, estado: 1 } }),
-      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'Asignado', estado: 1 } }),
+      prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'En curso', estado: 1 } }),
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, ...ESTADOS_FINALIZADO } }),
       prisma.tbl_emergencias.count({ where: { estado_emergencia: { in: ['Reportada', 'En atención'] }, estado: 1 } }),
       prisma.tbl_tecnicos.count({ where: { estado_operativo: 'Disponible', estado: 1 } }),
@@ -55,6 +56,15 @@ const resumen = async (req, res) => {
       cobrosVencidos, cobrosMora, cobrosPendientes,
       proyectosActivos, proyectosFinalizados
     };
+
+    // Los contadores de cobranza (vencidos / en mora / pendientes) son dato
+    // financiero: no se envían a los roles sin visibilidad económica, que además
+    // no los pintan en su tablero.
+    if (!puedeVerFinanzasReq(req)) {
+      delete data.cobrosVencidos;
+      delete data.cobrosMora;
+      delete data.cobrosPendientes;
+    }
 
     // Ámbito: anular los KPIs fuera del ámbito del usuario (admin/coordinador
     // acotado). Los de Servicios cuando no tiene Servicios; los de Proyectos
@@ -82,13 +92,13 @@ const resumen = async (req, res) => {
         prisma.tbl_servicios_asignaciones.count({
           where: {
             id_tecnico: idTec, estado: 1,
-            servicio: { estado_servicio: { in: ['Pendiente', 'Asignado', 'Checklist de salida pendiente', 'Listo para salida'] }, estado: 1 }
+            servicio: { estado_servicio: { in: ['Pendiente', 'Asignado'] }, estado: 1 }
           }
         }),
         prisma.tbl_servicios_asignaciones.count({
           where: {
             id_tecnico: idTec, estado: 1,
-            servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+            servicio: { estado_servicio: 'En curso', estado: 1 }
           }
         }),
         prisma.tbl_servicios_realizados.count({

@@ -1,6 +1,8 @@
 const prisma = require('../config/prisma');
+const { registrarActividadTecnico } = require('../utils/actividadTecnico');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
+const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
 
 const subirEvidencia = async (req, res) => {
   try {
@@ -19,9 +21,17 @@ const subirEvidencia = async (req, res) => {
       where: { id: id_servicio }, include: { asignaciones: { where: { estado: 1 } } }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-    if (estaServicioFinalizado(servicio.estado_servicio)) {
+    // El técnico sube evidencias mientras ejecuta; los roles de gestión pueden
+    // además completarlas después, hasta la revisión administrativa (ver
+    // utils/registrosTecnico.js).
+    if (esRolGestion(req.user)) {
+      const bloqueo = motivoBloqueo(req.user, servicio, 'subir evidencias');
+      if (bloqueo) return res.status(400).json({ error: bloqueo });
+    } else if (estaServicioFinalizado(servicio.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se puede subir evidencias` });
     }
+    // La evidencia se atribuye al técnico que la tomó. Si la carga un rol de
+    // gestión, queda a nombre del técnico asignado (que es de quien es el trabajo).
     const id_tecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
     if (!id_tecnico) return res.status(400).json({ error: 'No hay técnico asignado' });
 
@@ -47,6 +57,9 @@ const subirEvidencia = async (req, res) => {
         user_id_registration: req.user.id
       }
     });
+    // Subir evidencia es trabajo en obra: enciende "En curso" si el servicio
+    // seguía en Pendiente/Asignado.
+    await registrarActividadTecnico(id_servicio, req.user.id, 'Evidencia cargada');
     res.status(201).json({ data: evidencia });
   } catch (err) {
     console.error(err);
@@ -74,23 +87,41 @@ const listarEvidencias = async (req, res) => {
 const actualizarEvidencia = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { descripcion } = req.body;
+    const { descripcion, id_archivo, momento } = req.body;
     const previa = await prisma.tbl_servicios_evidencias.findUnique({
       where: { id },
       include: { servicio: { select: { estado_servicio: true } } }
     });
     if (!previa) return res.status(404).json({ error: 'Evidencia no encontrada' });
     if (previa.estado === 0) return res.status(400).json({ error: 'Evidencia eliminada' });
-    if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
+    if (esRolGestion(req.user)) {
+      const bloqueo = motivoBloqueo(req.user, previa.servicio, 'editar evidencias');
+      if (bloqueo) return res.status(400).json({ error: bloqueo });
+    } else if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se puede editar evidencias` });
+    }
+    // El momento (Antes / Después) es parte de lo que puede haberse cargado mal.
+    let momentoNorm;
+    if (momento !== undefined) {
+      if (momento === null || momento === '') momentoNorm = null;
+      else if (['Antes', 'Despues'].includes(momento)) momentoNorm = momento;
+      else return res.status(400).json({ error: 'Momento inválido (use Antes o Despues)' });
     }
     const evidencia = await prisma.tbl_servicios_evidencias.update({
       where: { id },
       data: {
         descripcion: (descripcion ?? '').trim() || null,
+        // Reemplazo de la foto: solo si el payload lo trae, para que una
+        // edición de comentario no borre el archivo por omitirlo.
+        ...(id_archivo !== undefined ? { id_archivo: id_archivo ? Number(id_archivo) : null } : {}),
+        ...(momento !== undefined ? { momento: momentoNorm } : {}),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       }
+    });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_evidencias', id_entidad: id,
+      accion: 'UPDATE', valor_anterior: previa, valor_nuevo: evidencia, ip: req.ip
     });
     res.json({ data: evidencia });
   } catch (err) {
@@ -101,7 +132,9 @@ const actualizarEvidencia = async (req, res) => {
 
 const eliminarEvidencia = async (req, res) => {
   try {
-    if (!['super_admin', 'admin', 'tecnico'].includes(req.user.rol_codigo)) {
+    // Coordinación revisa el material antes de pasarlo a Administración, así que
+    // también retira una foto mal tomada o duplicada.
+    if (!esRolGestion(req.user) && req.user.rol_codigo !== 'tecnico') {
       return res.status(403).json({ error: 'No tiene permiso para eliminar evidencias' });
     }
     const id = Number(req.params.id);
@@ -111,7 +144,10 @@ const eliminarEvidencia = async (req, res) => {
     });
     if (!previa) return res.status(404).json({ error: 'Evidencia no encontrada' });
     if (previa.estado === 0) return res.status(400).json({ error: 'Evidencia ya eliminada' });
-    if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
+    if (esRolGestion(req.user)) {
+      const bloqueo = motivoBloqueo(req.user, previa.servicio, 'eliminar evidencias');
+      if (bloqueo) return res.status(400).json({ error: bloqueo });
+    } else if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se puede eliminar evidencias` });
     }
 

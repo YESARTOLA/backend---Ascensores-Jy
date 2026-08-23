@@ -4,10 +4,11 @@ const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado 
 const { diffDiasLima, parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioCobro } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
-const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA } = require('../utils/catalogosBancarios');
+const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { ESTADO_FACTURACION_SIN, esFacturaActiva } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
+const { detalleMensualPorCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
@@ -63,6 +64,20 @@ function agruparAbonosPorCuenta(pagos) {
 }
 
 /**
+ * Factura activa más reciente de un cobro: la que la tabla de cobros muestra en
+ * "Fecha de emisión" y "Serie y N° factura". Ordenar por otra distinta de la que
+ * se ve descolocaría la lista.
+ */
+function facturaVigente(cobro) {
+  const facturas = (cobro?.facturas || []).filter(f => f.estado !== 0);
+  if (facturas.length === 0) return null;
+  return facturas.reduce(
+    (max, f) => ((f.fecha_emision || '') > (max.fecha_emision || '') ? f : max),
+    facturas[0]
+  );
+}
+
+/**
  * Ordena el array de cobros (ya con métricas calculadas) por la columna pedida.
  * Las columnas que pueden ser null se relegan al final independientemente de la
  * dirección, para que el usuario nunca pierda los registros con dato faltante
@@ -74,9 +89,14 @@ function ordenarCobros(arr, orden, direccion) {
   const dir = direccion === 'desc' ? -1 : 1;
   const getters = {
     cliente: c => (c.cliente?.nombre || '').toLowerCase(),
+    // Serie y correlativo de la factura vigente ("F001-000123"). Como el
+    // correlativo va zero-padded, comparar el texto ya respeta el orden numérico
+    // dentro de cada serie. Los cobros aún sin factura caen al final (el
+    // comparador de abajo releva los vacíos).
+    factura: c => facturaVigente(c)?.numero_factura || '',
     proyecto: c => (c.servicio?.titulo || '').toLowerCase(),
     servicio: c => c.servicio?.codigo || '',
-    ot: c => c.servicio?.servicio_realizado?.numero_ot || '',
+    ot: c => c.servicio?.numero_ot || '',
     precio: c => Number(c.monto_total || 0),
     abonos: c => Number(c.total_abonado || 0),
     cuotas: c => Number(c.cuotas_pagadas || 0),
@@ -121,6 +141,52 @@ async function persistirEstadoMora(cobro) {
   return cobro;
 }
 
+/**
+ * Resumen de cobranza del conjunto de cobros YA FILTRADO (sin paginar): los dos
+ * indicadores de la cabecera de Gestión de cobros.
+ *
+ * El criterio es el DINERO, no el estado del cobro:
+ *   · cobrados   → todo lo abonado, incluidos los abonos parciales de cobros que
+ *                  siguen abiertos. La cantidad, en cambio, son los cobros ya
+ *                  saldados (saldo 0).
+ *   · pendientes → el saldo que falta cobrar, y la cantidad de cobros abiertos.
+ *
+ * Así los dos importes suman exactamente la cartera facturada del filtro: el par
+ * se lee como "cuánto entró / cuánto falta". Si el monto de cobrados contara
+ * solo los cobros saldados, el dinero abonado a cuenta no aparecería en ningún
+ * lado y los cards no cuadrarían con el total.
+ *
+ * Los montos se agrupan POR MONEDA: la cartera tiene cobros en PEN y en USD, y
+ * un único total mezclándolos sería un número falso. Se suma en centavos para
+ * no arrastrar el error del float (mismo criterio que el resto del módulo).
+ */
+function resumenCobranza(cobros) {
+  const cobrados = { cantidad: 0, cents: new Map() };
+  const pendientes = { cantidad: 0, cents: new Map() };
+  const acumular = (grupo, moneda, cents) => {
+    if (cents === 0) return;
+    grupo.cents.set(moneda, (grupo.cents.get(moneda) || 0) + cents);
+  };
+
+  for (const c of cobros) {
+    const moneda = c.moneda || MONEDA_POR_DEFECTO;
+    const saldo = aCentavos(c.saldo_pendiente);
+    const abonado = aCentavos(c.total_abonado);
+    if (saldo === 0) cobrados.cantidad++;
+    else pendientes.cantidad++;
+    acumular(cobrados, moneda, abonado);
+    acumular(pendientes, moneda, saldo);
+  }
+
+  const aSalida = (g) => ({
+    cantidad: g.cantidad,
+    montos: [...g.cents.entries()]
+      .map(([moneda, cents]) => ({ moneda, total: aSoles(cents) }))
+      .sort((a, b) => b.total - a.total)
+  });
+  return { cobrados: aSalida(cobrados), pendientes: aSalida(pendientes) };
+}
+
 const listar = async (req, res) => {
   try {
     const {
@@ -160,7 +226,9 @@ const listar = async (req, res) => {
             cotizacion: { select: { id: true, codigo: true } },
             ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
             asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
-            servicio_realizado: { include: { archivo_ot: true } }
+            // La OT vive en el servicio (relación "ServicioOt"), no en su folder contable.
+            archivo_ot: true,
+            servicio_realizado: true
           }
         },
         // Cobro de plan de mantenimiento (sin servicio): se muestra con el plan,
@@ -182,11 +250,19 @@ const listar = async (req, res) => {
 
     if (q) {
       const ql = q.toLowerCase();
-      // Buscador amplio: cliente, código/título del servicio, documento
-      // (RUC/DNI) y número/serie de factura (numero_factura tiene formato
-      // "F001-000123", por lo que un término de serie o de número coincide).
+      // Nombres de edificio/obra del cobro. Se llega al sitio por dos caminos
+      // según el origen: los ascensores del servicio, o los del plan de
+      // mantenimiento cuando el cobro es del plan (esos no tienen servicio).
+      const edificiosDe = (c) => [...(c.servicio?.ascensores || []), ...(c.mantenimiento_plan?.ascensores || [])]
+        .map(sa => sa.ascensor?.edificio?.nombre)
+        .filter(Boolean);
+      // Buscador amplio: cliente, nombre del edificio/obra, código/título del
+      // servicio, documento (RUC/DNI) y número/serie de factura (numero_factura
+      // tiene formato "F001-000123", por lo que un término de serie o de número
+      // coincide).
       data = data.filter(c =>
         c.cliente?.nombre?.toLowerCase().includes(ql) ||
+        edificiosDe(c).some(n => n.toLowerCase().includes(ql)) ||
         c.servicio?.codigo?.toLowerCase().includes(ql) ||
         c.servicio?.titulo?.toLowerCase().includes(ql) ||
         c.cliente?.numero_documento?.toLowerCase().includes(ql) ||
@@ -243,7 +319,10 @@ const listar = async (req, res) => {
 
     if (orden) data = ordenarCobros(data, orden, direccion);
 
-    res.json(paginarArray(data, req.query));
+    // El resumen se calcula sobre `data` YA FILTRADA y ANTES de paginar: los
+    // indicadores describen todo el recorte que el usuario eligió, no las 25
+    // filas que alcanza a ver.
+    res.json({ ...paginarArray(data, req.query), resumen_cobranza: resumenCobranza(data) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar cobros' });
@@ -274,7 +353,19 @@ const obtener = async (req, res) => {
     await persistirEstadoMora(cobro);
 
     const aprobacionCotizacion = await obtenerAprobacionCotizacion(cobro.servicio?.id_cotizacion);
-    res.json({ data: { ...calcularMetricas(cobro), aprobacion_cotizacion: aprobacionCotizacion } });
+    // Cobro de PLAN de mantenimiento: cada cuota es UN MES y se paga una sola
+    // vez, pero lleva el detalle de todos los mantenimientos de ese mes (qué
+    // ascensor, cuántas veces y en qué fechas). El desglose se deriva del
+    // cronograma del plan — no se duplica en la cuota — y va adjunto a cada una.
+    const detallePorCuota = await detalleMensualPorCuota(prisma, cobro.id_mantenimiento_plan);
+    const metricas = calcularMetricas(cobro);
+    if (detallePorCuota.size > 0) {
+      metricas.cuotas = (metricas.cuotas || []).map(c => ({
+        ...c,
+        detalle_mensual: detallePorCuota.get(c.id) || null
+      }));
+    }
+    res.json({ data: { ...metricas, aprobacion_cotizacion: aprobacionCotizacion } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener cobro' });
@@ -350,6 +441,15 @@ const actualizarPlanCuotas = async (req, res) => {
     // el acceso directo a la API.
     if (cobro.estado_cobro === 'Cerrado') {
       return res.status(409).json({ error: 'El cobro está cerrado; no se puede modificar el plan de cuotas' });
+    }
+    // Cobro de PLAN de mantenimiento: sus cuotas son los MESES del plan y las
+    // gobierna la aprobación mes a mes (una cuota por mes, por el monto mensual
+    // pactado). Reestructurarlas aquí rompería la correspondencia cuota ↔ mes
+    // de la que cuelgan el detalle de visitas y la facturación.
+    if (cobro.id_mantenimiento_plan) {
+      return res.status(409).json({
+        error: 'Este cobro pertenece a un plan de mantenimiento: sus cuotas son los meses del plan. Apruebe o ajuste los meses desde el plan.'
+      });
     }
 
     const pagadas = cobro.cuotas_pagadas;
@@ -867,7 +967,10 @@ const cuotasNoFacturadas = async (req, res) => {
     const alcance = porServicioOPlanAscensorEdificioWhere(req.user);
     if (Object.keys(alcance).length > 0) Object.assign(cobroWhere, alcance);
 
-    const where = { estado: 1, cobro: { is: cobroWhere } };
+    // Una cuota de importe 0 no se factura: son los MESES GRATUITOS de un plan
+    // de mantenimiento (se prestan pero no se cobran) y quedan saldados al
+    // aprobarse. Listarlos aquí obligaría a emitir comprobantes por S/ 0.
+    const where = { estado: 1, monto: { gt: 0 }, cobro: { is: cobroWhere } };
     if (fecha_desde || fecha_hasta) {
       where.fecha_vencimiento = {};
       if (fecha_desde) where.fecha_vencimiento.gte = parseYMDLima(fecha_desde);
@@ -899,6 +1002,14 @@ const cuotasNoFacturadas = async (req, res) => {
         }
       }
     });
+
+    // Desglose mensual de las cuotas de plan: una pasada por plan implicado.
+    const idsPlan = [...new Set(cuotas.map(cu => cu.cobro?.id_mantenimiento_plan).filter(Boolean))];
+    const detallePorCuota = new Map();
+    for (const idPlan of idsPlan) {
+      const mapa = await detalleMensualPorCuota(prisma, idPlan);
+      for (const [idCuota, det] of mapa) detallePorCuota.set(idCuota, det);
+    }
 
     // Solo las cuotas que aún no están cubiertas por ninguna factura activa.
     let filas = cuotas
@@ -945,6 +1056,9 @@ const cuotasNoFacturadas = async (req, res) => {
             modulo: servicio.tipo_servicio?.modulo_asociado || null
           } : null,
           mantenimiento_plan: plan ? { id: plan.id } : null,
+          // Mes del plan que factura esta cuota y los mantenimientos que cubre.
+          detalle_mensual: detallePorCuota.get(cu.id) || null,
+          numero_mes: cu.numero_mes ?? null,
           tipo_servicio: servicio?.tipo_servicio?.nombre || plan?.tipo_servicio?.nombre || null,
           edificio,
           facturacion_parcial: facturacionParcial

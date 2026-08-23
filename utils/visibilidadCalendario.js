@@ -17,8 +17,8 @@
  * Espejado en `frontend/src/utils/visibilidadCalendario.js`.
  */
 const VISIBILIDAD_POR_ROL = {
-  super_admin:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
-  admin:        { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso'] },
+  super_admin:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'cobro', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso', 'correctivo_gratuito'] },
+  admin:        { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar', 'servicio_finalizado_facturar', 'servicio_finalizado_aviso', 'correctivo_gratuito'] },
   coordinador:  { operativos: 'todos',     tipos_recordatorio: ['manual', 'mantenimiento', 'emergencia', 'observacion', 'observacion_alerta', 'cotizacion_urgente', 'servicio_finalizado_revisar'] },
   tecnico:      { operativos: 'asignados', tipos_recordatorio: ['mantenimiento', 'emergencia'] },
   // Contabilidad recibe SOLO el aviso sin detalle (observacion_facturar), no la
@@ -60,7 +60,8 @@ const COLOR_POR_TIPO = {
   cotizacion_urgente: '#dc2626',
   servicio_finalizado_revisar: '#f59e0b',
   servicio_finalizado_facturar: '#8b5cf6',
-  servicio_finalizado_aviso: '#0ea5e9'
+  servicio_finalizado_aviso: '#0ea5e9',
+  correctivo_gratuito: '#b45309'
 };
 
 function colorPorTipo(tipo) {

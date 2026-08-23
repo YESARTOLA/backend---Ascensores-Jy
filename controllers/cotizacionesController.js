@@ -17,6 +17,7 @@ const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = 
 const { bajaArchivoEnTx, purgarObjetosWasabi, bajaServicioCascadaEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { tiposRegistroPermitidos, cotizacionAlcanceWhere, puedeVerTipoRegistro, conAlcance } = require('../utils/alcanceUsuario');
 const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
+const { puedeVerFinanzasReq, cotizacionSinFinanzas } = require('../utils/visibilidadFinanzas');
 
 // Categoría funcional (del tipo padre) que corresponde a cada ámbito. Se usa para
 // acotar las cotizaciones que ve un usuario de área (servicios / proyectos).
@@ -30,6 +31,10 @@ function categoriasFuncionalesDeAmbito(user) {
 // área solo ve/gestiona las cotizaciones de esa área).
 const ROLES_VER = ['super_admin', 'admin', 'contabilidad'];
 const ROLES_EDIT = ['super_admin', 'admin'];
+// El Coordinador NO entra al módulo (ni listado, ni exportación, ni historial,
+// ni PDF): solo abre el DETALLE de la cotización de origen desde el servicio, y
+// lo recibe sin ningún dato financiero (ver `cotizacionSinFinanzas`).
+const ROLES_VER_DETALLE = [...ROLES_VER, 'coordinador'];
 
 // Catálogos de estado: viven en utils/estadoCotizacion.js para que el listado
 // (y su filtro) los consuman del backend en vez de repetirlos a mano.
@@ -41,12 +46,17 @@ const {
   ESTADOS_GLOBALES,
   ESTADOS_VERSION_LISTA,
   FILTROS_GLOBALES,
+  ETIQUETAS_FILTRO_GLOBAL,
   resolverFiltroGlobal,
   rangoEsPorFechaAceptacion
 } = require('../utils/estadoCotizacion');
 
 function puedeVer(req) {
   return ROLES_VER.includes(req.user?.rol_codigo);
+}
+
+function puedeVerDetalle(req) {
+  return ROLES_VER_DETALLE.includes(req.user?.rol_codigo);
 }
 
 function puedeEditar(req) {
@@ -112,11 +122,10 @@ function transicionPermitida(actual, destino) {
 // cotización. Se mantienen aquí para que el cálculo sea una sola fuente de
 // verdad — no se duplican en frontend.
 const ESTADOS_SERVICIO_EJECUCION = [
-  'Asignado', 'Checklist de salida pendiente', 'Listo para salida',
-  'En camino', 'En curso'
+  'Asignado', 'En curso'
 ];
 const ESTADOS_SERVICIO_PENDIENTE = [
-  'Finalizado por técnico', 'Finalizado observado',
+  'Finalizado',
   'En revisión administrativa', 'A gestión de cobro', 'En cobro',
   'Cobrado parcial', 'Facturado'
 ];
@@ -127,7 +136,7 @@ const ESTADOS_SERVICIO_TERMINADO = ['Cobrado total', 'Cerrado'];
  *
  *  - Cotizado  → no hay servicio (ninguna versión Aprobada todavía)
  *  - Aceptado  → servicio creado, aún en Pendiente
- *  - Ejecución → servicio asignado / en camino / en curso
+ *  - Ejecución → servicio asignado / en curso
  *  - Pendiente → servicio finalizado pero con cobro/facturación abierta
  *  - Terminado → servicio cerrado o cobro totalmente liquidado
  */
@@ -239,13 +248,14 @@ const listar = async (req, res) => {
       // Código de servicio generado por la cotización (cuando ya fue aprobada)
       { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
     ] });
-    // El filtro acepta un estado_global exacto o un filtro virtual ('Aprobadas')
-    // que agrupa todas las etapas posteriores a la aceptación. Sin esto, una
-    // cotización aceptada desaparecía del filtro 'Aceptado' apenas su servicio
-    // pasaba a ejecución (estado_global → 'Ejecución').
+    // El filtro de estado no siempre es una igualdad: algunos valores arrastran
+    // las fases posteriores del ciclo (ver EXPANSION_FILTRO_GLOBAL). Sin esto
+    // una cotización aceptada desaparecía del filtro 'Aceptado' apenas su
+    // servicio pasaba a ejecución, y 'Terminado' dejaba fuera los servicios ya
+    // terminados que están en cobro o facturación (estado_global 'Pendiente').
     if (estado_global) {
-      const estadosVirtual = resolverFiltroGlobal(estado_global);
-      and.push(estadosVirtual ? { estado_global: { in: estadosVirtual } } : { estado_global });
+      const estadosFiltro = resolverFiltroGlobal(estado_global);
+      and.push(estadosFiltro ? { estado_global: { in: estadosFiltro } } : { estado_global });
     }
     if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
     // Filtro por ascensor: cotizaciones que incluyen ese ascensor existente.
@@ -302,7 +312,7 @@ const listar = async (req, res) => {
 
 const obtener = async (req, res) => {
   try {
-    if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
+    if (!puedeVerDetalle(req)) return res.status(403).json({ error: 'No autorizado' });
     const id = Number(req.params.id);
     const cotizacion = await prisma.tbl_cotizaciones.findUnique({
       where: { id },
@@ -337,6 +347,14 @@ const obtener = async (req, res) => {
     const catsAmbito = categoriasFuncionalesDeAmbito(req.user);
     if (catsAmbito && !catsAmbito.includes(cotizacion.tipo_servicio?.categoria_funcional)) {
       return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+
+    // Roles sin visibilidad financiera (Coordinador): se responde una vista
+    // reducida —ítems, sus fotos y los adjuntos que sean imágenes— sin precios,
+    // totales, cuotas, cuentas bancarias, PDF ni respaldo. Lista blanca en
+    // utils/visibilidadFinanzas.js: un campo nuevo del modelo no se filtra solo.
+    if (!puedeVerFinanzasReq(req)) {
+      return res.json({ data: cotizacionSinFinanzas(cotizacion) });
     }
 
     res.json({ data: cotizacion });
@@ -2185,12 +2203,12 @@ function construirWhereCotizaciones(query) {
     // Código de servicio generado por la cotización (cuando ya fue aprobada)
     { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
   ];
-  // Igual que el listado: el valor puede ser un estado exacto o el filtro
-  // virtual 'Aprobadas' (todas las etapas posteriores a la aceptación). La
-  // traducción vive en utils/estadoCotizacion.js para no duplicarla aquí.
+  // Igual que el listado: el valor puede ser un estado exacto o un filtro que
+  // arrastra fases posteriores ('Aprobadas', 'Terminado'). La traducción vive
+  // en utils/estadoCotizacion.js para no duplicarla aquí.
   if (estado_global) {
-    const estadosVirtual = resolverFiltroGlobal(estado_global);
-    where.estado_global = estadosVirtual ? { in: estadosVirtual } : estado_global;
+    const estadosFiltro = resolverFiltroGlobal(estado_global);
+    where.estado_global = estadosFiltro ? { in: estadosFiltro } : estado_global;
   }
   if (id_cliente) where.id_cliente = Number(id_cliente);
   // Mismo filtro por ascensor que el listado (para exportar lo que se ve).
@@ -2302,7 +2320,16 @@ const historial = async (req, res) => {
 // desde el backend para que la UI no vuelva a duplicarlos en un array literal
 // y no pueda desalinearse de lo que realmente se escribe en la BD.
 const catalogos = (_req, res) => {
-  res.json({ data: { estados_globales: ESTADOS_GLOBALES, filtros_globales: FILTROS_GLOBALES, estados_version: ESTADOS_VERSION_LISTA } });
+  res.json({
+    data: {
+      estados_globales: ESTADOS_GLOBALES,
+      filtros_globales: FILTROS_GLOBALES,
+      // Estados reales cuya opción del selector se pinta con otro texto porque
+      // el filtro arrastra fases posteriores (p.ej. 'Terminado').
+      etiquetas_globales: ETIQUETAS_FILTRO_GLOBAL,
+      estados_version: ESTADOS_VERSION_LISTA
+    }
+  });
 };
 
 module.exports = {

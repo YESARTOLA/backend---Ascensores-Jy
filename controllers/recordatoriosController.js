@@ -7,6 +7,29 @@ const {
   tiposRecordatorioPermitidos,
   soloOperativosAsignados
 } = require('../utils/visibilidadCalendario');
+const {
+  puedeVerFinanzas, servicioSinPrecios, planMantenimientoSinFinanzas, omitir
+} = require('../utils/visibilidadFinanzas');
+
+/**
+ * Un recordatorio arrastra el servicio, el plan, el cobro y la cuota completos.
+ * Para los roles sin visibilidad financiera se entrega solo la parte operativa:
+ * sin precio del servicio, sin monto por ascensor del plan y sin cobro ni cuota.
+ */
+function sanearRecordatorio(r, user) {
+  if (!r || puedeVerFinanzas(user)) return r;
+  return omitir({
+    ...r,
+    servicio: r.servicio ? servicioSinPrecios(r.servicio) : r.servicio,
+    mantenimiento_plan: r.mantenimiento_plan
+      ? planMantenimientoSinFinanzas(r.mantenimiento_plan, user)
+      : r.mantenimiento_plan,
+    // La emergencia vinculada arrastra a su vez el servicio, con su precio.
+    emergencia: r.emergencia
+      ? { ...r.emergencia, servicio: r.emergencia.servicio ? servicioSinPrecios(r.emergencia.servicio) : r.emergencia.servicio }
+      : r.emergencia
+  }, ['cobro', 'cuota']);
+}
 
 // Include base + asignaciones activas para poder validar acceso por técnico.
 const includeRel = {
@@ -55,6 +78,11 @@ function whereVisible(user) {
       ]
     });
   }
+  // Recordatorio DIRIGIDO a un rol (alerta de observación con destinatario
+  // elegido por el técnico): solo lo ve ese rol. Los que no llevan destinatario
+  // —todo el histórico y el resto de automatismos— se rigen como siempre por la
+  // matriz de tipos, así que este filtro no les cambia nada.
+  clauses.push({ OR: [{ rol_destinatario: null }, { rol_destinatario: user.rol_codigo }] });
   return clauses.length === 1 ? clauses[0] : { AND: clauses };
 }
 
@@ -92,6 +120,9 @@ function puedeAcceder(rec, user) {
   if (!tipos.includes(rec.tipo)) return false;
   // Un recordatorio manual solo lo puede ver/operar su creador (privado).
   if (rec.tipo === 'manual' && rec.user_id_registration !== user.id) return false;
+  // Dirigido a un rol: no accesible ni por id desde otro rol (espejo del filtro
+  // de `whereVisible`, que si no se saltaría abriendo el recordatorio directo).
+  if (rec.rol_destinatario && rec.rol_destinatario !== user.rol_codigo) return false;
   if (!soloOperativosAsignados(user.rol_codigo)) return true;
   const idTec = user.id_tecnico;
   if (!idTec) return false;
@@ -146,7 +177,7 @@ const listar = async (req, res) => {
       });
     }
 
-    res.json(paginarArray(list, req.query));
+    res.json(paginarArray(list.map(r => sanearRecordatorio(r, req.user)), req.query));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar recordatorios' });
@@ -161,7 +192,7 @@ const obtener = async (req, res) => {
     });
     if (!r || r.estado !== 1) return res.status(404).json({ error: 'Recordatorio no encontrado' });
     if (!puedeAcceder(r, req.user)) return res.status(404).json({ error: 'Recordatorio no encontrado' });
-    res.json({ data: r });
+    res.json({ data: sanearRecordatorio(r, req.user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener recordatorio' });

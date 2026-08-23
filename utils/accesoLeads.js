@@ -38,6 +38,12 @@ const ROLES_GESTION_LEAD = [...ROLES_LEADS_GLOBALES];
 // Conversión a cliente/servicio: la Vendedora responsable (más administración).
 const ROLES_CONVERSION_LEAD = ['super_admin', 'admin', ROL_VENDEDORA];
 
+// A quién se puede ASIGNAR un lead. Coincide con quien puede convertirlo: no
+// tiene sentido asignar un lead a alguien que después no podrá trabajarlo.
+// Incluye administración porque en la práctica parte del equipo comercial está
+// dado de alta con esos roles y no con el rol `vendedora`.
+const ROLES_ASIGNABLES_LEAD = [...ROLES_CONVERSION_LEAD];
+
 /** ¿Este usuario solo puede ver los leads que tiene asignados? */
 const soloSusLeads = (user) => user?.rol_codigo === ROL_VENDEDORA;
 
@@ -59,6 +65,7 @@ module.exports = {
   ROLES_EDICION_LEAD,
   ROLES_GESTION_LEAD,
   ROLES_CONVERSION_LEAD,
+  ROLES_ASIGNABLES_LEAD,
   soloSusLeads,
   leadAlcanceWhere,
   puedeVerLead,

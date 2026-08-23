@@ -50,7 +50,11 @@ router.get('/catalogos', permitirRoles('super_admin', 'admin', 'contabilidad'), 
 // Debe ir antes de /:id para que no lo capture como id. Solo lectura.
 router.get('/desde-observaciones', permitirRoles('super_admin', 'admin'), c.desdeObservaciones);
 router.get('/desde-emergencia', permitirRoles('super_admin', 'admin'), c.desdeEmergencia);
-router.get('/:id', permitirRoles('super_admin', 'admin', 'contabilidad'), c.obtener);
+// Detalle: además de los roles comerciales, el Coordinador puede ABRIRLO desde
+// el código de cotización que aparece en el servicio. El controlador le devuelve
+// la vista sin datos financieros (ítems, sus fotos e imágenes adjuntas).
+// El listado, la exportación, el historial y el PDF siguen fuera de su alcance.
+router.get('/:id', permitirRoles('super_admin', 'admin', 'contabilidad', 'coordinador'), c.obtener);
 router.get('/:id/historial', permitirRoles('super_admin', 'admin', 'contabilidad'), c.historial);
 
 router.post('/', permitirRoles('super_admin', 'admin'), c.crear);

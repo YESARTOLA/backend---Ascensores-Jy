@@ -13,12 +13,16 @@
  *    coordinador lo vea en su dashboard y módulo Recordatorios.
  */
 const prisma = require('../config/prisma');
+const { registrarActividadTecnico } = require('../utils/actividadTecnico');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { esServicioPostRevision } = require('../utils/estadoServicio');
+const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
 const { sincronizarRecordatorioObservaciones, crearAlertaObservacion, descartarAlertaObservacion, sincronizarRecordatorioCotizacionUrgente } = require('../utils/recordatoriosAuto');
+const {
+  DESTINATARIOS_POR_DEFECTO, normalizarDestinatarios, etiquetasDestinatarios
+} = require('../utils/destinatariosAlerta');
 
 const ROLES_ATIENDEN = ['super_admin', 'admin', 'coordinador'];
-const ROLES_ADMIN = ['super_admin', 'admin'];
 
 async function tecnicoEstaAsignado(idServicio, idTecnico) {
   if (!idTecnico) return false;
@@ -83,7 +87,7 @@ const crear = async (req, res) => {
 
     // Mismo gate que guías de salida: a partir de "En revisión administrativa"
     // (y todo el flujo posterior) no se aceptan nuevas observaciones técnicas.
-    // El predicado deja pasar "Finalizado por técnico" / "Finalizado observado"
+    // El predicado deja pasar "Finalizado"
     // para regularización.
     if (esServicioPostRevision(servicio.estado_servicio)) {
       return res.status(400).json({
@@ -91,9 +95,9 @@ const crear = async (req, res) => {
       });
     }
 
-    // Solo técnicos asignados o roles administrativos pueden registrar
-    const esAdmin = ROLES_ADMIN.includes(req.user.rol_codigo);
-    if (!esAdmin) {
+    // Registran: los técnicos asignados y los roles que gestionan el expediente
+    // del servicio (incluida coordinación, que revisa el material del técnico).
+    if (!esRolGestion(req.user)) {
       if (req.user.rol_codigo !== 'tecnico') {
         return res.status(403).json({ error: 'Solo los técnicos asignados pueden registrar observaciones' });
       }
@@ -104,7 +108,20 @@ const crear = async (req, res) => {
     }
 
     const idArchivo = req.body?.id_archivo ? Number(req.body.id_archivo) : null;
-    const generaAlerta = req.body?.genera_alerta ? 1 : 0;
+
+    // A quién va la alerta. La lista manda: si viene vacía no se alerta a nadie,
+    // aunque llegue `genera_alerta`. Un cliente antiguo que solo manda el flag
+    // (sin lista) conserva el reparto histórico, a todos.
+    const destinatarios = normalizarDestinatarios(req.body?.destinatarios_alerta);
+    const pidioAlerta = Boolean(req.body?.genera_alerta);
+    const trajoLista = Array.isArray(req.body?.destinatarios_alerta);
+    const destinosFinales = trajoLista
+      ? destinatarios
+      : (pidioAlerta ? DESTINATARIOS_POR_DEFECTO : []);
+    if (pidioAlerta && trajoLista && destinatarios.length === 0) {
+      return res.status(400).json({ error: 'Elige al menos un destinatario para la alerta' });
+    }
+    const generaAlerta = destinosFinales.length > 0 ? 1 : 0;
 
     const obs = await prisma.tbl_servicios_observaciones.create({
       data: {
@@ -112,6 +129,7 @@ const crear = async (req, res) => {
         texto,
         id_archivo: idArchivo,
         genera_alerta: generaAlerta,
+        destinatarios_alerta: generaAlerta ? destinosFinales.join(',') : null,
         registrada_por: req.user.id,
         user_id_registration: req.user.id
       },
@@ -120,7 +138,12 @@ const crear = async (req, res) => {
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_observaciones', id_entidad: obs.id,
-      accion: 'CREATE', valor_nuevo: { id_servicio: idServicio, texto: texto.slice(0, 200), genera_alerta: generaAlerta }, ip: req.ip
+      accion: 'CREATE',
+      valor_nuevo: {
+        id_servicio: idServicio, texto: texto.slice(0, 200), genera_alerta: generaAlerta,
+        destinatarios_alerta: etiquetasDestinatarios(destinosFinales).join(', ') || null
+      },
+      ip: req.ip
     });
 
     sincronizarRecordatorioObservaciones(idServicio).catch(err =>
@@ -132,6 +155,8 @@ const crear = async (req, res) => {
         console.error('Crear alerta observacion:', err));
     }
 
+    // Registrar una observación es actividad del técnico sobre el servicio.
+    await registrarActividadTecnico(idServicio, req.user.id, 'Observación técnica registrada');
     res.status(201).json({ data: obs });
   } catch (err) {
     console.error('[observacionesServicio.crear]', err);
@@ -174,14 +199,75 @@ const atender = async (req, res) => {
   }
 };
 
+/**
+ * Corrige una observación ya registrada: su texto y/o su foto. Lo usa
+ * coordinación para arreglar lo que el técnico anotó mal desde la obra; el
+ * técnico autor puede corregir la suya mientras el servicio siga abierto.
+ *
+ * No toca `genera_alerta` ni los destinatarios: cambiar a quién se avisó
+ * después de haberlo avisado no tendría efecto (las alertas ya salieron), así
+ * que se deja fuera a propósito en vez de fingir que se puede.
+ */
+const actualizar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previa = await prisma.tbl_servicios_observaciones.findUnique({
+      where: { id }, include: { servicio: { select: { estado_servicio: true } } }
+    });
+    if (!previa || previa.estado !== 1) return res.status(404).json({ error: 'Observación no encontrada' });
+
+    const gestiona = esRolGestion(req.user);
+    const esAutorTecnico = req.user.rol_codigo === 'tecnico' && previa.registrada_por === req.user.id;
+    if (!gestiona && !esAutorTecnico) {
+      return res.status(403).json({ error: 'No tiene permiso para editar esta observación' });
+    }
+    if (gestiona) {
+      const bloqueo = motivoBloqueo(req.user, previa.servicio, 'editar observaciones');
+      if (bloqueo) return res.status(400).json({ error: bloqueo });
+    } else if (esServicioPostRevision(previa.servicio?.estado_servicio)) {
+      return res.status(400).json({
+        error: `El servicio está ${previa.servicio.estado_servicio}: no se pueden editar observaciones`
+      });
+    }
+
+    const data = { user_id_modification: req.user.id, date_time_modification: new Date() };
+    if (req.body?.texto !== undefined) {
+      const texto = String(req.body.texto || '').trim();
+      if (!texto) return res.status(400).json({ error: 'El texto de la observación es obligatorio' });
+      if (texto.length > 5000) return res.status(400).json({ error: 'La observación excede 5000 caracteres' });
+      data.texto = texto;
+    }
+    // Solo se toca la foto si el payload la trae: así editar el texto no la borra.
+    if (req.body?.id_archivo !== undefined) {
+      data.id_archivo = req.body.id_archivo ? Number(req.body.id_archivo) : null;
+    }
+
+    const obs = await prisma.tbl_servicios_observaciones.update({
+      where: { id }, data, include: { archivo: true }
+    });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_observaciones', id_entidad: id,
+      accion: 'UPDATE', valor_anterior: previa, valor_nuevo: obs, ip: req.ip
+    });
+    res.json({ data: obs });
+  } catch (err) {
+    console.error('[observacionesServicio.actualizar]', err);
+    res.status(500).json({ error: 'Error al actualizar observación' });
+  }
+};
+
 const eliminar = async (req, res) => {
   try {
-    if (!ROLES_ADMIN.includes(req.user.rol_codigo)) {
-      return res.status(403).json({ error: 'Solo super_admin/admin pueden eliminar observaciones' });
+    if (!esRolGestion(req.user)) {
+      return res.status(403).json({ error: 'No tiene permiso para eliminar observaciones' });
     }
     const id = Number(req.params.id);
-    const previa = await prisma.tbl_servicios_observaciones.findUnique({ where: { id } });
+    const previa = await prisma.tbl_servicios_observaciones.findUnique({
+      where: { id }, include: { servicio: { select: { estado_servicio: true } } }
+    });
     if (!previa || previa.estado !== 1) return res.status(404).json({ error: 'Observación no encontrada' });
+    const bloqueoEliminar = motivoBloqueo(req.user, previa.servicio, 'eliminar observaciones');
+    if (bloqueoEliminar) return res.status(400).json({ error: bloqueoEliminar });
     await prisma.tbl_servicios_observaciones.update({
       where: { id },
       data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
@@ -203,4 +289,4 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, crear, atender, eliminar };
+module.exports = { listar, crear, atender, actualizar, eliminar };

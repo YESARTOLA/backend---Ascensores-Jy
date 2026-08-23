@@ -24,6 +24,9 @@
 const { parseYMDLima } = require('./tiempo');
 const { clasificarTipoServicio, MODULOS_VALIDOS } = require('./clasificacionServicio');
 const { ESTADO_PLAN_ACTIVO } = require('./estadoPlanMantenimiento');
+const { mesesParaVisitas } = require('./frecuenciaMantenimiento');
+const { generarProgramacion } = require('./planMantenimientoMensual');
+const { crearCobroInicial } = require('./crearCobroInicial');
 
 function nivelUrgencia(valor, defaultValor) {
   return ['alta', 'media', 'baja'].includes(valor) ? valor : defaultValor;
@@ -113,6 +116,14 @@ async function replicarEnModulo(tx, args) {
     const cantidadMant = d.cantidad_mantenimientos != null ? Number(d.cantidad_mantenimientos) : null;
     const cantidadGratuitos = Math.max(0, Number(d.cantidad_mantenimientos_gratuitos) || 0);
     const fechaInicioPlan = d.fecha_inicio_plan ? parseYMDLima(d.fecha_inicio_plan) : fechaProgramada;
+    // El plan se dimensiona en MESES. Si el origen habla de "N mantenimientos"
+    // (formularios previos al modelo mensual) se convierte conservando el
+    // horizonte del contrato: trimestral × 4 → 12 meses.
+    const duracionMeses = tipoPlan === 'eventual'
+      ? 1
+      : (Number.isFinite(Number(d.duracion_meses)) && Number(d.duracion_meses) >= 1
+          ? Number(d.duracion_meses)
+          : mesesParaVisitas(frecuencia, frecDiasCustom, cantidadMant ?? 12));
     // Un único plan que cubre todos los ascensores. Los montos por ascensor se
     // heredan de la junction del servicio originante (mismo reparto del precio).
     const ascSrv = await tx.tbl_servicios_ascensores.findMany({
@@ -128,22 +139,56 @@ async function replicarEnModulo(tx, args) {
       moneda: a.moneda || 'PEN',
       user_id_registration: usuarioId
     }));
-    await tx.tbl_mantenimientos_planes.create({
+    // Monto mensual: el importe pactado por ocurrencia repartido sobre los
+    // meses del plan, de modo que el total del contrato no cambie.
+    const sumaPorOcurrencia = filasAsc.reduce((acc, a) => acc + Number(a.monto || 0), 0);
+    const montoMensual = Number(d.monto_mensual) >= 0 && d.monto_mensual !== undefined && d.monto_mensual !== null && d.monto_mensual !== ''
+      ? Math.round(Number(d.monto_mensual) * 100) / 100
+      : Math.round((sumaPorOcurrencia * (cantidadMant ?? duracionMeses) / duracionMeses) * 100) / 100;
+    const monedaPlan = filasAsc[0]?.moneda || 'PEN';
+
+    const plan = await tx.tbl_mantenimientos_planes.create({
       data: {
         id_cliente: idCliente,
         id_tipo_servicio: tipoServicio.id,
         tipo_plan: tipoPlan,
         frecuencia,
         frecuencia_dias_custom: frecDiasCustom,
+        duracion_meses: duracionMeses,
         cantidad_mantenimientos: cantidadMant,
         cantidad_mantenimientos_gratuitos: cantidadGratuitos,
+        monto_mensual: montoMensual,
+        moneda: monedaPlan,
         fecha_inicio: fechaInicioPlan,
         hora_programada: horaProgramada,
         estado_plan: ESTADO_PLAN_ACTIVO,
         observaciones: obs,
         user_id_registration: usuarioId,
-        ascensores: { create: filasAsc }
+        // Cada ascensor hereda la frecuencia del plan; se puede afinar luego
+        // desde el detalle del plan.
+        ascensores: { create: filasAsc.map(a => ({ ...a, frecuencia, frecuencia_dias_custom: frecDiasCustom })) }
       }
+    });
+
+    // Cronograma completo (una fila y un evento por visita de cada ascensor).
+    const filasJunction = await tx.tbl_mantenimientos_planes_ascensores.findMany({
+      where: { id_plan: plan.id, estado: 1 },
+      include: { ascensor: { select: { id: true, codigo: true, edificio: { select: { nombre: true } } } } }
+    });
+    const prog = await generarProgramacion(tx, { plan, filasJunction, userId: usuarioId });
+    await tx.tbl_mantenimientos_planes.update({
+      where: { id: plan.id }, data: { cantidad_mantenimientos: prog.creadas }
+    });
+
+    // Cobro ÚNICO del plan: nace vacío y crece una cuota por mes aprobado.
+    await crearCobroInicial(tx, {
+      idMantenimientoPlan: plan.id,
+      idCliente,
+      monto: 0,
+      moneda: monedaPlan,
+      fechaCuotaUnica: plan.fecha_inicio,
+      sinCuotas: true,
+      idUsuario: usuarioId
     });
     return 'mantenimiento';
   }

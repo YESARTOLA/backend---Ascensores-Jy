@@ -137,6 +137,19 @@ function inicioDelMinutoActual() {
   return new Date(Math.floor(Date.now() / MS_POR_MINUTO) * MS_POR_MINUTO);
 }
 
+/**
+ * Suma `n` días a un 'YYYY-MM-DD' devolviendo 'YYYY-MM-DD'. Se opera en UTC
+ * puro: para fechas sin hora eso es aritmética de calendario exacta y evita
+ * cualquier corrimiento por huso.
+ */
+function addDiasYMD(ymd, n) {
+  if (!ymd) return null;
+  const d = new Date(`${String(ymd).substring(0, 10)}T00:00:00.000Z`);
+  if (isNaN(d.getTime())) return null;
+  d.setUTCDate(d.getUTCDate() + Number(n || 0));
+  return d.toISOString().slice(0, 10);
+}
+
 function diffDiasLima(a, b) {
   const da = inicioDelDiaLima(new Date(a)).getTime();
   const db = inicioDelDiaLima(new Date(b)).getTime();
@@ -150,6 +163,7 @@ module.exports = {
   inicioMesLima, finMesLima,
   parseYMDLima, parseYMDFinDiaLima, parseYMDUTC,
   combinarFechaHoraLima,
+  addDiasYMD,
   parseDateTimeLocalLima,
   inicioDelMinutoActual,
   diffDiasLima

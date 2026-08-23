@@ -51,42 +51,6 @@ const ESTADOS_VERSION_LISTA = [
 ];
 
 // ----------------------------------------------------------------------------
-// Filtros VIRTUALES del listado / exportación.
-//
-// No son estados que se escriban en la BD: son opciones del selector que
-// agrupan varios estado_global reales bajo un solo `IN (...)`. Existen porque
-// `estado_global` avanza (Aceptado → Ejecución → Pendiente → Terminado) y, al
-// pasar el servicio a ejecución, una cotización que el cliente SÍ aceptó deja
-// de aparecer bajo el filtro exacto 'Aceptado'. Este agregado permite ver de un
-// vistazo todas las que se aceptaron alguna vez, sin perder los filtros exactos.
-//
-// El `valor` ('Aprobadas') es el que viaja en la query; `despues_de` le dice al
-// frontend tras qué opción real insertarlo en el selector.
-const FILTRO_GLOBAL_APROBADAS = 'Aprobadas';
-
-const FILTROS_GLOBALES = [
-  {
-    valor: FILTRO_GLOBAL_APROBADAS,
-    etiqueta: 'Aceptadas (incluye ejecución)',
-    despues_de: ESTADO_GLOBAL.ACEPTADO,
-    estados: [
-      ESTADO_GLOBAL.ACEPTADO,
-      ESTADO_GLOBAL.EJECUCION,
-      ESTADO_GLOBAL.PENDIENTE,
-      ESTADO_GLOBAL.TERMINADO
-    ]
-  }
-];
-
-// Traduce un valor de filtro (real o virtual) al conjunto de estado_global
-// reales que representa. Devuelve un array cuando es virtual, o null cuando el
-// valor no es un filtro virtual (el caller debe tratarlo como estado exacto).
-function resolverFiltroGlobal(valor) {
-  const f = FILTROS_GLOBALES.find(x => x.valor === valor);
-  return f ? f.estados : null;
-}
-
-// ----------------------------------------------------------------------------
 // Semántica del rango de fechas del listado.
 //
 // Por defecto el rango filtra por FECHA DE CREACIÓN de la cotización. Pero
@@ -101,6 +65,69 @@ const ESTADOS_GLOBALES_POST_ACEPTACION = [
   ESTADO_GLOBAL.PENDIENTE,
   ESTADO_GLOBAL.TERMINADO
 ];
+
+// Estados en los que el trabajo en campo YA TERMINÓ: el técnico cerró el
+// servicio y todo lo que queda es circuito administrativo/contable (revisión,
+// cobro, facturación) hasta el cierre. 'Pendiente' no es una etapa anterior a
+// 'Terminado' en el trabajo: es la misma obra terminada, esperando plata.
+const ESTADOS_GLOBALES_TRABAJO_TERMINADO = [
+  ESTADO_GLOBAL.PENDIENTE,
+  ESTADO_GLOBAL.TERMINADO
+];
+
+// ----------------------------------------------------------------------------
+// Filtros INCLUSIVOS del listado / exportación.
+//
+// Un valor del selector no siempre significa `estado_global = <ese valor>`:
+// algunos agrupan varias etapas del ciclo bajo un solo `IN (...)`. Existen
+// porque `estado_global` AVANZA (Aceptado → Ejecución → Pendiente → Terminado)
+// y con la igualdad estricta una cotización se cae del filtro apenas su
+// servicio da el siguiente paso, aunque el hecho que el filtro busca siga
+// siendo cierto.
+//
+// Hay dos clases, y `EXPANSION_FILTRO_GLOBAL` las resuelve a las dos igual:
+//
+//  - VIRTUALES: opciones que no existen como estado en la BD y se añaden al
+//    selector (hoy solo 'Aprobadas'). Se declaran en `FILTROS_GLOBALES`, cuyo
+//    `valor` es el que viaja en la query y cuyo `despues_de` le dice al
+//    frontend tras qué opción real insertarlas.
+//
+//  - ESTADOS REALES CON ARRASTRE: opciones que sí son un estado_global, pero
+//    cuya lectura natural abarca también las fases posteriores. 'Terminado' es
+//    el caso: al pedir los servicios/proyectos terminados se esperan también
+//    los que ya pasaron a una fase posterior — facturados, en cobro, en
+//    revisión — que hoy figuran como 'Pendiente'. Para esos se sobrescribe la
+//    etiqueta del selector (`ETIQUETAS_FILTRO_GLOBAL`) y así queda claro por
+//    qué la lista trae badges distintos del filtro elegido.
+const FILTRO_GLOBAL_APROBADAS = 'Aprobadas';
+
+const FILTROS_GLOBALES = [
+  {
+    valor: FILTRO_GLOBAL_APROBADAS,
+    etiqueta: 'Aceptadas (incluye ejecución)',
+    despues_de: ESTADO_GLOBAL.ACEPTADO,
+    estados: ESTADOS_GLOBALES_POST_ACEPTACION
+  }
+];
+
+// Valor del selector → estados reales que representa.
+const EXPANSION_FILTRO_GLOBAL = {
+  [FILTRO_GLOBAL_APROBADAS]: ESTADOS_GLOBALES_POST_ACEPTACION,
+  [ESTADO_GLOBAL.TERMINADO]: ESTADOS_GLOBALES_TRABAJO_TERMINADO
+};
+
+// Etiqueta con la que el selector pinta un estado REAL cuyo filtro arrastra
+// fases posteriores. Los estados que no aparecen aquí se pintan con su nombre.
+const ETIQUETAS_FILTRO_GLOBAL = {
+  [ESTADO_GLOBAL.TERMINADO]: 'Terminado (incluye cobro/facturación)'
+};
+
+// Traduce un valor de filtro al conjunto de estado_global reales que
+// representa. Devuelve un array cuando el filtro abarca más de un estado, o
+// null cuando no hay expansión (el caller debe tratarlo como estado exacto).
+function resolverFiltroGlobal(valor) {
+  return EXPANSION_FILTRO_GLOBAL[valor] || null;
+}
 
 function rangoEsPorFechaAceptacion(valorFiltroGlobal) {
   if (!valorFiltroGlobal) return false;
@@ -123,7 +150,9 @@ module.exports = {
   ESTADOS_VERSION_LISTA,
   FILTRO_GLOBAL_APROBADAS,
   FILTROS_GLOBALES,
+  ETIQUETAS_FILTRO_GLOBAL,
   ESTADOS_GLOBALES_POST_ACEPTACION,
+  ESTADOS_GLOBALES_TRABAJO_TERMINADO,
   resolverFiltroGlobal,
   rangoEsPorFechaAceptacion,
   esEstadoGlobalValido,

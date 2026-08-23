@@ -91,7 +91,6 @@ app.use('/api/tipos-servicio', require('./routes/tiposServicioRoutes'));
 app.use('/api/tipos-ascensor', require('./routes/tiposAscensorRoutes'));
 app.use('/api/ubigeo', require('./routes/ubigeoRoutes'));
 app.use('/api/servicios', require('./routes/serviciosRoutes'));
-app.use('/api/checklists', require('./routes/checklistRoutes'));
 app.use('/api/checklist-plantillas', require('./routes/checklistPlantillasRoutes'));
 app.use('/api/cobros', require('./routes/cobrosRoutes'));
 app.use('/api/facturas', require('./routes/facturasRoutes'));

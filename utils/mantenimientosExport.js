@@ -16,6 +16,7 @@ const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
 const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
+const { totalesDelPlan } = require('./planMantenimientoMensual');
 
 // Paleta corporativa (espejada con frontend/src/utils/pdfReport.js)
 const BRAND = {
@@ -44,15 +45,27 @@ function fechaHoraISO(d) {
   return `${dt.toISOString().slice(0, 10)} ${dt.toISOString().slice(11, 16)}`;
 }
 
+/**
+ * Frecuencia del plan para el reporte. Cada ascensor tiene la suya, así que
+ * se listan las distintas ("Mensual, Trimestral"); si el plan no las tiene
+ * por ascensor (creado antes del modelo por-ascensor) cae a la del plan.
+ */
 function labelFrecuencia(plan) {
   if (!plan) return '';
   if (plan.tipo_plan === 'eventual') return 'Eventual';
-  const fr = obtenerFrecuencia(plan.frecuencia);
-  let etiqueta = fr ? fr.etiqueta : plan.frecuencia;
-  if (plan.frecuencia === 'custom' && plan.frecuencia_dias_custom) {
-    etiqueta += ` (${plan.frecuencia_dias_custom} días)`;
-  }
-  return etiqueta;
+  const etiquetaDe = (cod, dias) => {
+    const fr = obtenerFrecuencia(cod);
+    let e = fr ? fr.etiqueta : cod;
+    if (cod === 'custom' && dias) e += ` (${dias} días)`;
+    return e;
+  };
+  const propias = [...new Set(
+    (plan.ascensores || [])
+      .filter(a => a.frecuencia)
+      .map(a => etiquetaDe(a.frecuencia, a.frecuencia_dias_custom))
+  )];
+  if (propias.length > 0) return propias.join(', ');
+  return etiquetaDe(plan.frecuencia, plan.frecuencia_dias_custom);
 }
 
 function formatMonto(monto, moneda) {
@@ -97,12 +110,15 @@ const COLUMNAS_PLAN = [
   { header: 'Ubicación',         key: 'ubicacion',        width: 24 },
   { header: 'Tipo servicio',     key: 'tipo_servicio',    width: 22 },
   { header: 'Modalidad',         key: 'modalidad',        width: 12 },
-  { header: 'Frecuencia',        key: 'frecuencia',       width: 22 },
-  { header: 'Cantidad',          key: 'cantidad',         width: 10 },
+  { header: 'Frecuencia',        key: 'frecuencia',       width: 26 },
+  { header: 'Duración (meses)',  key: 'duracion_meses',   width: 15 },
+  { header: 'Mantenimientos',    key: 'cantidad',         width: 15 },
   { header: 'Ejecutados',        key: 'ejecutados',       width: 12 },
   { header: 'Gratuitos',         key: 'gratuitos',        width: 12 },
   { header: 'Inicio',            key: 'inicio',           width: 14 },
-  { header: 'Precio',            key: 'precio',           width: 14 },
+  { header: 'Meses facturables', key: 'meses_facturables', width: 16 },
+  { header: 'Monto mensual',     key: 'monto_mensual',    width: 14 },
+  { header: 'Total del plan',    key: 'precio',           width: 14 },
   { header: 'Estado plan',       key: 'estado_plan',      width: 12 }
 ];
 
@@ -132,19 +148,26 @@ function _mapearFilaPrograma(i) {
 function _mapearFilaPlan(p) {
   // Un plan cubre N ascensores; el precio total es la suma de sus montos.
   const ascs = (p.ascensores || []).map(a => a.ascensor).filter(Boolean);
-  const total = (p.ascensores || []).reduce((acc, a) => acc + Number(a.monto || 0), 0);
-  const moneda = (p.ascensores || [])[0]?.moneda || 'PEN';
+  // El importe del plan es el monto MENSUAL global; el total descuenta los
+  // meses gratuitos (SSoT: utils/planMantenimientoMensual.totalesDelPlan).
+  const tot = totalesDelPlan(p);
+  const mensual = tot.monto_mensual;
+  const meses = tot.meses;
+  const moneda = p.moneda || (p.ascensores || [])[0]?.moneda || 'PEN';
   return {
     ascensor: ascs.map(a => a.codigo).filter(Boolean).join(', '),
     ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', '),
     tipo_servicio: p.tipo_servicio?.nombre || '',
     modalidad: p.tipo_plan ? p.tipo_plan.charAt(0).toUpperCase() + p.tipo_plan.slice(1) : '',
     frecuencia: labelFrecuencia(p),
+    duracion_meses: meses || 'Indef.',
     cantidad: p.cantidad_mantenimientos ?? 'Indef.',
     ejecutados: p.mantenimientos_ejecutados_total ?? 0,
     gratuitos: `${p.mantenimientos_gratuitos_ejecutados || 0} / ${p.cantidad_mantenimientos_gratuitos || 0}`,
     inicio: fechaISO(p.fecha_inicio),
-    precio: formatMonto(total, moneda),
+    monto_mensual: formatMonto(mensual, moneda),
+    meses_facturables: tot.meses_facturables,
+    precio: formatMonto(tot.total, moneda),
     estado_plan: p.estado_plan || ''
   };
 }

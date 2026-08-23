@@ -19,27 +19,29 @@
  * Todo el cálculo trabaja en "fecha pura" (YYYY-MM-DD) de Lima, sin husos.
  */
 
-const { ymdDeFecha, ymdLima } = require('./tiempo');
-
-// Suma `n` días a un 'YYYY-MM-DD' devolviendo 'YYYY-MM-DD' (sin husos: se opera
-// en UTC puro, que para fechas sin hora es aritmética de calendario exacta).
-function addDiasYMD(ymd, n) {
-  if (!ymd) return null;
-  const d = new Date(`${ymd}T00:00:00.000Z`);
-  if (isNaN(d.getTime())) return null;
-  d.setUTCDate(d.getUTCDate() + Number(n || 0));
-  return d.toISOString().slice(0, 10);
-}
+const { ymdDeFecha, ymdLima, addDiasYMD } = require('./tiempo');
 
 /**
- * Último día programado del servicio: fecha_programada + (duracion_dias - 1).
- * Devuelve 'YYYY-MM-DD' o null si el servicio no tiene fecha programada.
+ * Último día programado del servicio, en 'YYYY-MM-DD' (null si no está
+ * programado).
+ *
+ * La programación puede ser de días NO corridos (10, 15 y 20 de agosto), así que
+ * la fuente de verdad es la grilla `tbl_servicios_dias`: se toma la fecha máxima
+ * de los días activos cuando el servicio llega con ellos cargados. Sin la grilla
+ * (consultas que no la incluyen, o datos previos a la grilla) se cae al cálculo
+ * clásico fecha_programada + (duracion_dias - 1), que solo es exacto si los días
+ * son corridos — por eso es el fallback y no el camino principal.
  */
 function ultimoDiaProgramado(servicio) {
+  const dias = Array.isArray(servicio?.dias)
+    ? servicio.dias.filter(d => d && d.estado !== 0).map(d => ymdDeFecha(d.fecha)).filter(Boolean)
+    : [];
+  if (dias.length > 0) return dias.sort().pop();
+
   const inicio = ymdDeFecha(servicio?.fecha_programada);
   if (!inicio) return null;
-  const dias = Number(servicio?.duracion_dias) || 1;
-  return addDiasYMD(inicio, Math.max(0, dias - 1));
+  const n = Number(servicio?.duracion_dias) || 1;
+  return addDiasYMD(inicio, Math.max(0, n - 1));
 }
 
 /**

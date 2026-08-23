@@ -10,12 +10,21 @@ const {
 // Estados nominados que se referencian explícitamente desde la lógica de negocio
 // (transiciones de cierre, regularización de guías). Cualquier flujo que cambie
 // estos textos debe pasar por aquí.
-const ESTADO_SERVICIO_FINALIZADO_TECNICO = 'Finalizado por técnico';
-const ESTADO_SERVICIO_FINALIZADO_OBSERVADO = 'Finalizado observado';
-const ESTADO_SERVICIO_CANCELADO = 'Cancelado';
+const ESTADO_SERVICIO_PENDIENTE = 'Pendiente';
+// Asignado = tiene técnico Y fecha programada. Las dos condiciones a la vez: un
+// servicio con técnico pero sin fecha (o al revés) no está listo para ejecutarse
+// y se queda en Pendiente.
+const ESTADO_SERVICIO_ASIGNADO = 'Asignado';
 // El paso a este estado marca el inicio real del trabajo en obra: su primera
-// aparición en el historial es la "fecha de inicio del servicio".
+// aparición en el historial es la "fecha de inicio del servicio". Ya no se
+// teclea: lo dispara el primer registro que hace el técnico sobre el servicio
+// (evidencia, guía, OT, observación o respuesta del checklist de finalización).
 const ESTADO_SERVICIO_EN_CURSO = 'En curso';
+// Cierre del trabajo de campo, siempre manual. Único: un cierre sin guía no es
+// otro estado sino una guía en estado "Observada" — la deuda documental se lee
+// de la guía, que es donde se resuelve.
+const ESTADO_SERVICIO_FINALIZADO = 'Finalizado';
+const ESTADO_SERVICIO_CANCELADO = 'Cancelado';
 
 /**
  * Catálogo único de `tbl_servicios_realizados.estado_administrativo` — la etapa
@@ -56,14 +65,10 @@ const RESULTADO_REVISION = {
  */
 const ESTADOS_SERVICIO = [
   'Borrador',
-  'Pendiente',
-  'Asignado',
-  'Checklist de salida pendiente',
-  'Listo para salida',
-  'En camino',
-  'En curso',
-  ESTADO_SERVICIO_FINALIZADO_TECNICO,
-  ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
+  ESTADO_SERVICIO_PENDIENTE,
+  ESTADO_SERVICIO_ASIGNADO,
+  ESTADO_SERVICIO_EN_CURSO,
+  ESTADO_SERVICIO_FINALIZADO,
   'En revisión administrativa',
   'A gestión de cobro',
   'En cobro',
@@ -82,10 +87,8 @@ const ESTADOS_SERVICIO = [
  */
 const ESTADOS_SERVICIO_EDITABLES = [
   'Borrador',
-  'Pendiente',
-  'Asignado',
-  'Checklist de salida pendiente',
-  'Listo para salida'
+  ESTADO_SERVICIO_PENDIENTE,
+  ESTADO_SERVICIO_ASIGNADO
 ];
 
 /**
@@ -108,12 +111,9 @@ const ESTADOS_SERVICIO_EDITABLES = [
  */
 const ESTADOS_SERVICIO_EN_GESTION = [
   'Borrador',
-  'Pendiente',
-  'Asignado',
-  'Checklist de salida pendiente',
-  'Listo para salida',
-  'En camino',
-  'En curso'
+  ESTADO_SERVICIO_PENDIENTE,
+  ESTADO_SERVICIO_ASIGNADO,
+  ESTADO_SERVICIO_EN_CURSO
 ];
 
 const ESTADOS_POST_EJECUCION = [
@@ -142,7 +142,7 @@ function esServicioEditable(estadoServicio) {
  * facturación, cerrado, cancelado). A partir de aquí no se deben crear,
  * editar ni eliminar guías de salida ni sus observaciones técnicas.
  * Más permisivo que `estaServicioFinalizado` porque deja pasar todavía
- * "Finalizado por técnico" y "Finalizado observado" (regularización).
+ * "Finalizado" (ahí es donde se regulariza una guía que faltaba).
  */
 function esServicioPostRevision(estadoServicio) {
   return ESTADOS_POST_EJECUCION.includes(estadoServicio);
@@ -320,10 +320,11 @@ module.exports = {
   sincronizarEstadoEmergencia,
   esCorrectivoCerrado,
   esAtencionRapidaConvertida,
-  ESTADO_SERVICIO_FINALIZADO_TECNICO,
-  ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
-  ESTADO_SERVICIO_CANCELADO,
+  ESTADO_SERVICIO_PENDIENTE,
+  ESTADO_SERVICIO_ASIGNADO,
   ESTADO_SERVICIO_EN_CURSO,
+  ESTADO_SERVICIO_FINALIZADO,
+  ESTADO_SERVICIO_CANCELADO,
   ESTADOS_SERVICIO,
   ESTADOS_SERVICIO_EDITABLES,
   ESTADOS_SERVICIO_EN_GESTION,

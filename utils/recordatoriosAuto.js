@@ -10,6 +10,9 @@
  */
 const prisma = require('../config/prisma');
 const { combinarFechaHoraLima, inicioDelDiaLima } = require('./tiempo');
+const {
+  DESTINATARIOS_POR_DEFECTO, normalizarDestinatarios, destinatario
+} = require('./destinatariosAlerta');
 const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
 
 // Estados de servicio donde aplica la alerta "el técnico finalizó". Inline
@@ -17,8 +20,7 @@ const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
 // `estadoServicio.js` ya importa este módulo y crearía dependencia circular.
 // Excluye 'Cancelado' porque ahí la alerta debe descartarse, no crearse.
 const ESTADOS_SERVICIO_POST_FINALIZACION = [
-  'Finalizado por técnico',
-  'Finalizado observado',
+  'Finalizado',
   'En revisión administrativa',
   'A gestión de cobro',
   'En cobro',
@@ -43,7 +45,8 @@ const COLORES = {
   cotizacion_urgente: '#c026d3',             // fucsia
   servicio_finalizado_revisar:  '#65a30d',   // coordinador → revisar trabajo/informe (lima)
   servicio_finalizado_facturar: '#4f46e5',   // contabilidad → emitir factura (índigo)
-  servicio_finalizado_aviso:    '#475569'    // admin → solo aviso informativo (gris)
+  servicio_finalizado_aviso:    '#475569',   // admin → solo aviso informativo (gris)
+  correctivo_gratuito:          '#b45309'    // administración → correctivo marcado sin costo (ámbar oscuro)
 };
 
 const ESTADOS_TERMINALES_SERVICIO = ['Cerrado', 'Cancelado', 'Cobrado total', 'Facturado'];
@@ -130,10 +133,17 @@ async function sincronizarRecordatorioMantenimientoPlan(planId) {
     return descartarAuto({ tipo: 'mantenimiento', id_mantenimiento_plan: planId });
   }
   const fechaRecordatorio = combinarFechaHoraLima(p.fecha_inicio, p.hora_programada);
-  const fr = obtenerFrecuencia(p.frecuencia);
+  // Un plan puede tener frecuencias distintas por ascensor: el título las
+  // lista todas ("mensual, trimestral") en vez de una sola.
+  const codigosFrec = [...new Set(
+    (p.ascensores || []).map(a => a.frecuencia).filter(Boolean)
+  )];
+  const listaFrec = (codigosFrec.length > 0 ? codigosFrec : [p.frecuencia])
+    .filter(Boolean)
+    .map(c => (obtenerFrecuencia(c)?.etiqueta || c).toLowerCase());
   const detalleFrecuencia = p.tipo_plan === 'eventual'
     ? 'eventual'
-    : (fr ? fr.etiqueta.toLowerCase() : (p.frecuencia || ''));
+    : listaFrec.join(', ');
   const titulo = `Mantenimiento ${detalleFrecuencia}${p.tipo_servicio?.nombre ? ' · ' + p.tipo_servicio.nombre : ''}`.trim();
   const codigosAsc = (p.ascensores || []).map(a => a.ascensor?.codigo).filter(Boolean).join(', ');
   const descripcion = `${p.cliente?.nombre || ''}${codigosAsc ? ` · ${codigosAsc}` : ''}`;
@@ -337,37 +347,120 @@ async function crearAlertaObservacion(idObservacion) {
   const detalleCliente = s?.cliente?.nombre || '';
   const fecha = obs.date_time_registration || new Date();
 
-  // 1) Alerta CON detalle → administración / vendedora / coordinador.
+  // Destinatarios elegidos por el técnico. Sin lista (observación creada por un
+  // cliente que aún no la manda) se cae al reparto histórico: a todos.
+  const elegidos = normalizarDestinatarios(
+    String(obs.destinatarios_alerta || '').split(',').map(x => x.trim()).filter(Boolean)
+  );
+  const destinos = elegidos.length ? elegidos : DESTINATARIOS_POR_DEFECTO;
+
   const recorte = (obs.texto || '').replace(/\s+/g, ' ').trim().slice(0, 140);
   const descripcionDetalle = `${detalleCliente ? detalleCliente + ' · ' : ''}${recorte}${(obs.texto || '').length > 140 ? '…' : ''}`;
-  await prisma.tbl_recordatorios.create({
-    data: {
-      tipo: 'observacion_alerta',
-      origen: 'auto',
-      titulo: `🔔 Alerta técnica — ${s?.codigo || 'Servicio'}`,
-      descripcion: descripcionDetalle,
-      fecha_recordatorio: fecha,
-      prioridad: 'alta',
-      color: COLORES.observacion_alerta,
-      estado_recordatorio: 'pendiente',
-      id_servicio: s?.id || null,
-      notas_seguimiento: `obs:${obs.id}`
+  const descripcionAviso = `${detalleCliente ? detalleCliente + ' · ' : ''}Se registró una observación técnica en el servicio. Preparar la facturación cuando corresponda.`;
+
+  // Un recordatorio POR ROL destinatario: el tipo por sí solo no distingue
+  // (a 'observacion_alerta' lo ven varios roles), así que el filtro fino lo
+  // hace `rol_destinatario` al listar.
+  const filas = [];
+  for (const codigo of destinos) {
+    const def = destinatario(codigo);
+    if (!def) continue;
+    for (const rol of def.roles) {
+      filas.push({
+        tipo: def.detalle ? 'observacion_alerta' : 'observacion_facturar',
+        origen: 'auto',
+        titulo: def.detalle
+          ? `🔔 Alerta técnica — ${s?.codigo || 'Servicio'}`
+          : `🔔 Servicio con observación — ${s?.codigo || 'Servicio'}`,
+        descripcion: def.detalle ? descripcionDetalle : descripcionAviso,
+        fecha_recordatorio: fecha,
+        prioridad: 'alta',
+        color: def.detalle ? COLORES.observacion_alerta : COLORES.observacion_facturar,
+        estado_recordatorio: 'pendiente',
+        id_servicio: s?.id || null,
+        rol_destinatario: rol,
+        notas_seguimiento: `obs:${obs.id}`
+      });
+    }
+  }
+  if (filas.length) await prisma.tbl_recordatorios.createMany({ data: filas });
+}
+
+// Administración: quien debe enterarse de que un correctivo se marcó sin costo.
+const ROLES_ALERTA_GRATUITO = ['super_admin', 'admin'];
+
+/**
+ * Alerta de CORRECTIVO GRATUITO.
+ *
+ * Marcar un correctivo "sin costo" es una decisión con impacto económico, y la
+ * toma un rol que no maneja precios (el Coordinador). Se avisa a administración
+ * para que pueda revisarla: un recordatorio por rol destinatario, igual que las
+ * alertas de observación.
+ *
+ * Idempotente: `notas_seguimiento` marca el correctivo, así que reeditarlo no
+ * genera una alerta nueva mientras la anterior siga pendiente.
+ */
+async function crearAlertaCorrectivoGratuito(idCorrectivo, { usuarioId = null } = {}) {
+  if (!idCorrectivo) return;
+  const marca = `correctivo_gratuito:${idCorrectivo}`;
+  const yaExiste = await prisma.tbl_recordatorios.findFirst({
+    where: { notas_seguimiento: marca, estado: 1, estado_recordatorio: { not: 'atendido' } },
+    select: { id: true }
+  });
+  if (yaExiste) return;
+
+  const cor = await prisma.tbl_correctivos.findUnique({
+    where: { id: idCorrectivo },
+    include: {
+      cliente: { select: { nombre: true } },
+      ascensor: { select: { codigo: true } },
+      servicio: { select: { id: true, codigo: true } }
     }
   });
+  if (!cor || cor.estado !== 1) return;
 
-  // 2) Alerta SOLO aviso (sin texto ni imagen) → contabilidad.
-  await prisma.tbl_recordatorios.create({
+  const autor = usuarioId
+    ? await prisma.tbl_usuarios.findUnique({ where: { id: usuarioId }, select: { nombres: true } })
+    : null;
+  const partes = [
+    cor.cliente?.nombre,
+    cor.ascensor?.codigo ? `Ascensor ${cor.ascensor.codigo}` : null,
+    autor?.nombres ? `Marcado gratuito por ${autor.nombres.trim()}` : null
+  ].filter(Boolean);
+
+  const filas = ROLES_ALERTA_GRATUITO.map(rol => ({
+    tipo: 'correctivo_gratuito',
+    origen: 'auto',
+    titulo: `💸 Correctivo sin costo — ${cor.servicio?.codigo || `Correctivo #${cor.id}`}`,
+    descripcion: `${partes.join(' · ')}${partes.length ? ' · ' : ''}${(cor.falla || '').replace(/\s+/g, ' ').trim().slice(0, 120)}`,
+    fecha_recordatorio: new Date(),
+    prioridad: 'alta',
+    color: COLORES.correctivo_gratuito,
+    estado_recordatorio: 'pendiente',
+    id_servicio: cor.servicio?.id || null,
+    rol_destinatario: rol,
+    notas_seguimiento: marca
+  }));
+  await prisma.tbl_recordatorios.createMany({ data: filas });
+}
+
+/**
+ * Descarta la alerta de correctivo gratuito: se llama cuando el correctivo deja
+ * de estar marcado sin costo (administración le puso precio).
+ */
+async function descartarAlertaCorrectivoGratuito(idCorrectivo) {
+  if (!idCorrectivo) return;
+  await prisma.tbl_recordatorios.updateMany({
+    where: {
+      tipo: 'correctivo_gratuito',
+      notas_seguimiento: `correctivo_gratuito:${idCorrectivo}`,
+      estado: 1,
+      estado_recordatorio: { not: 'atendido' }
+    },
     data: {
-      tipo: 'observacion_facturar',
-      origen: 'auto',
-      titulo: `🔔 Servicio con observación — ${s?.codigo || 'Servicio'}`,
-      descripcion: `${detalleCliente ? detalleCliente + ' · ' : ''}Se registró una observación técnica en el servicio. Preparar la facturación cuando corresponda.`,
-      fecha_recordatorio: fecha,
-      prioridad: 'alta',
-      color: COLORES.observacion_facturar,
-      estado_recordatorio: 'pendiente',
-      id_servicio: s?.id || null,
-      notas_seguimiento: `obs:${obs.id}`
+      estado_recordatorio: 'atendido',
+      fecha_atendido: new Date(),
+      date_time_modification: new Date()
     }
   });
 }
@@ -471,7 +564,7 @@ async function sincronizarRecordatorioCotizacionUrgente(idServicio) {
 }
 
 /**
- * Helper común para las 3 alertas de "servicio finalizado por técnico".
+ * Helper común para las 3 alertas de "servicio finalizado".
  *
  * Cada llamada crea o refresca UN recordatorio por servicio por tipo
  * (`upsertAuto` con clave compuesta `tipo + id_servicio`). Si el servicio se
@@ -575,5 +668,7 @@ module.exports = {
   descartarAlertaFacturarServicio,
   crearAlertaObservacion,
   descartarAlertaObservacion,
+  crearAlertaCorrectivoGratuito,
+  descartarAlertaCorrectivoGratuito,
   COLORES
 };

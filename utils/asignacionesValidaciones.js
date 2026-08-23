@@ -25,9 +25,6 @@ function validarConsistenciaAsignaciones(tecnicos) {
   if (tecnicos.filter(t => t.responsable_principal).length > 1) {
     return { ok: false, error: 'Solo puede haber un técnico principal' };
   }
-  if (!tecnicos.some(t => t.responsable_checklist)) {
-    return { ok: false, error: 'Debe marcar técnico responsable del checklist' };
-  }
   return { ok: true };
 }
 

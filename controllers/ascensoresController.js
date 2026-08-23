@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
+const { puedeVerFinanzasReq, ascensorSinFinanzas, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, ymdLima } = require('../utils/tiempo');
 const { CLASIFICACIONES_CODIGOS, normalizarClasificacion } = require('../utils/catalogosClientes');
@@ -151,6 +152,11 @@ const listar = async (req, res) => {
       { where, orderBy: ordenAscensores(req.query), include: { ...INCLUDE_EDIFICIO, precios: INCLUDE_PRECIOS } },
       req.query
     );
+    // El catálogo de precios por subtipo es dato financiero: no viaja a los
+    // roles sin visibilidad económica (Coordinador, Técnico…).
+    if (!puedeVerFinanzasReq(req)) {
+      result.data = result.data.map(a => ascensorSinFinanzas(a, req.user));
+    }
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -175,7 +181,11 @@ const exportar = async (req, res) => {
       include: {
         ...INCLUDE_EDIFICIO,
         // Con el nombre del subtipo: el reporte imprime el precio legible, no ids.
-        precios: { ...INCLUDE_PRECIOS, include: { tipo_servicio: { select: { nombre: true } } } }
+        // Solo para roles con visibilidad económica: al resto el archivo sale sin
+        // la columna de precios (el export los omite si no vienen).
+        ...(puedeVerFinanzasReq(req)
+          ? { precios: { ...INCLUDE_PRECIOS, include: { tipo_servicio: { select: { nombre: true } } } } }
+          : {})
       }
     });
 
@@ -214,7 +224,7 @@ const obtener = async (req, res) => {
       include: { edificio: { include: { cliente: true } }, precios: INCLUDE_PRECIOS }
     });
     if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
-    res.json({ data: ascensor });
+    res.json({ data: ascensorSinFinanzas(ascensor, req.user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener ascensor' });
@@ -287,14 +297,17 @@ const historial = async (req, res) => {
     // Emergencias y mantenimientos son dominio de Servicios: se ocultan a un
     // usuario cuyo ámbito sea solo Proyectos.
     const soloProyectos = tipos && !tipos.includes('servicio');
+    // Sin visibilidad económica: el historial va sin precios de servicio y sin
+    // el bloque de facturas (que lleva los importes emitidos al cliente).
+    const verFinanzas = puedeVerFinanzasReq(req);
     res.json({
       data: {
         ascensor,
-        servicios,
+        servicios: verFinanzas ? servicios : servicios.map(servicioSinPrecios),
         emergencias: soloProyectos ? [] : emergencias,
         mantenimientos: soloProyectos ? [] : mantenimientos,
         entregas,
-        facturas,
+        facturas: verFinanzas ? facturas : [],
         guias,
         evidencias,
         historial: eventosHist
@@ -345,7 +358,12 @@ const crear = async (req, res) => {
           user_id_registration: req.user.id
         }
       });
-      await reemplazarPreciosAscensor(tx, creado.id, data.precios, req.user.id);
+      // El catálogo de precios solo lo escribe quien puede verlo: si el payload
+      // trae precios desde un rol sin permiso, se ignoran (no se inventan ni se
+      // borran los existentes).
+      if (puedeVerFinanzasReq(req)) {
+        await reemplazarPreciosAscensor(tx, creado.id, data.precios, req.user.id);
+      }
       return creado;
     });
     await prisma.tbl_ascensores_historial.create({
@@ -432,8 +450,9 @@ const actualizar = async (req, res) => {
         }
       });
       // Solo se toca el catálogo si el payload trae `precios` (el form lo envía);
-      // otros orígenes que no lo mandan no borran los precios existentes.
-      if (data.precios !== undefined) {
+      // otros orígenes que no lo mandan no borran los precios existentes. Un rol
+      // sin visibilidad financiera nunca lo modifica, mande lo que mande.
+      if (data.precios !== undefined && puedeVerFinanzasReq(req)) {
         await reemplazarPreciosAscensor(tx, id, data.precios, req.user.id);
       }
       if (pasaAInactivo) {

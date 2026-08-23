@@ -7,10 +7,9 @@
  * cerró el trabajo (independiente de revisión administrativa o cobro posterior).
  */
 
-const ESTADOS_INICIO = ['En camino', 'En curso'];
+const ESTADOS_INICIO = ['En curso'];
 const ESTADOS_FIN = [
-  'Finalizado por técnico',
-  'Finalizado observado',
+  'Finalizado',
   'En revisión administrativa',
   'A gestión de cobro',
   'En cobro',
@@ -61,7 +60,7 @@ function derivarEjecucion(servicio) {
   }
   const historial = servicio.historial_estados || [];
   const fechaInicio = primeraFechaHaciaEstado(historial, ESTADOS_INICIO);
-  const fechaFinPorHistorial = primeraFechaHaciaEstado(historial, ['Finalizado por técnico', 'Finalizado observado']);
+  const fechaFinPorHistorial = primeraFechaHaciaEstado(historial, ['Finalizado']);
   const fechaFin = fechaFinPorHistorial || servicio.servicio_realizado?.fecha_realizacion || null;
   return {
     estado_ejecucion: estadoEjecucion(servicio.estado_servicio),

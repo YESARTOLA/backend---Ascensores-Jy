@@ -6,9 +6,12 @@
  * registradas durante el servicio, las respuestas del checklist de
  * finalización (Sí / No / N/A + nota) renderizadas bajo el título
  * "Actividades realizadas" — cada ítem con sus fotos (día y coordenadas
- * clicables) — y un bloque "Registros fotográficos" con las evidencias
- * GENERALES del servicio (las fotos por ítem ya van junto a su ítem) y las
- * imágenes adjuntas a observaciones técnicas.
+ * clicables) — y un bloque "Registros fotográficos" con TODAS las evidencias
+ * adjuntas al servicio y las imágenes de las observaciones técnicas.
+ *
+ * El pie de cada fotografía lleva SOLO su comentario y la fecha en que se
+ * registró; nunca el nombre del archivo, que es un dato del almacenamiento y no
+ * dice nada del trabajo. Lo arma `pieDeFoto` en checklistFinalizacionController.
  */
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
@@ -148,7 +151,6 @@ async function generarInformeFinalizacionPdf(ctx) {
       const roles = [
         a.responsable_principal === 1 ? 'Resp. principal' : null,
         a.responsable_documentacion === 1 ? 'Resp. documentación' : null,
-        a.responsable_checklist === 1 ? 'Resp. checklist' : null
       ].filter(Boolean).join(', ');
       doc.text(`• ${a.tecnico.nombre || '—'}${roles ? ` (${roles})` : ''}`, x0, y, { width: ancho }); y += 12;
     });
@@ -250,7 +252,8 @@ async function generarInformeFinalizacionPdf(ctx) {
     const gap = 12;
     const anchoFoto = (ancho - gap * (columnas - 1)) / columnas;
     const altoFoto = 160;
-    const alturaCaption = 28;
+    // Tres líneas a 8pt: entra un comentario corriente junto con la fecha.
+    const alturaCaption = 34;
 
     for (let i = 0; i < fotos.length; i += columnas) {
       const fila = fotos.slice(i, i + columnas);

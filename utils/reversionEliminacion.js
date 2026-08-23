@@ -23,7 +23,7 @@ const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 const { keyDesdeRuta, eliminarObjeto } = require('./storage');
 
-const ESTADOS_EN_CAMPO = ['En camino', 'En curso'];
+const ESTADOS_EN_CAMPO = ['En curso'];
 
 /**
  * Da de baja (estado = 0) una fila de tbl_archivos dentro de la transacción.
@@ -57,7 +57,7 @@ async function purgarObjetosWasabi(keys) {
 
 /**
  * Da de baja en cascada un servicio y TODO lo que cuelga de él (asignaciones,
- * ascensores, checklists + items, guías, evidencias, entregas, observaciones,
+ * ascensores, guías, evidencias, entregas, observaciones,
  * historial de estados, checklist de finalización + respuestas, servicio
  * realizado, cobro + cuotas + pagos + recordatorios de cobro + facturas),
  * cancela sus eventos de calendario y descarta sus recordatorios. Recolecta las
@@ -77,7 +77,6 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
     where: { id: idServicio },
     include: {
       asignaciones: { where: { estado: 1 } },
-      checklists: { where: { estado: 1 } },
       guias: { where: { estado: 1 } },
       evidencias: { where: { estado: 1 } },
       entregas: { where: { estado: 1 } },
@@ -97,7 +96,7 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   for (const g of servicio.guias) if (g.id_archivo) archivoIds.add(g.id_archivo);
   for (const e of servicio.evidencias) if (e.id_archivo) archivoIds.add(e.id_archivo);
   for (const e of servicio.entregas) if (e.id_archivo) archivoIds.add(e.id_archivo);
-  if (servicio.servicio_realizado?.id_archivo_ot) archivoIds.add(servicio.servicio_realizado.id_archivo_ot);
+  if (servicio.id_archivo_ot) archivoIds.add(servicio.id_archivo_ot);
   if (servicio.finalizacion_checklist?.id_archivo_pdf) archivoIds.add(servicio.finalizacion_checklist.id_archivo_pdf);
   for (const f of servicio.facturas) if (f.id_archivo) archivoIds.add(f.id_archivo);
   if (servicio.cobro) {
@@ -116,11 +115,6 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   await tx.tbl_servicios_ascensores.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_asignaciones.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
-  const checklistIds = servicio.checklists.map(c => c.id);
-  if (checklistIds.length) {
-    await tx.tbl_checklists_salida_items.updateMany({ where: { id_checklist: { in: checklistIds }, estado: 1 }, data: { estado: 0, ...stamp } });
-  }
-  await tx.tbl_checklists_salida.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_guias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_evidencias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_entregas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
@@ -196,7 +190,7 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
 
 /**
  * Vuelve a "Disponible" cada técnico que ya no tenga ningún otro servicio
- * activo en campo (En camino / En curso). Se ejecuta fuera de la transacción.
+ * activo en campo (En curso). Se ejecuta fuera de la transacción.
  */
 async function liberarTecnicos(tecnicoIds, idServicioExcluido) {
   for (const idTecnico of new Set(tecnicoIds || [])) {

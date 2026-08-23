@@ -3,7 +3,7 @@
  *
  * Reparación reactiva (no urgente, no programada). El patrón sigue al de
  * Emergencias: cada correctivo crea siempre un servicio vinculado para
- * heredar el flujo de asignaciones / checklist / evidencias / cobro.
+ * heredar el flujo de asignaciones / evidencias / cobro.
  *
  * Diferencias frente a Emergencias:
  *   - nivel_urgencia default = 'media' (no 'alta')
@@ -11,23 +11,39 @@
  *   - El tipo de servicio se busca/crea por categoría = 'Correctivo'
  *   - color del calendario = ámbar (#f59e0b)
  *   - La fecha programada se elige al crear (por defecto hoy) y admite una
- *     fecha estimada de término opcional para ocupar varios días en agenda.
+ *     fecha estimada de término opcional.
+ *
+ * Días de trabajo: el correctivo se puede programar en un rango de fechas, en
+ * fechas sueltas (p. ej. 10, 15 y 20 de agosto) o en cualquier combinación de
+ * ambos; el técnico solo verá en su calendario los días programados. La grilla
+ * la materializa `sincronizarDiasYEventos` (utils/diasServicio).
  */
 
 const prisma = require('../config/prisma');
-const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { puedeVerFinanzasReq, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
+const { hmLima, inicioDelDiaLima, parseYMDLima, finDelDiaLima, ymdDeFecha } = require('../utils/tiempo');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
-const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+const {
+  sincronizarRecordatorioServicio,
+  crearAlertaCorrectivoGratuito,
+  descartarAlertaCorrectivoGratuito
+} = require('../utils/recordatoriosAuto');
+const { resolverGratuidad } = require('../utils/gratuidadServicio');
 const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { esServicioEditable, esCorrectivoCerrado } = require('../utils/estadoServicio');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const {
+  sincronizarDiasYEventos,
+  reprogramarConservandoForma,
+  ConfirmacionRequeridaError
+} = require('../utils/diasServicio');
+const { normalizarProgramacion } = require('../utils/programacionDias');
 const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
 const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
@@ -47,6 +63,9 @@ const obtener = async (req, res) => {
         servicio: {
           include: {
             asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+            // Grilla de días programados: el formulario de edición precarga con
+            // ella la programación (rangos y/o fechas sueltas).
+            dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' } },
             historial_estados: true,
             servicio_realizado: true
           }
@@ -54,7 +73,10 @@ const obtener = async (req, res) => {
       }
     });
     if (!c) return res.status(404).json({ error: 'Correctivo no encontrado' });
-    res.json({ data: { ...c, ejecucion: derivarEjecucion(c.servicio) } });
+    // El servicio vinculado trae `precio_interno`: se anula para quien no puede
+    // ver datos económicos (el formulario ya le oculta el campo de precio).
+    const servicioCorr = puedeVerFinanzasReq(req) ? c.servicio : servicioSinPrecios(c.servicio);
+    res.json({ data: { ...c, servicio: servicioCorr, ejecucion: derivarEjecucion(c.servicio) } });
   } catch (err) {
     console.error('[correctivos.obtener]', err);
     res.status(500).json({ error: 'Error al obtener correctivo' });
@@ -95,6 +117,7 @@ const listar = async (req, res) => {
           servicio: {
             include: {
               asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+              dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' } },
               historial_estados: true,
               servicio_realizado: true
             }
@@ -105,7 +128,12 @@ const listar = async (req, res) => {
     );
     // Fechas de ejecución (inicio/fin de trabajo derivados del historial de
     // estados del servicio) para las columnas del listado.
-    result.data = result.data.map(c => ({ ...c, ejecucion: derivarEjecucion(c.servicio) }));
+    const verFinanzas = puedeVerFinanzasReq(req);
+    result.data = result.data.map(c => ({
+      ...c,
+      servicio: verFinanzas ? c.servicio : servicioSinPrecios(c.servicio),
+      ejecucion: derivarEjecucion(c.servicio)
+    }));
     res.json(result);
   } catch (err) {
     console.error('[correctivos.listar]', err);
@@ -124,26 +152,37 @@ const crear = async (req, res) => {
     if (ascSel?.estado_operativo === 'Instalación cancelada') {
       return res.status(400).json({ error: 'Este ascensor tiene la instalación cancelada y no admite servicios.' });
     }
-    const sinCobro = d.sin_cobro === true || d.sin_cobro === 1 || d.sin_cobro === '1';
-    if (!sinCobro && (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')) {
+    // Gratuidad y facturación las decide utils/gratuidadServicio (SSoT):
+    // un rol sin visibilidad financiera solo registra correctivos gratuitos, y
+    // lo gratuito nunca lleva factura. El default del módulo cuando SÍ se cobra
+    // es "con factura" (1).
+    const { sinCobro, requiereFactura, fijaPrecio, gratuidadImpuesta } =
+      resolverGratuidad(req, d, { requiereFacturaPorDefecto: 1 });
+    // Un correctivo gratuito registrado por quien no gestiona precios es una
+    // decisión económica que administración debe poder revisar: se le avisa
+    // (ver crearAlertaCorrectivoGratuito).
+    const gratuitoRequiereAviso = gratuidadImpuesta;
+    if (fijaPrecio && !sinCobro && (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')) {
       return res.status(400).json({ error: 'Precio obligatorio' });
     }
-    const precioFinal = sinCobro ? 0 : d.precio_interno;
-    // Bandera persistida "requiere factura": default del módulo Correctivos = 1
-    // (con factura). Editable desde el formulario de creación.
-    const requiereFactura = d.requiere_factura === undefined
-      ? 1
-      : (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0);
+    const precioFinal = (sinCobro || !fijaPrecio) ? 0 : d.precio_interno;
 
     const tecnicos = Array.isArray(d.tecnicos) ? d.tecnicos : [];
-    const items_checklist = Array.isArray(d.items_checklist) ? d.items_checklist : [];
 
     const consistencia = validarConsistenciaAsignaciones(tecnicos);
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
 
     // Fechas de agenda: fecha programada elegible (por defecto hoy) y fecha
     // estimada de término opcional para ocupar varios días en el calendario.
-    const fechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima();
+    // Días de trabajo: rangos y/o fechas sueltas (ver utils/programacionDias).
+    // Sin `dias`, el correctivo ocupa un único día (el clásico fecha_programada).
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const fechaProgramada = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima());
     const horaProgramada = d.hora_programada || hmLima();
     const fechaEstimadaEntrega = d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null;
     if (fechaEstimadaEntrega && fechaEstimadaEntrega < fechaProgramada) {
@@ -172,11 +211,12 @@ const crear = async (req, res) => {
         descripcion: d.falla,
         fecha_programada: fechaProgramada,
         hora_programada: horaProgramada,
+        duracion_dias: fechasProgramacion ? fechasProgramacion.length : 1,
         fecha_estimada_entrega: fechaEstimadaEntrega,
         prioridad: nivelUrgencia,
-        estado_servicio: tecnicos.length > 0
-          ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado')
-          : 'Pendiente',
+        // Asignado exige técnico Y fecha: aquí la fecha siempre se registra al
+        // crear, así que basta con que venga algún técnico.
+        estado_servicio: tecnicos.length > 0 ? 'Asignado' : 'Pendiente',
         precio_interno: precioFinal,
         moneda: d.moneda || 'PEN',
         sin_cobro: sinCobro ? 1 : 0,
@@ -208,16 +248,15 @@ const crear = async (req, res) => {
       }
     });
 
-    await prisma.tbl_calendario_eventos.create({
-      data: {
-        id_servicio: servicio.id,
-        titulo: `CORRECTIVO ${servicio.codigo}`,
-        tipo_evento: 'correctivo',
-        fecha_inicio: combinarFechaHoraLima(fechaProgramada, horaProgramada),
-        fecha_fin: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null,
-        estado_evento: ESTADO_EVENTO_PROGRAMADO,
-        color: '#f59e0b'
-      }
+    // Grilla de días + un evento de calendario por día programado. Con un solo
+    // día se conserva el comportamiento previo (evento único que puede
+    // extenderse hasta la fecha estimada de término).
+    await sincronizarDiasYEventos(prisma, servicio.id, {
+      userId: req.user.id,
+      fechas: fechasProgramacion,
+      tituloBase: `CORRECTIVO ${servicio.codigo}`,
+      tipoEvento: 'correctivo',
+      fechaFinEvento: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null
     });
 
     if (tecnicos.length > 0) {
@@ -230,37 +269,10 @@ const crear = async (req, res) => {
             rol_asignacion: t.rol_asignacion || 'Apoyo',
             responsable_principal: t.responsable_principal ? 1 : 0,
             responsable_documentacion: t.responsable_documentacion ? 1 : 0,
-            responsable_checklist: t.responsable_checklist ? 1 : 0,
             asignado_por: req.user.id,
             user_id_registration: req.user.id
           }
         });
-      }
-
-      const tecChecklist = tecnicos.find(t => t.responsable_checklist) || tecnicos[0];
-      if (tecChecklist?.id_tecnico) {
-        const checklist = await prisma.tbl_checklists_salida.create({
-          data: {
-            id_servicio: servicio.id,
-            id_tecnico_responsable: Number(tecChecklist.id_tecnico),
-            estado_checklist: items_checklist.length > 0 ? 'En llenado' : 'Pendiente',
-            user_id_registration: req.user.id
-          }
-        });
-        for (const it of items_checklist) {
-          if (!it.nombre) continue;
-          await prisma.tbl_checklists_salida_items.create({
-            data: {
-              id_checklist: checklist.id,
-              tipo_item: it.tipo_item || 'Herramienta',
-              nombre: it.nombre,
-              cantidad: it.cantidad || 1,
-              unidad: it.unidad || 'Unidad',
-              observaciones: it.observaciones || null,
-              user_id_registration: req.user.id
-            }
-          });
-        }
       }
     }
 
@@ -269,6 +281,10 @@ const crear = async (req, res) => {
       accion: 'CREATE', valor_nuevo: correctivo, ip: req.ip
     });
     sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync rec servicio:', err));
+    if (gratuitoRequiereAviso) {
+      crearAlertaCorrectivoGratuito(correctivo.id, { usuarioId: req.user.id })
+        .catch(err => console.error('Alerta correctivo gratuito:', err));
+    }
     res.status(201).json({ data: { correctivo, servicio } });
   } catch (err) {
     console.error('[correctivos.crear]', err);
@@ -308,14 +324,22 @@ const actualizar = async (req, res) => {
     }
 
     const puedeCambiarPrecio = ROLES_PRECIO_COR.includes(req.user.rol_codigo);
-    const sinCobroNuevo = d.sin_cobro !== undefined
+    // La gratuidad solo la cambia quien gestiona precios. Un rol sin
+    // visibilidad financiera conserva el valor que ya tenía el servicio: no
+    // puede volver cobrable un correctivo gratuito, ni regalar uno que
+    // administración dejó de pago.
+    const sinCobroNuevo = (puedeCambiarPrecio && d.sin_cobro !== undefined)
       ? (d.sin_cobro === true || d.sin_cobro === 1 || d.sin_cobro === '1' ? 1 : 0)
       : servicioPrevio?.sin_cobro;
     const precioRecibido = d.precio_interno !== undefined ? Number(d.precio_interno) : null;
     const precioFinal = sinCobroNuevo === 1 ? 0 : (puedeCambiarPrecio && precioRecibido !== null ? precioRecibido : Number(servicioPrevio?.precio_interno || 0));
-    const requiereFacturaNuevo = d.requiere_factura !== undefined
-      ? (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0)
-      : servicioPrevio?.requiere_factura;
+    // Gratuito ⇒ sin factura, también al editar: si el servicio queda sin cobro
+    // la bandera se apaga aunque el payload pida lo contrario.
+    const requiereFacturaNuevo = sinCobroNuevo === 1
+      ? 0
+      : (d.requiere_factura !== undefined
+        ? (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0)
+        : servicioPrevio?.requiere_factura);
     const nuevaFalla = d.falla ?? previo.falla;
     const nuevoNivel = d.nivel_urgencia ?? previo.nivel_urgencia;
     const nuevaMoneda = d.moneda ?? servicioPrevio?.moneda ?? 'PEN';
@@ -323,9 +347,17 @@ const actualizar = async (req, res) => {
     const nuevoIdAscensor = d.id_ascensor ? Number(d.id_ascensor) : (servicioPrevio?.id_ascensor ?? previo.id_ascensor);
 
     // Fechas de agenda (opcionales en el payload: si no vienen, se conservan).
-    const nuevaFechaProgramada = d.fecha_programada !== undefined
-      ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
-      : servicioPrevio?.fecha_programada;
+    // `dias` (rangos y/o fechas sueltas) manda sobre `fecha_programada`: esta
+    // pasa a ser el primer día del trabajo.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const nuevaFechaProgramada = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada !== undefined
+        ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
+        : servicioPrevio?.fecha_programada);
     const nuevaHoraProgramada = d.hora_programada !== undefined
       ? (d.hora_programada || null)
       : servicioPrevio?.hora_programada;
@@ -346,7 +378,9 @@ const actualizar = async (req, res) => {
       }
     }
 
-    const correctivoActualizado = await prisma.$transaction(async (tx) => {
+    let correctivoActualizado;
+    try {
+      correctivoActualizado = await prisma.$transaction(async (tx) => {
       const c = await tx.tbl_correctivos.update({
         where: { id },
         data: {
@@ -391,18 +425,39 @@ const actualizar = async (req, res) => {
           create: { id_servicio: servicioPrevio.id, id_ascensor: nuevoIdAscensor, monto: precioFinal, moneda: nuevaMoneda, user_id_registration: req.user.id }
         });
 
-        await tx.tbl_calendario_eventos.updateMany({
-          where: { id_servicio: servicioPrevio.id, estado: 1 },
-          data: {
-            titulo: `CORRECTIVO ${servicioPrevio.codigo}`,
-            ...(nuevaFechaProgramada ? { fecha_inicio: combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada) } : {}),
-            fecha_fin: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null,
-            user_id_modification: req.user.id, date_time_modification: new Date()
+        // Regenerar días + eventos. Qué fechas: las enviadas; si solo se movió la
+        // fecha programada, la programación vigente desplazada (conserva su
+        // forma: 10/15/20 movido una semana → 17/22/27); si no, se conserva.
+        if (nuevaFechaProgramada) {
+          let fechas = fechasProgramacion;
+          if (!fechas && d.fecha_programada !== undefined) {
+            fechas = await reprogramarConservandoForma(tx, servicioPrevio.id, {
+              nuevoInicio: ymdDeFecha(nuevaFechaProgramada)
+            });
           }
-        });
+          await sincronizarDiasYEventos(tx, servicioPrevio.id, {
+            userId: req.user.id,
+            confirmar: d.confirmar === true,
+            fechas,
+            tituloBase: `CORRECTIVO ${servicioPrevio.codigo}`,
+            tipoEvento: 'correctivo',
+            fechaFinEvento: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null
+          });
+        }
       }
       return c;
-    });
+      }, { timeout: 20000 });
+    } catch (e) {
+      // Reprogramar dejando fuera días ya trabajados exige confirmación explícita.
+      if (e instanceof ConfirmacionRequeridaError || e.code === 'REQUIERE_CONFIRMACION') {
+        return res.status(409).json({
+          error: 'La nueva programación dejaría fuera días que ya tienen evidencia',
+          requiere_confirmacion: true,
+          dias_con_evidencia: e.diasConEvidencia || []
+        });
+      }
+      throw e;
+    }
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_correctivos', id_entidad: id,
@@ -410,6 +465,14 @@ const actualizar = async (req, res) => {
     });
     if (servicioPrevio) {
       sincronizarRecordatorioServicio(servicioPrevio.id).catch(err => console.error('Sync rec servicio:', err));
+    }
+    // Cuando administración le fija un precio a un correctivo que estaba
+    // gratuito, la alerta pendiente se cierra sola: ya la revisó. (La alerta
+    // solo NACE en el alta: editando, un rol sin visibilidad financiera ya no
+    // puede cambiar la gratuidad.)
+    if (sinCobroNuevo !== 1 && servicioPrevio?.sin_cobro === 1) {
+      descartarAlertaCorrectivoGratuito(id)
+        .catch(err => console.error('Descarte alerta correctivo gratuito:', err));
     }
     res.json({ data: correctivoActualizado });
   } catch (err) {
@@ -421,7 +484,7 @@ const actualizar = async (req, res) => {
 /**
  * Soft-delete de un correctivo: estado = 0. Igual que Emergencias, cada
  * correctivo posee un servicio vinculado (1:1); la baja arrastra ese servicio y
- * TODA su cascada (asignaciones, checklist, evidencias, cobro, facturas, folder
+ * TODA su cascada (asignaciones, evidencias, cobro, facturas, folder
  * contable, eventos de calendario, recordatorios) vía el motor de reversión,
  * limpia los archivos en Wasabi y libera a los técnicos sin otros servicios
  * activos. No borra físicamente: queda auditado y recuperable. Solo Super Admin.

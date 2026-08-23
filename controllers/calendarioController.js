@@ -7,6 +7,9 @@ const {
   colorPorTipo
 } = require('../utils/visibilidadCalendario');
 const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
+const {
+  puedeVerFinanzasReq, servicioSinPrecios, planMantenimientoSinFinanzas, omitir
+} = require('../utils/visibilidadFinanzas');
 
 const listar = async (req, res) => {
   try {
@@ -62,6 +65,9 @@ const listar = async (req, res) => {
         if (tiposPermitidos.includes('manual')) {
           whereRec.OR = [{ tipo: { not: 'manual' } }, { user_id_registration: req.user.id }];
         }
+        // Alerta dirigida a un rol concreto: solo la ve ese rol. Va en AND
+        // aparte para no pisar el OR de los recordatorios manuales.
+        whereRec.AND = [{ OR: [{ rol_destinatario: null }, { rol_destinatario: rol }] }];
         if (desde || hasta) {
           whereRec.fecha_recordatorio = {};
           if (desde) whereRec.fecha_recordatorio.gte = parseYMDLima(desde);
@@ -159,6 +165,21 @@ const listar = async (req, res) => {
     const combinado = [...eventosNormalizados, ...recordatorios]
       .filter(visiblePorAmbito)
       .sort((a, b) => new Date(a.fecha_inicio) - new Date(b.fecha_inicio));
+
+    // Los ítems del calendario arrastran el servicio y el plan completos: se les
+    // quitan precio, monto por ascensor y cobro para los roles sin visibilidad
+    // financiera. El calendario es una agenda, no un tablero económico.
+    if (!puedeVerFinanzasReq(req)) {
+      return res.json({
+        data: combinado.map(it => omitir({
+          ...it,
+          servicio: it.servicio ? servicioSinPrecios(it.servicio) : it.servicio,
+          mantenimiento_plan: it.mantenimiento_plan
+            ? planMantenimientoSinFinanzas(it.mantenimiento_plan, req.user)
+            : it.mantenimiento_plan
+        }, ['cobro']))
+      });
+    }
 
     res.json({ data: combinado });
   } catch (err) {

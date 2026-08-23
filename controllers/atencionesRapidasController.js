@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
+const { resolverGratuidad } = require('../utils/gratuidadServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima } = require('../utils/tiempo');
@@ -9,6 +10,17 @@ const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
 const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { sincronizarDiasYEventos } = require('../utils/diasServicio');
+const { normalizarProgramacion } = require('../utils/programacionDias');
+const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
+
+// Módulo destino → tipo de evento del calendario. Los módulos sin evento propio
+// (atención rápida, o sin módulo) caen al tipo derivado de `tipo_registro`.
+const TIPO_EVENTO_POR_MODULO = {
+  emergencia: 'emergencia',
+  correctivo: 'correctivo',
+  mantenimiento: 'mantenimiento'
+};
 
 const listar = async (req, res) => {
   try {
@@ -128,9 +140,20 @@ const convertir = async (req, res) => {
     const d = req.body;
     const at = await prisma.tbl_atenciones_rapidas.findUnique({ where: { id } });
     if (!at) return res.status(404).json({ error: 'Atención no encontrada' });
-    if (!d.id_cliente || !d.id_ascensor || !d.id_subtipo_servicio || d.precio_interno === undefined) {
-      return res.status(400).json({ error: 'Faltan datos para conversión (cliente, ascensor, subtipo y precio)' });
+    // Gratuidad y facturación por la regla común (utils/gratuidadServicio): el
+    // Coordinador solo genera servicios gratuitos —no maneja precios— y lo
+    // gratuito no se factura. El default del módulo cuando sí se cobra es
+    // "con factura" (1), igual que en el resto de servicios.
+    const { sinCobro, requiereFactura, fijaPrecio } =
+      resolverGratuidad(req, d, { requiereFacturaPorDefecto: 1 });
+    if (!d.id_cliente || !d.id_ascensor || !d.id_subtipo_servicio) {
+      return res.status(400).json({ error: 'Faltan datos para conversión (cliente, ascensor y subtipo)' });
     }
+    // El precio solo se exige cuando la conversión SÍ se cobra.
+    if (fijaPrecio && !sinCobro && d.precio_interno === undefined) {
+      return res.status(400).json({ error: 'Faltan datos para conversión (precio)' });
+    }
+    const precioConversion = (fijaPrecio && !sinCobro) ? (d.precio_interno || 0) : 0;
     // Un ascensor con la instalación cancelada no admite servicios.
     const ascSel = await prisma.tbl_ascensores.findUnique({ where: { id: Number(d.id_ascensor) }, select: { estado_operativo: true } });
     if (ascSel?.estado_operativo === 'Instalación cancelada') {
@@ -150,10 +173,18 @@ const convertir = async (req, res) => {
     catch (e) { return res.status(400).json({ error: e.message }); }
 
     const codigo = await generarCodigoServicio(clasif.tipo_registro);
+    // Días de trabajo: `dias` admite un rango, fechas sueltas o la combinación de
+    // ambos (ver utils/programacionDias). Sin `dias`, el trabajo ocupa un único
+    // día: el clásico `fecha_programada`.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     // Anclar fecha a Lima TZ con parseYMDLima — `new Date("YYYY-MM-DD")` daría
     // midnight UTC, que en local Perú (UTC-5) se desplaza al día anterior al
     // serializarse a @db.Date.
-    const fecha = d.fecha_programada ? parseYMDLima(d.fecha_programada) : new Date();
+    const fecha = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada ? parseYMDLima(d.fecha_programada) : new Date());
 
     const resultado = await prisma.$transaction(async (tx) => {
       // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
@@ -169,16 +200,19 @@ const convertir = async (req, res) => {
           descripcion: at.mensaje_rapido || null,
           fecha_programada: fecha,
           hora_programada: d.hora_programada || null,
+          duracion_dias: fechasProgramacion ? fechasProgramacion.length : 1,
           prioridad: at.nivel_urgencia,
-          precio_interno: d.precio_interno,
+          precio_interno: precioConversion,
           moneda: d.moneda || 'PEN',
+          sin_cobro: sinCobro ? 1 : 0,
+          requiere_factura: requiereFactura,
           observaciones: d.observaciones || null,
           ...datosSitio,
           user_id_registration: req.user.id,
           ascensores: {
             create: [{
               id_ascensor: Number(d.id_ascensor),
-              monto: d.precio_interno || 0,
+              monto: precioConversion,
               moneda: d.moneda || 'PEN',
               user_id_registration: req.user.id
             }]
@@ -219,6 +253,16 @@ const convertir = async (req, res) => {
       });
       return servicio;
     });
+
+    // Grilla de días + un evento de calendario por día programado: sin esto el
+    // servicio convertido no aparecería en la agenda del técnico.
+    await sincronizarDiasYEventos(prisma, resultado.id, {
+      userId: req.user.id,
+      fechas: fechasProgramacion,
+      tipoEvento: TIPO_EVENTO_POR_MODULO[clasif.modulo_asociado] || null
+    });
+    sincronizarRecordatorioServicio(resultado.id).catch(err => console.error('Sync rec servicio:', err));
+
     res.json({ data: { servicio: resultado, atencion_id: id } });
   } catch (err) {
     console.error(err);

@@ -10,6 +10,11 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const { descartarAlertaFacturarServicio } = require('../utils/recordatoriosAuto');
 const {
+  TIPOS_COMPROBANTE_CODIGOS,
+  esTipoComprobanteValido,
+  normalizarTipoComprobante
+} = require('../utils/catalogosComprobante');
+const {
   ESTADO_FACTURA_EMITIDA,
   ESTADO_FACTURA_ANULADA,
   ESTADOS_FACTURA,
@@ -18,7 +23,9 @@ const {
   calcularEstadoFacturacion
 } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
+const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
+const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 
 /**
@@ -39,9 +46,114 @@ function conFechaInicioServicio(f) {
   };
 }
 
+/**
+ * Resumen de facturación del conjunto FILTRADO completo (no de la página
+ * visible): alimenta el indicador de la cabecera de Facturas.
+ *
+ *   - `facturado`: las facturas del filtro con su importe. Las ANULADAS se
+ *     excluyen: no son facturación válida aunque sigan listadas.
+ *   - `pendiente`: de esas mismas facturas, cuántas siguen con saldo y cuánto
+ *     falta cobrar.
+ *
+ * Cómo se reparte el saldo entre las facturas de un mismo cobro (para no
+ * contarlo dos veces): una factura de cuota se lleva el saldo de SU cuota; las
+ * facturas generales (sin cuota) se reparten a prorrata el saldo del cobro MENOS
+ * el de las cuotas que ya tienen factura propia — solo esas, porque son las
+ * únicas que otra fila va a contar. El saldo de las cuotas todavía sin facturar
+ * sigue perteneciendo a la factura general que cubre el cobro. En ambos casos el
+ * pendiente de una factura nunca supera su propio importe.
+ *
+ * Los importes van desglosados POR MONEDA: la cartera mezcla PEN y USD y sumarlos
+ * daría un número falso.
+ */
+async function resumenFacturas(where) {
+  const filas = await prisma.tbl_facturas.findMany({
+    where,
+    select: {
+      id: true, monto: true, id_cobro: true, estado_factura: true,
+      cuota: { select: { monto: true, monto_pagado: true } },
+      servicio: { select: { moneda: true } },
+      cobro: {
+        select: {
+          id: true, moneda: true, saldo_pendiente: true,
+          cuotas: {
+            where: { estado: 1 },
+            select: {
+              monto: true, monto_pagado: true,
+              // Si la cuota ya tiene comprobante propio, su saldo lo reporta esa
+              // factura; si no, sigue dentro del saldo de la factura general.
+              facturas: { where: { estado: 1 }, select: { estado_factura: true } }
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // Centavos enteros: evita los residuos de coma flotante al acumular importes.
+  const cent = (v) => Math.round(Number(v || 0) * 100);
+  const saldoCuota = (c) => Math.max(0, cent(c?.monto) - cent(c?.monto_pagado));
+  // Misma regla que usa la tabla para mostrar la moneda de cada fila.
+  const monedaDe = (f) => f.cobro?.moneda || f.servicio?.moneda || MONEDA_POR_DEFECTO;
+
+  const activas = filas.filter(f => f.estado_factura !== ESTADO_FACTURA_ANULADA);
+
+  // Resto del cobro no cubierto por sus cuotas, a repartir entre las facturas
+  // generales de ese cobro que estén dentro del filtro.
+  const generalesPorCobro = new Map();
+  for (const f of activas) {
+    if (f.cuota || !f.id_cobro) continue;
+    if (!generalesPorCobro.has(f.id_cobro)) generalesPorCobro.set(f.id_cobro, []);
+    generalesPorCobro.get(f.id_cobro).push(f);
+  }
+  const pendientePorFactura = new Map();
+  for (const [, grupo] of generalesPorCobro) {
+    const cobro = grupo[0].cobro;
+    const saldoCuotasFacturadas = (cobro?.cuotas || [])
+      .filter(c => (c.facturas || []).some(f => f.estado_factura !== ESTADO_FACTURA_ANULADA))
+      .reduce((acc, c) => acc + saldoCuota(c), 0);
+    const resto = Math.max(0, cent(cobro?.saldo_pendiente) - saldoCuotasFacturadas);
+    const totalGrupo = grupo.reduce((acc, f) => acc + cent(f.monto), 0);
+    for (const f of grupo) {
+      const parte = totalGrupo > 0 ? Math.round((resto * cent(f.monto)) / totalGrupo) : 0;
+      pendientePorFactura.set(f.id, Math.min(cent(f.monto), parte));
+    }
+  }
+  for (const f of activas) {
+    if (!f.cuota) continue;
+    pendientePorFactura.set(f.id, Math.min(cent(f.monto), saldoCuota(f.cuota)));
+  }
+
+  const facturado = { cantidad: 0, montos: new Map() };
+  const pendiente = { cantidad: 0, montos: new Map() };
+  const acumular = (grupo, moneda, centavos) =>
+    grupo.montos.set(moneda, (grupo.montos.get(moneda) || 0) + centavos);
+
+  for (const f of activas) {
+    const moneda = monedaDe(f);
+    facturado.cantidad++;
+    acumular(facturado, moneda, cent(f.monto));
+    const saldo = pendientePorFactura.get(f.id) || 0;
+    if (saldo > 0) {
+      pendiente.cantidad++;
+      acumular(pendiente, moneda, saldo);
+    }
+  }
+
+  // Mismo formato que `resumen_facturacion` de Contabilidad: importes por moneda
+  // ordenados de mayor a menor, para que la UI los pinte sin adivinar.
+  const aSalida = (g) => ({
+    cantidad: g.cantidad,
+    montos: [...g.montos.entries()]
+      .map(([moneda, centavos]) => ({ moneda, total: centavos / 100 }))
+      .sort((a, b) => b.total - a.total)
+  });
+  return { facturado: aSalida(facturado), pendiente: aSalida(pendiente) };
+}
+
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio, q, estado_factura, cobertura, tipo_categoria, desde, hasta } = req.query;
+    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, desde, hasta } = req.query;
     // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
     // tipo de servicio): asignarlos a where.OR directamente se pisarían.
     const and = [];
@@ -49,6 +161,11 @@ const listar = async (req, res) => {
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_servicio) where.id_servicio = Number(id_servicio);
     if (estado_factura) where.estado_factura = estado_factura;
+    // Tipo de comprobante: Factura | Boleta. Un valor desconocido se ignora en
+    // vez de devolver una lista vacía silenciosa.
+    if (tipo_comprobante && esTipoComprobanteValido(tipo_comprobante)) {
+      where.tipo_comprobante = tipo_comprobante;
+    }
     // Cobertura: 'general' = factura por todo el servicio (sin cuota);
     // 'cuota' = factura ligada a una cuota específica del plan.
     if (cobertura === 'general') where.id_cuota = null;
@@ -63,7 +180,12 @@ const listar = async (req, res) => {
       { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
       // RUC / DNI del cliente: contabilidad busca por documento tanto como por nombre.
       { cliente: { numero_documento: { contains: q, mode: 'insensitive' } } },
-      { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
+      { servicio: { codigo: { contains: q, mode: 'insensitive' } } },
+      // Nombre del edificio / obra. La factura llega al sitio por dos caminos
+      // según su origen: vía el servicio, o vía el plan de mantenimiento cuando
+      // es la factura de una cuota del plan (esas no tienen id_servicio).
+      { servicio: { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } } },
+      { mantenimiento_plan: { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } } }
     ] });
     // Tipo de servicio facturado. Mismo criterio que el filtro de Cobros
     // (cobrosController.listar): correctivo / preventivo (mantenimiento, incluye
@@ -81,7 +203,9 @@ const listar = async (req, res) => {
 
     // Orden configurable por columna (whitelist para evitar inyección). El
     // correlativo refleja el orden de creación (id), por eso "correlativo" mapea
-    // a id. Por defecto: id ascendente (el correlativo 1 queda arriba).
+    // a id. Por defecto: serie y N° de factura ascendente, que es el orden del
+    // registro contable y el que muestra la pantalla al abrirse. El correlativo
+    // (zero-padded dentro de cada serie) ordena bien como texto.
     const { sort, dir } = req.query;
     const direccion = dir === 'desc' ? 'desc' : 'asc';
     const ORDEN = {
@@ -94,7 +218,7 @@ const listar = async (req, res) => {
       cobertura: { id_cuota: direccion },
       estado_factura: { estado_factura: direccion }
     };
-    const orderBy = ORDEN[sort] || { id: 'asc' };
+    const orderBy = ORDEN[sort] || { numero_factura: 'asc' };
     // Alcance por tipo de edificio (Administrador): factura de servicio o de plan.
     conAlcance(where, porServicioOPlanAscensorEdificioWhere(req.user));
 
@@ -108,6 +232,12 @@ const listar = async (req, res) => {
           servicio: {
             include: {
               tipo_servicio: true,
+              // Edificio / obra donde se prestó el servicio: la tabla lo muestra
+              // y el buscador filtra por su nombre.
+              ascensores: {
+                where: { estado: 1 },
+                select: { ascensor: { select: { edificio: { select: { id: true, nombre: true } } } } }
+              },
               // Primer paso a 'En curso' = inicio real del servicio en obra.
               historial_estados: {
                 where: { estado_nuevo: ESTADO_SERVICIO_EN_CURSO },
@@ -117,7 +247,17 @@ const listar = async (req, res) => {
               }
             }
           },
-          mantenimiento_plan: { include: { tipo_servicio: true } },
+          // Las facturas de cuota de un plan no cuelgan de un servicio: el
+          // edificio se resuelve por los ascensores que cubre el plan.
+          mantenimiento_plan: {
+            include: {
+              tipo_servicio: true,
+              ascensores: {
+                where: { estado: 1 },
+                select: { ascensor: { select: { edificio: { select: { id: true, nombre: true } } } } }
+              }
+            }
+          },
           archivo: true,
           cobro: true,
           cuota: true
@@ -126,7 +266,11 @@ const listar = async (req, res) => {
       req.query
     );
     if (Array.isArray(result?.data)) result.data = result.data.map(conFechaInicioServicio);
-    res.json(result);
+    // El resumen se calcula con el MISMO `where` que la tabla y antes de paginar:
+    // así los indicadores describen todo el recorte elegido, no las 25 filas
+    // visibles, y no pueden desincronizarse de los filtros. La ruta ya está
+    // restringida a roles con visibilidad financiera (ver facturasRoutes).
+    res.json({ ...result, resumen_facturas: await resumenFacturas(where) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar facturas' });
@@ -158,7 +302,12 @@ const obtener = async (req, res) => {
       }
     });
     if (!f) return res.status(404).json({ error: 'No encontrada' });
-    res.json({ data: conFechaInicioServicio(f) });
+    // Factura de un MES de un plan de mantenimiento: adjunta el detalle de los
+    // mantenimientos que cubre ese mes (qué ascensor, cuántas veces y en qué
+    // fechas). Es un solo comprobante por el monto mensual pactado; el detalle
+    // se deriva del cronograma del plan, no se copia en la factura.
+    const detalleMensual = f.id_cuota ? await detalleMensualDeCuota(prisma, f.id_cuota) : null;
+    res.json({ data: { ...conFechaInicioServicio(f), detalle_mensual: detalleMensual } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener factura' });
@@ -199,7 +348,7 @@ async function recomputarEstadoFacturacionServicio(idServicio, idUsuario) {
  * El plan se factura una sola vez por el total; admite factura general o por cuota,
  * con las mismas reglas de exclusividad que las facturas por servicio.
  */
-async function _crearFacturaPlan(req, res, d) {
+async function _crearFacturaPlan(req, res, d, tipoComprobante) {
   const idPlan = Number(d.id_mantenimiento_plan);
   const plan = await prisma.tbl_mantenimientos_planes.findUnique({
     where: { id: idPlan }, include: { cobro: true }
@@ -238,6 +387,7 @@ async function _crearFacturaPlan(req, res, d) {
     ? d.estado_factura : ESTADO_FACTURA_EMITIDA;
   const factura = await prisma.tbl_facturas.create({
     data: {
+      tipo_comprobante: tipoComprobante,
       id_servicio: null,
       id_mantenimiento_plan: idPlan,
       id_cobro: cobro.id,
@@ -270,9 +420,16 @@ const crear = async (req, res) => {
     if (Number(d.monto) < 0) {
       return res.status(400).json({ error: 'Monto no puede ser negativo' });
     }
+    // Tipo de comprobante: se exige un valor del catálogo cuando viene, en vez
+    // de caer al default en silencio y guardar una boleta como factura.
+    if (d.tipo_comprobante !== undefined && d.tipo_comprobante !== null && d.tipo_comprobante !== ''
+        && !esTipoComprobanteValido(d.tipo_comprobante)) {
+      return res.status(400).json({ error: `Tipo de comprobante inválido. Valores permitidos: ${TIPOS_COMPROBANTE_CODIGOS.join(', ')}` });
+    }
+    const tipoComprobante = normalizarTipoComprobante(d.tipo_comprobante);
     // Factura de plan de mantenimiento (cobro único del plan, sin servicio).
     if (d.id_mantenimiento_plan) {
-      return await _crearFacturaPlan(req, res, d);
+      return await _crearFacturaPlan(req, res, d, tipoComprobante);
     }
     if (!d.id_servicio) {
       return res.status(400).json({ error: 'Servicio (o plan de mantenimiento) es obligatorio' });
@@ -356,6 +513,7 @@ const crear = async (req, res) => {
 
     const factura = await prisma.tbl_facturas.create({
       data: {
+        tipo_comprobante: tipoComprobante,
         id_servicio: Number(d.id_servicio),
         id_cobro: servicio.cobro?.id || null,
         id_cuota: idCuota,

@@ -1,7 +1,7 @@
 /**
  * Verifica E2E las 3 alertas de finalización de servicio.
  *
- * Toma un servicio en estado 'Finalizado por técnico' (id=9 en el dataset local),
+ * Toma un servicio en estado 'Finalizado' (id=9 en el dataset local),
  * dispara las 3 sincronizadoras, y verifica que:
  *   - se crean los 3 recordatorios (uno por tipo)
  *   - son idempotentes (segunda llamada no duplica)

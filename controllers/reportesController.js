@@ -14,10 +14,28 @@ const {
 } = require('../utils/alcanceUsuario');
 const { whereElegibleContable, whereCobroElegible } = require('../utils/elegibilidadContable');
 
-const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
+// Roles con visibilidad de datos económicos (SSoT: utils/visibilidadFinanzas.js).
+const { ROLES_FINANZAS: ROLES_PRECIO, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 
 // El usuario acotado solo a Proyectos no ve reportes de dominio Servicios
 // (emergencias, correctivos, mantenimientos, atención rápida).
+/**
+ * Frecuencias vigentes de un plan de mantenimiento, para los reportes.
+ *
+ * Cada ascensor del plan lleva la suya (uno mensual, otro trimestral…), así que
+ * el reporte muestra las distintas separadas por coma. Los planes creados antes
+ * del modelo por-ascensor caen a la frecuencia del plan.
+ *
+ * Requiere el plan con su junction `ascensores` incluida.
+ */
+function _frecuenciasDelPlan(plan) {
+  const propias = [...new Set(
+    (plan?.ascensores || []).map(a => a.frecuencia).filter(Boolean)
+  )];
+  if (propias.length > 0) return propias.join(', ');
+  return plan?.frecuencia || null;
+}
+
 const sinAmbitoServicio = (req) => {
   const t = tiposRegistroPermitidos(req.user);
   return !!t && !t.includes('servicio');
@@ -59,10 +77,10 @@ const operativos = async (req, res) => {
       }
     });
 
-    // Roles sin acceso financiero no ven precio ni montos del cobro.
+    // Roles sin acceso financiero no ven precio, monto por ascensor ni cobro.
     const sanit = ROLES_PRECIO.includes(req.user.rol_codigo)
       ? servicios
-      : servicios.map(s => ({ ...s, precio_interno: null, cobro: null }));
+      : servicios.map(servicioSinPrecios);
     res.json({ data: sanit });
   } catch (err) {
     console.error(err);
@@ -136,7 +154,7 @@ const mantenimientosCumplidos = async (req, res) => {
     });
     const sanit = ROLES_PRECIO.includes(req.user.rol_codigo)
       ? servicios
-      : servicios.map(s => ({ ...s, precio_interno: null }));
+      : servicios.map(servicioSinPrecios);
     res.json({ data: sanit });
   } catch (err) {
     console.error(err);
@@ -176,9 +194,7 @@ const serviciosFinalizados = async (req, res) => {
       : realizados;
     const sanit = filtrados.map(r => ({
       ...r,
-      servicio: r.servicio && !ROLES_PRECIO.includes(req.user.rol_codigo)
-        ? { ...r.servicio, precio_interno: null }
-        : r.servicio
+      servicio: ROLES_PRECIO.includes(req.user.rol_codigo) ? r.servicio : servicioSinPrecios(r.servicio)
     }));
     res.json({ data: sanit });
   } catch (err) {
@@ -279,7 +295,7 @@ const historialTecnicoAscensor = async (req, res) => {
 
     const sanit = ROLES_PRECIO.includes(req.user.rol_codigo)
       ? servicios
-      : servicios.map(s => ({ ...s, precio_interno: null }));
+      : servicios.map(servicioSinPrecios);
     // Emergencias y mantenimientos son dominio Servicios: ocultos a ámbito solo Proyectos.
     const soloProyectos = sinAmbitoServicio(req);
     res.json({
@@ -325,7 +341,7 @@ const tecnicos = async (_req, res) => {
     const data = tecs.map(t => {
       const asignados = t.asignaciones.length;
       const finalizados = t.asignaciones.filter(a => a.servicio?.estado_servicio?.startsWith('Finalizado') || a.servicio?.estado_servicio === 'Cerrado').length;
-      const enCurso = t.asignaciones.filter(a => ['En camino', 'En curso'].includes(a.servicio?.estado_servicio)).length;
+      const enCurso = t.asignaciones.filter(a => a.servicio?.estado_servicio === 'En curso').length;
       return { id: t.id, nombre: t.nombre, estado_operativo: t.estado_operativo, asignados, finalizados, enCurso };
     });
     res.json({ data });
@@ -396,20 +412,103 @@ const atencionesRapidas = async (req, res) => {
   }
 };
 
-const leads = async (_req, res) => {
+/**
+ * Desglose de leads por una dimensión (canal, vendedora, estado…).
+ *
+ * Cada fila trae el volumen y su conversión, porque el dato accionable no es
+ * "de dónde entran más leads" sino "de dónde entran los que se cierran": un
+ * canal que aporta muchos y convierte poco pide una lectura distinta que uno
+ * pequeño con alta conversión.
+ *
+ * @param {Array}    lista   leads del periodo
+ * @param {Function} claveDe (lead) => etiqueta, o null para excluirlo del corte
+ * @param {string}   sinDato etiqueta para los leads sin valor en esa dimensión
+ */
+function desgloseLeads(lista, claveDe, sinDato = 'Sin dato') {
+  const grupos = new Map();
+  for (const l of lista) {
+    const label = claveDe(l) || sinDato;
+    if (!grupos.has(label)) grupos.set(label, { label, total: 0, convertidos: 0, descartados: 0 });
+    const g = grupos.get(label);
+    g.total++;
+    if (l.estado_lead === ESTADO_LEAD_INGRESADO) g.convertidos++;
+    if (l.estado_lead === ESTADO_LEAD_DESCARTADO) g.descartados++;
+  }
+  return [...grupos.values()]
+    .map(g => ({ ...g, tasa_conversion: porcentaje(g.convertidos, g.total) }))
+    .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+}
+
+/** Porcentaje con un decimal; 0 si no hay base (evita el NaN en la UI). */
+function porcentaje(parte, total) {
+  if (!total) return 0;
+  return Math.round((parte / total) * 1000) / 10;
+}
+
+/**
+ * Reporte de leads: embudo comercial del periodo.
+ *
+ * Filtra por TEMPORALIDAD sobre la fecha de registro del lead (cuándo entró),
+ * que es lo que define "los leads de este mes". La conversión se mide sobre ese
+ * mismo conjunto: de los leads que entraron en el periodo, cuántos terminaron
+ * ingresados. Un lead que entró antes y se convirtió dentro del rango no cuenta
+ * aquí — el corte es por ingreso, no por cierre.
+ */
+const leads = async (req, res) => {
   try {
+    const { desde, hasta } = req.query;
+    const where = { estado: 1 };
+    if (desde || hasta) {
+      where.date_time_registration = {};
+      if (desde) where.date_time_registration.gte = parseYMDLima(desde);
+      if (hasta) where.date_time_registration.lte = parseYMDFinDiaLima(hasta);
+    }
+
     const list = await prisma.tbl_leads.findMany({
-      where: { estado: 1 },
-      include: { tipo_servicio: true, cliente: true }
+      where,
+      orderBy: { id: 'desc' },
+      include: {
+        tipo_servicio: true,
+        cliente: true,
+        vendedor: { select: { id: true, nombres: true } },
+        ubigeo: { select: { departamento: true, provincia: true, distrito: true } },
+        tipo_ascensor: { select: { id: true, nombre: true } }
+      }
     });
-    const porCanal = {};
-    list.forEach(l => {
-      const k = l.canal || 'desconocido';
-      porCanal[k] = (porCanal[k] || 0) + 1;
-    });
+
+    const total = list.length;
     const convertidos = list.filter(l => l.estado_lead === ESTADO_LEAD_INGRESADO).length;
     const descartados = list.filter(l => l.estado_lead === ESTADO_LEAD_DESCARTADO).length;
-    res.json({ data: { total: list.length, convertidos, descartados, porCanal, leads: list } });
+
+    res.json({
+      data: {
+        total,
+        convertidos,
+        descartados,
+        // Ni cerrados ni descartados: siguen vivos en el embudo.
+        en_seguimiento: total - convertidos - descartados,
+        tasa_conversion: porcentaje(convertidos, total),
+        tasa_descarte: porcentaje(descartados, total),
+        por_canal: desgloseLeads(list, l => l.canal, 'Sin canal'),
+        por_vendedor: desgloseLeads(list, l => l.vendedor?.nombres, 'Sin asignar'),
+        por_estado: desgloseLeads(list, l => l.estado_lead, 'Sin estado'),
+        // La provincia se acompaña del departamento: hay provincias homónimas en
+        // departamentos distintos y agruparlas juntas falsearía el corte.
+        por_provincia: desgloseLeads(
+          list,
+          l => (l.ubigeo?.provincia ? `${l.ubigeo.provincia} (${l.ubigeo.departamento})` : null),
+          'Sin ubicación'
+        ),
+        por_tipo_ascensor: desgloseLeads(list, l => l.tipo_ascensor?.nombre, 'Sin tipo'),
+        // Motivos de descarte, para leer el "por qué" detrás del % descartado.
+        motivos_descarte: desgloseLeads(
+          list.filter(l => l.estado_lead === ESTADO_LEAD_DESCARTADO),
+          l => (l.motivo_descarte || '').trim() || null,
+          'Sin motivo registrado'
+        ),
+        leads: list
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error en reporte leads' });
@@ -451,13 +550,16 @@ const mantenimientosVencidos = async (req, res) => {
       where: {
         estado: 1,
         origen: 'mantenimiento',
-        estado_servicio: { in: ['Pendiente', 'Asignado', 'Checklist de salida pendiente', 'Listo para salida'] },
+        estado_servicio: { in: ['Pendiente', 'Asignado'] },
         fecha_programada: fechaWhere
       },
       orderBy: { fecha_programada: 'asc' },
       include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: true } }, tipo_servicio: true }
     });
-    res.json({ data: list });
+    // El servicio viaja entero: se anulan el precio y el monto por ascensor para
+    // los roles sin acceso financiero (mismo criterio que el resto de reportes).
+    const sanit = ROLES_PRECIO.includes(req.user.rol_codigo) ? list : list.map(servicioSinPrecios);
+    res.json({ data: sanit });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error reporte mantenimientos vencidos' });
@@ -758,7 +860,10 @@ const mantenimientosPorCliente = async (req, res) => {
             ascensor_ubicacion: ascsPlan.map(a => a.ubicacion).filter(Boolean).join(', ') || null,
             tipo_servicio: plan.tipo_servicio?.nombre || null,
             tipo_plan: plan.tipo_plan,
-            frecuencia: plan.frecuencia || null,
+            // Frecuencias vigentes del plan: la de cada ascensor (pueden diferir).
+            frecuencia: _frecuenciasDelPlan(plan),
+            duracion_meses: plan.duracion_meses ?? null,
+            monto_mensual: Number(plan.monto_mensual || 0),
             programados,
             realizados,
             faltan,
@@ -829,18 +934,30 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
       }
     });
 
+    // Ascensor real de cada evento: en el modelo mensual una visita del
+    // cronograma cubre UN ascensor, y el evento es el de esa visita.
+    const visitas = await prisma.tbl_mantenimientos_programacion.findMany({
+      where: { id_evento: { in: eventos.map(e => e.id) }, estado: 1 },
+      select: { id_evento: true, id_ascensor: true, numero_mes: true }
+    });
+    const visitaPorEvento = new Map(visitas.map(v => [v.id_evento, v]));
+
     const hoy = inicioDelDiaLima();
     const data = eventos.map(e => {
       const plan = e.mantenimiento_plan;
       const fecha = e.fecha_inicio;
       const vencido = fecha && new Date(fecha) < hoy;
-      // El precio del evento = suma de los montos por ascensor del plan (cada
-      // monto es el precio configurado del ascensor al crear el plan).
-      const montos = (plan?.ascensores || []).map(a => Number(a.monto || 0));
-      const precioPlan = montos.length ? montos.reduce((acc, m) => acc + m, 0) : null;
-      const monedaPlan = plan?.ascensores?.[0]?.moneda || 'PEN';
-      // El plan cubre N ascensores; se muestran sus códigos/ubicaciones unidos.
-      const ascs = (plan?.ascensores || []).map(a => a.ascensor).filter(Boolean);
+      // El plan se cobra por un monto MENSUAL global: una fecha suelta no
+      // tiene precio propio. Se informa el mensual como referencia.
+      const precioPlan = plan ? Number(plan.monto_mensual || 0) : null;
+      const monedaPlan = plan?.moneda || plan?.ascensores?.[0]?.moneda || 'PEN';
+      const visita = visitaPorEvento.get(e.id) || null;
+      const ascsPlan = (plan?.ascensores || []).map(a => a.ascensor).filter(Boolean);
+      // Con visita del cronograma, el ascensor concreto; si no (evento legado),
+      // se listan los del plan como antes.
+      const ascs = visita
+        ? ascsPlan.filter(a => a.id === visita.id_ascensor)
+        : ascsPlan;
       const ascensor = ascs.length
         ? { codigo: ascs.map(a => a.codigo).filter(Boolean).join(', '), ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', ') || null }
         : null;
@@ -852,11 +969,13 @@ const mantenimientosProgramadosSinServicio = async (req, res) => {
         cliente: plan?.cliente ? { id: plan.cliente.id, nombre: plan.cliente.nombre } : null,
         ascensor,
         tipo_servicio: plan?.tipo_servicio || null,
+        // `precio` = monto mensual del plan (importe de referencia del mes).
         precio: precioPlan,
         moneda: monedaPlan,
+        numero_mes: visita?.numero_mes ?? null,
         titulo: e.titulo,
         tipo_plan: plan?.tipo_plan || null,
-        frecuencia: plan?.frecuencia || null
+        frecuencia: plan ? _frecuenciasDelPlan(plan) : null
       };
     });
 

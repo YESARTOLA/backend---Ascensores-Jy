@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
+const { puedeVerFinanzasReq, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { paginar } = require('../utils/paginacion');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const { parseYMDLima } = require('../utils/tiempo');
@@ -29,6 +30,11 @@ const listar = async (req, res) => {
       { where, orderBy: { id: 'desc' }, include: { servicio: { include: { cliente: true } }, archivo: true } },
       req.query
     );
+    // El servicio embebido trae su precio interno: se anula para los roles sin
+    // visibilidad financiera (la entrega es un acto documental, no económico).
+    if (!puedeVerFinanzasReq(req)) {
+      result.data = result.data.map(e => ({ ...e, servicio: servicioSinPrecios(e.servicio) }));
+    }
     res.json(result);
   } catch (err) {
     console.error(err);

@@ -1,9 +1,10 @@
 const prisma = require('../config/prisma');
-const { ESTADO_EVENTO_PROGRAMADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
+const { ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
+const { puedeVerFinanzasReq, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { hmLima, inicioDelDiaLima, parseYMDLima, combinarFechaHoraLima, finDelDiaLima } = require('../utils/tiempo');
+const { hmLima, inicioDelDiaLima, parseYMDLima, finDelDiaLima, ymdDeFecha } = require('../utils/tiempo');
 const { sincronizarRecordatorioEmergencia, sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { paginar } = require('../utils/paginacion');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
@@ -19,7 +20,17 @@ const {
   INCLUDE_ADJUNTOS, COUNT_ADJUNTOS, MAX_ADJUNTOS,
   vincularAdjuntosEnTx, bajaAdjuntosEnTx, puedeGestionar
 } = require('../utils/adjuntosEmergencia');
+const {
+  sincronizarDiasYEventos,
+  reprogramarConservandoForma,
+  ConfirmacionRequeridaError
+} = require('../utils/diasServicio');
+const { normalizarProgramacion } = require('../utils/programacionDias');
 
+// La emergencia se registra siempre sin costo (ver `crear`), así que en el alta
+// no interviene ningún rol de precio. Esta lista solo rige la EDICIÓN: si una
+// emergencia concreta terminó teniendo importe, únicamente estos roles pueden
+// cambiarlo desde aquí.
 const ROLES_PRECIO_EM = ['super_admin', 'admin', 'contabilidad'];
 
 /**
@@ -53,6 +64,9 @@ const obtener = async (req, res) => {
         servicio: {
           include: {
             asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+            // Grilla de días programados: el formulario de edición precarga con
+            // ella la programación (rangos y/o fechas sueltas).
+            dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' } },
             historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } },
             servicio_realizado: { select: { fecha_realizacion: true } }
           }
@@ -60,7 +74,10 @@ const obtener = async (req, res) => {
       }
     });
     if (!em) return res.status(404).json({ error: 'Emergencia no encontrada' });
-    res.json({ data: { ...em, ejecucion: derivarEjecucion(em.servicio) } });
+    // El servicio vinculado trae `precio_interno`: se anula para quien no puede
+    // ver datos económicos (el formulario ya le oculta el campo de precio).
+    const servicioEm = puedeVerFinanzasReq(req) ? em.servicio : servicioSinPrecios(em.servicio);
+    res.json({ data: { ...em, servicio: servicioEm, ejecucion: derivarEjecucion(em.servicio) } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener emergencia' });
@@ -96,6 +113,7 @@ const listar = async (req, res) => {
           servicio: {
             include: {
               asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
+              dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' } },
               historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } },
               servicio_realizado: { select: { fecha_realizacion: true } }
             }
@@ -104,8 +122,10 @@ const listar = async (req, res) => {
       },
       req.query
     );
+    const verFinanzas = puedeVerFinanzasReq(req);
     const data = result.data.map(em => ({
       ...em,
+      servicio: verFinanzas ? em.servicio : servicioSinPrecios(em.servicio),
       ejecucion: derivarEjecucion(em.servicio)
     }));
     res.json({ ...result, data });
@@ -126,27 +146,34 @@ const crear = async (req, res) => {
     if (ascSel?.estado_operativo === 'Instalación cancelada') {
       return res.status(400).json({ error: 'Este ascensor tiene la instalación cancelada y no admite servicios.' });
     }
-    const sinCobro = d.sin_cobro === true || d.sin_cobro === 1 || d.sin_cobro === '1';
-    if (!sinCobro && (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')) {
-      return res.status(400).json({ error: 'Precio obligatorio' });
-    }
-    const precioFinal = sinCobro ? 0 : d.precio_interno;
-    // Bandera persistida "requiere factura": default del módulo Emergencias = 0
-    // (sin factura). Editable desde el formulario de creación.
-    const requiereFactura = d.requiere_factura === undefined
-      ? 0
-      : (d.requiere_factura === true || d.requiere_factura === 1 || d.requiere_factura === '1' ? 1 : 0);
+    // LA EMERGENCIA NACE SIN COSTO. Es una decisión de negocio, no un permiso:
+    // atender una emergencia no se cobra, así que el alta no pide precio a
+    // ningún rol (el formulario tampoco lo muestra) y el servicio se crea en 0
+    // con la marca `sin_cobro`. Si un caso concreto sí debe cobrarse, se ajusta
+    // después desde el servicio vinculado, que es donde vive el dato económico.
+    const sinCobro = true;
+    const precioFinal = 0;
+    // Sin cobro no hay nada que facturar: la bandera acompaña al precio en 0.
+    // Si el caso terminara cobrándose, tanto el importe como la factura se
+    // habilitan desde el servicio vinculado, no desde el alta de la emergencia.
+    const requiereFactura = 0;
 
     const tecnicos = Array.isArray(d.tecnicos) ? d.tecnicos : [];
-    const items_checklist = Array.isArray(d.items_checklist) ? d.items_checklist : [];
 
     const consistencia = validarConsistenciaAsignaciones(tecnicos);
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
 
     // Fechas de agenda: el usuario elige la fecha programada (por defecto hoy) y,
-    // opcionalmente, una fecha estimada de término para que el servicio ocupe
-    // varios días en el calendario. Sin estimada, dura solo el día programado.
-    const fechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima();
+    // opcionalmente, una fecha estimada de término. Los DÍAS DE TRABAJO pueden
+    // ser un rango, fechas sueltas o una combinación (`dias`; ver
+    // utils/programacionDias): el técnico solo verá esos días en su calendario.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const fechaProgramada = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada ? parseYMDLima(d.fecha_programada) : inicioDelDiaLima());
     const horaProgramada = d.hora_programada || hmLima();
     const fechaEstimadaEntrega = d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null;
     if (fechaEstimadaEntrega && fechaEstimadaEntrega < fechaProgramada) {
@@ -174,9 +201,12 @@ const crear = async (req, res) => {
         descripcion: d.motivo,
         fecha_programada: fechaProgramada,
         hora_programada: horaProgramada,
+        duracion_dias: fechasProgramacion ? fechasProgramacion.length : 1,
         fecha_estimada_entrega: fechaEstimadaEntrega,
         prioridad: d.nivel_urgencia || 'alta',
-        estado_servicio: tecnicos.length > 0 ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado') : 'Pendiente',
+        // Asignado exige técnico Y fecha: aquí la fecha siempre se registra al
+        // crear, así que basta con que venga algún técnico.
+        estado_servicio: tecnicos.length > 0 ? 'Asignado' : 'Pendiente',
         precio_interno: precioFinal,
         moneda: d.moneda || 'PEN',
         sin_cobro: sinCobro ? 1 : 0,
@@ -212,16 +242,16 @@ const crear = async (req, res) => {
     // (la emergencia aún no existía) y manda aquí los ids resultantes.
     await vincularAdjuntosEnTx(prisma, emergencia.id, d.archivos, req.user.id);
 
-    await prisma.tbl_calendario_eventos.create({
-      data: {
-        id_servicio: servicio.id, id_emergencia: emergencia.id,
-        titulo: `EMERGENCIA ${servicio.codigo}`,
-        tipo_evento: 'emergencia',
-        fecha_inicio: combinarFechaHoraLima(fechaProgramada, horaProgramada),
-        fecha_fin: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null,
-        estado_evento: ESTADO_EVENTO_PROGRAMADO,
-        color: '#dc2626'
-      }
+    // Grilla de días + un evento de calendario por día programado. Con un solo
+    // día se conserva el comportamiento previo (evento único que puede
+    // extenderse hasta la fecha estimada de término).
+    await sincronizarDiasYEventos(prisma, servicio.id, {
+      userId: req.user.id,
+      fechas: fechasProgramacion,
+      tituloBase: `EMERGENCIA ${servicio.codigo}`,
+      tipoEvento: 'emergencia',
+      idEmergencia: emergencia.id,
+      fechaFinEvento: fechaEstimadaEntrega ? finDelDiaLima(fechaEstimadaEntrega) : null
     });
 
     // Asignar técnicos al servicio si vienen en la creación
@@ -235,39 +265,12 @@ const crear = async (req, res) => {
             rol_asignacion: t.rol_asignacion || 'Apoyo',
             responsable_principal: t.responsable_principal ? 1 : 0,
             responsable_documentacion: t.responsable_documentacion ? 1 : 0,
-            responsable_checklist: t.responsable_checklist ? 1 : 0,
             asignado_por: req.user.id,
             user_id_registration: req.user.id
           }
         });
       }
 
-      // Crear checklist asociado
-      const tecChecklist = tecnicos.find(t => t.responsable_checklist) || tecnicos[0];
-      if (tecChecklist?.id_tecnico) {
-        const checklist = await prisma.tbl_checklists_salida.create({
-          data: {
-            id_servicio: servicio.id,
-            id_tecnico_responsable: Number(tecChecklist.id_tecnico),
-            estado_checklist: items_checklist.length > 0 ? 'En llenado' : 'Pendiente',
-            user_id_registration: req.user.id
-          }
-        });
-        for (const it of items_checklist) {
-          if (!it.nombre) continue;
-          await prisma.tbl_checklists_salida_items.create({
-            data: {
-              id_checklist: checklist.id,
-              tipo_item: it.tipo_item || 'Herramienta',
-              nombre: it.nombre,
-              cantidad: it.cantidad || 1,
-              unidad: it.unidad || 'Unidad',
-              observaciones: it.observaciones || null,
-              user_id_registration: req.user.id
-            }
-          });
-        }
-      }
     }
 
     await registrarAuditoria({
@@ -333,9 +336,17 @@ const actualizar = async (req, res) => {
     const nuevoIdAscensor = d.id_ascensor ? Number(d.id_ascensor) : (servicioPrevio?.id_ascensor ?? previo.id_ascensor);
 
     // Fechas de agenda (opcionales en el payload: si no vienen, se conservan).
-    const nuevaFechaProgramada = d.fecha_programada !== undefined
-      ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
-      : servicioPrevio?.fecha_programada;
+    // `dias` (rangos y/o fechas sueltas) manda sobre `fecha_programada`: esta
+    // pasa a ser el primer día del trabajo.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const nuevaFechaProgramada = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada !== undefined
+        ? (d.fecha_programada ? parseYMDLima(d.fecha_programada) : servicioPrevio?.fecha_programada)
+        : servicioPrevio?.fecha_programada);
     const nuevaHoraProgramada = d.hora_programada !== undefined
       ? (d.hora_programada || null)
       : servicioPrevio?.hora_programada;
@@ -357,7 +368,9 @@ const actualizar = async (req, res) => {
       }
     }
 
-    const emergenciaActualizada = await prisma.$transaction(async (tx) => {
+    let emergenciaActualizada;
+    try {
+      emergenciaActualizada = await prisma.$transaction(async (tx) => {
       const em = await tx.tbl_emergencias.update({
         where: { id },
         data: {
@@ -406,19 +419,40 @@ const actualizar = async (req, res) => {
           create: { id_servicio: servicioPrevio.id, id_ascensor: nuevoIdAscensor, monto: precioFinal, moneda: nuevaMoneda, user_id_registration: req.user.id }
         });
 
-        // Actualizar título y rango de fechas del evento de calendario
-        await tx.tbl_calendario_eventos.updateMany({
-          where: { id_servicio: servicioPrevio.id, estado: 1 },
-          data: {
-            titulo: `EMERGENCIA ${servicioPrevio.codigo}`,
-            ...(nuevaFechaProgramada ? { fecha_inicio: combinarFechaHoraLima(nuevaFechaProgramada, nuevaHoraProgramada) } : {}),
-            fecha_fin: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null,
-            user_id_modification: req.user.id, date_time_modification: new Date()
+        // Regenerar días + eventos. Qué fechas: las enviadas; si solo se movió la
+        // fecha programada, la programación vigente desplazada (conserva su
+        // forma: 10/15/20 movido una semana → 17/22/27); si no, se conserva.
+        if (nuevaFechaProgramada) {
+          let fechas = fechasProgramacion;
+          if (!fechas && d.fecha_programada !== undefined) {
+            fechas = await reprogramarConservandoForma(tx, servicioPrevio.id, {
+              nuevoInicio: ymdDeFecha(nuevaFechaProgramada)
+            });
           }
-        });
+          await sincronizarDiasYEventos(tx, servicioPrevio.id, {
+            userId: req.user.id,
+            confirmar: d.confirmar === true,
+            fechas,
+            tituloBase: `EMERGENCIA ${servicioPrevio.codigo}`,
+            tipoEvento: 'emergencia',
+            idEmergencia: previo.id,
+            fechaFinEvento: nuevaFechaEstimada ? finDelDiaLima(nuevaFechaEstimada) : null
+          });
+        }
       }
       return em;
-    });
+      }, { timeout: 20000 });
+    } catch (e) {
+      // Reprogramar dejando fuera días ya trabajados exige confirmación explícita.
+      if (e instanceof ConfirmacionRequeridaError || e.code === 'REQUIERE_CONFIRMACION') {
+        return res.status(409).json({
+          error: 'La nueva programación dejaría fuera días que ya tienen evidencia',
+          requiere_confirmacion: true,
+          dias_con_evidencia: e.diasConEvidencia || []
+        });
+      }
+      throw e;
+    }
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_emergencias', id_entidad: id,
@@ -438,7 +472,7 @@ const actualizar = async (req, res) => {
 /**
  * Soft-delete de una emergencia: estado = 0. Como cada emergencia crea y posee
  * un servicio vinculado (1:1), la baja arrastra ese servicio y TODA su cascada
- * (asignaciones, checklist, evidencias, cobro, facturas, folder contable,
+ * (asignaciones, evidencias, cobro, facturas, folder contable,
  * eventos de calendario, recordatorios) vía el motor de reversión, limpia los
  * archivos en Wasabi y libera a los técnicos sin otros servicios activos.
  * No borra físicamente: queda auditado y recuperable.

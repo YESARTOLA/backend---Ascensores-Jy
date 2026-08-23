@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
+const { puedeVerFinanzasReq, servicioSinPrecios, planMantenimientoSinFinanzas } = require('../utils/visibilidadFinanzas');
 const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
@@ -518,7 +519,22 @@ const vista360 = async (req, res) => {
       })
     ]);
 
-    res.json({ data: { ...cliente, entregas, documentos: documentosCliente } });
+    const data = { ...cliente, entregas, documentos: documentosCliente };
+    // Roles sin visibilidad financiera (Coordinador, Técnico…): la ficha 360 se
+    // entrega sin cobros ni facturas, sin el precio de cada servicio y sin el
+    // total de las cotizaciones. Se conservan código, tipo, estado y fechas.
+    if (!puedeVerFinanzasReq(req)) {
+      delete data.cobros;
+      delete data.facturas;
+      data.servicios = (data.servicios || []).map(servicioSinPrecios);
+      data.mantenimientos = (data.mantenimientos || [])
+        .map(m => planMantenimientoSinFinanzas(m, req.user));
+      data.cotizaciones = (data.cotizaciones || []).map(c => ({
+        ...c,
+        versiones: (c.versiones || []).map(({ monto_total, moneda, ...v }) => v)
+      }));
+    }
+    res.json({ data });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error en vista 360' });

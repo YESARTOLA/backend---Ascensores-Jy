@@ -34,6 +34,32 @@ const ESTADOS_FACTURACION_COMPLETA = [
   ESTADO_FACTURACION_ENVIADA
 ];
 
+// Estados en los que la emisión del comprobante TODAVÍA no está completa.
+// 'Parcialmente facturado' entra aquí: quedan cuotas por emitir.
+const ESTADOS_FACTURACION_PENDIENTE_EMISION = [
+  ESTADO_FACTURACION_SIN,
+  ESTADO_FACTURACION_PENDIENTE,
+  ESTADO_FACTURACION_PARCIAL
+];
+
+/**
+ * ¿Este servicio realizado está PENDIENTE DE FACTURAR?
+ *
+ * No basta con que su estado sea 'Sin factura': la mayoría de los servicios en
+ * ese estado están marcados "no requiere factura" (requiere_factura = 0) o son
+ * gratuitos, y no se van a facturar nunca. "Por facturar" es la emisión que
+ * realmente queda pendiente.
+ *
+ * @param {object} realizado Fila de tbl_servicios_realizados con su `servicio`.
+ */
+function esPorFacturar(realizado) {
+  const srv = realizado?.servicio;
+  if (!srv) return false;
+  if (srv.requiere_factura === 0) return false;
+  if (srv.sin_cobro === 1) return false;
+  return ESTADOS_FACTURACION_PENDIENTE_EMISION.includes(realizado.estado_facturacion);
+}
+
 function esEstadoFacturaValido(estado) {
   return ESTADOS_FACTURA.includes(estado);
 }
@@ -99,6 +125,8 @@ module.exports = {
   ESTADO_FACTURACION_FACTURADO,
   ESTADO_FACTURACION_ENVIADA,
   ESTADOS_FACTURACION_COMPLETA,
+  ESTADOS_FACTURACION_PENDIENTE_EMISION,
+  esPorFacturar,
   esEstadoFacturaValido,
   esFacturaActiva,
   esFacturado,

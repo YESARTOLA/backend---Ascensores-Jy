@@ -17,6 +17,11 @@ router.use(verificarToken);
 // POR LEAD (la Vendedora solo opera los suyos) lo aplica el controlador.
 router.get('/', permitirRoles(...ROLES_LECTURA_LEAD), c.listar);
 router.get('/vendedores', permitirRoles(...ROLES_LECTURA_LEAD), c.listarVendedores);
+// Catálogo de personas asignables (rutas ANTES de '/:id' para que no las capture).
+router.get('/asignables', permitirRoles(...ROLES_LECTURA_LEAD), c.listarAsignables);
+// Aviso de prospecto ya registrado mientras se llena el formulario. Lo consulta
+// quien da de alta o edita, por eso comparte los roles de edición.
+router.get('/duplicados', permitirRoles(...ROLES_EDICION_LEAD), c.verificarDuplicados);
 router.post('/', permitirRoles(...ROLES_ALTA_LEAD), c.crear);
 router.put('/:id', permitirRoles(...ROLES_EDICION_LEAD), c.actualizar);
 router.get('/:id/historial', permitirRoles('super_admin'), c.historial);

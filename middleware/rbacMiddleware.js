@@ -2,6 +2,8 @@
  * Middleware de control de acceso basado en roles (RBAC).
  * Recibe lista de códigos de rol permitidos (super_admin, admin, coordinador, tecnico, contabilidad).
  */
+const { ROLES_FINANZAS, puedeVerFinanzasReq } = require('../utils/visibilidadFinanzas');
+
 const permitirRoles = (...rolesPermitidos) => {
   return (req, res, next) => {
     if (!req.user) {
@@ -17,6 +19,12 @@ const permitirRoles = (...rolesPermitidos) => {
 
 const esSuperAdmin = (req, _res, _next) => req.user?.rol_codigo === 'super_admin';
 
-const puedeVerPrecio = (req) => ['super_admin', 'admin', 'contabilidad'].includes(req.user?.rol_codigo);
+// Visibilidad de datos económicos. La lista de roles vive en
+// utils/visibilidadFinanzas.js (SSoT) para que middleware, controladores y
+// sanitizadores no se desincronicen.
+const puedeVerPrecio = (req) => puedeVerFinanzasReq(req);
 
-module.exports = { permitirRoles, esSuperAdmin, puedeVerPrecio };
+/** Atajo de ruta: corta con 403 a quien no puede ver datos financieros. */
+const soloFinanzas = permitirRoles(...ROLES_FINANZAS);
+
+module.exports = { permitirRoles, esSuperAdmin, puedeVerPrecio, soloFinanzas };

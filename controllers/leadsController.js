@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_PROGRAMADO } = require('../utils/estadoEvento');
+const { puedeVerFinanzasReq } = require('../utils/visibilidadFinanzas');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { paginar } = require('../utils/paginacion');
@@ -11,10 +12,19 @@ const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { conAlcance } = require('../utils/alcanceUsuario');
 const {
   ROL_VENDEDORA,
+  ROLES_ASIGNABLES_LEAD,
   soloSusLeads,
   leadAlcanceWhere,
   puedeVerLead
 } = require('../utils/accesoLeads');
+const {
+  TIPO_DOC_RUC,
+  BUEN_PAGADOR_SIN_CALIFICAR,
+  esBuenPagadorValido,
+  ESTADOS_BUEN_PAGADOR,
+  resolverDocumento
+} = require('../utils/datosLead');
+const { buscarDuplicadosLead, mensajeDuplicados } = require('../utils/duplicadosLead');
 const {
   MAX_DOCUMENTOS,
   INCLUDE_DOCUMENTOS,
@@ -63,7 +73,9 @@ const CAMPOS_EDITABLES_LEAD = [
   { campo: 'codigo_ubigeo', etiqueta: 'Ubicación', valor: l => l.ubigeo ? `${l.ubigeo.distrito}, ${l.ubigeo.provincia}, ${l.ubigeo.departamento}` : null },
   { campo: 'id_tipo_ascensor', etiqueta: 'Tipo de ascensor', valor: l => l.tipo_ascensor?.nombre ?? null },
   { campo: 'razon_social', etiqueta: 'Razón social', valor: l => l.razon_social },
-  { campo: 'ruc', etiqueta: 'RUC', valor: l => l.ruc },
+  { campo: 'tipo_documento', etiqueta: 'Tipo de documento', valor: l => l.tipo_documento },
+  { campo: 'ruc', etiqueta: 'RUC / DNI', valor: l => l.ruc },
+  { campo: 'buen_pagador', etiqueta: 'Referencia de pago', valor: l => l.buen_pagador },
   { campo: 'nombre_proyecto', etiqueta: 'Nombre del proyecto', valor: l => l.nombre_proyecto },
   { campo: 'id_tipo_servicio_solicitado', etiqueta: 'Tipo de servicio solicitado', valor: l => l.tipo_servicio?.nombre ?? null },
   { campo: 'cliente_existente', etiqueta: '¿Cliente existente?', valor: l => (l.cliente_existente ? 'Sí' : 'No') },
@@ -95,7 +107,7 @@ async function resolverVendedorAsignado(valor, actual = null) {
   if (!id) return { error: 'La vendedora asignada no es válida' };
   if (actual !== null && id === actual) return { id_vendedor: actual };
   const usuario = await prisma.tbl_usuarios.findFirst({
-    where: { id, estado: 1, rol: { is: { codigo: ROL_VENDEDORA } } },
+    where: { id, estado: 1, rol: { is: { codigo: { in: ROLES_ASIGNABLES_LEAD } } } },
     select: { id: true }
   });
   if (!usuario) return { error: 'La vendedora asignada no existe o no está activa' };
@@ -114,17 +126,24 @@ async function cargarLeadPermitido(req, id, include = undefined) {
 
 // Valida y normaliza los campos comerciales del lead (ubicación por ubigeo,
 // tipo de ascensor, correo, empresa del prospecto y nombre del proyecto).
-// Con `requeridos: true` (alta) exige ubicación y tipo de ascensor; en la
+// El lead es el punto de captura: solo exige contacto (nombre, teléfono,
+// correo) y tipo de ascensor. La ubicación y el resto de datos comerciales son
+// opcionales aquí y se piden como obligatorios recién al convertirlo a cliente
+// (wizard cliente → edificio → ascensor → servicio).
+// Con `requeridos: true` (alta) exige tipo de ascensor y correo; en la
 // actualización solo valida lo que viene en el payload (update parcial).
 async function resolverCamposComerciales(d, { requeridos }) {
   const data = {};
 
+  // Ubicación opcional: si llega vacía se guarda sin ubigeo; al convertir, el
+  // distrito lo pide el edificio.
   if (requeridos || d.codigo_ubigeo !== undefined) {
     const codigo = String(d.codigo_ubigeo || '').trim();
-    if (!codigo) return { error: 'La ubicación (departamento, provincia y distrito) es obligatoria' };
-    const ubigeo = await prisma.tbl_ubigeo_peru.findUnique({ where: { codigo } });
-    if (!ubigeo) return { error: 'El distrito seleccionado no es válido' };
-    data.codigo_ubigeo = codigo;
+    if (codigo) {
+      const ubigeo = await prisma.tbl_ubigeo_peru.findUnique({ where: { codigo } });
+      if (!ubigeo) return { error: 'El distrito seleccionado no es válido' };
+    }
+    data.codigo_ubigeo = codigo || null;
   }
 
   if (requeridos || d.id_tipo_ascensor !== undefined) {
@@ -137,23 +156,37 @@ async function resolverCamposComerciales(d, { requeridos }) {
 
   if (requeridos || d.correo !== undefined) {
     const correo = String(d.correo || '').trim();
-    if (correo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    if (!correo) return { error: 'El correo es obligatorio' };
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
       return { error: 'El correo no tiene un formato válido' };
     }
-    data.correo = correo || null;
+    data.correo = correo;
   }
 
-  // La empresa (razón social + RUC) solo aplica a prospectos: si el lead se
-  // vincula a un cliente existente esos datos viven en el cliente.
+  // La empresa (razón social + documento) solo aplica a prospectos: si el lead
+  // se vincula a un cliente existente esos datos viven en el cliente.
+  // El prospecto puede ser empresa (RUC) o persona natural (DNI): el par
+  // tipo/número lo valida `resolverDocumento`.
   const esClienteExistente = !!d.cliente_existente;
-  if (requeridos || d.razon_social !== undefined || d.ruc !== undefined || d.cliente_existente !== undefined) {
+  if (requeridos || d.razon_social !== undefined || d.ruc !== undefined
+      || d.tipo_documento !== undefined || d.cliente_existente !== undefined) {
     const razonSocial = esClienteExistente ? '' : String(d.razon_social || '').trim();
-    const ruc = esClienteExistente ? '' : String(d.ruc || '').trim();
-    if (ruc && !/^\d{11}$/.test(ruc)) {
-      return { error: 'El RUC debe tener 11 dígitos numéricos' };
-    }
+    const documento = esClienteExistente
+      ? { tipo_documento: null, numero: null }
+      : resolverDocumento(d.tipo_documento, d.ruc);
+    if (documento.error) return { error: documento.error };
     data.razon_social = razonSocial || null;
-    data.ruc = ruc || null;
+    data.tipo_documento = documento.tipo_documento;
+    data.ruc = documento.numero;
+  }
+
+  // Referencia comercial informativa. No se toca si el payload no la trae.
+  if (requeridos || d.buen_pagador !== undefined) {
+    const valor = String(d.buen_pagador || '').trim() || BUEN_PAGADOR_SIN_CALIFICAR;
+    if (!esBuenPagadorValido(valor)) {
+      return { error: `La referencia de pago debe ser: ${ESTADOS_BUEN_PAGADOR.join(', ')}` };
+    }
+    data.buen_pagador = valor;
   }
 
   if (requeridos || d.nombre_proyecto !== undefined) {
@@ -170,8 +203,10 @@ async function resolverCamposComerciales(d, { requeridos }) {
 //   id_vendedor   — vendedor asignado (exacto)
 //   provincia     — provincia del proyecto (vía relación ubigeo)
 //   codigo_ubigeo — distrito del proyecto (preciso; implica su provincia)
+//   buen_pagador  — referencia comercial (Buen pagador / No es buen pagador /
+//                   Sin calificar)
 function construirWhereLeads(query) {
-  const { q, id_vendedor, provincia, codigo_ubigeo, id_padre } = query;
+  const { q, id_vendedor, provincia, codigo_ubigeo, id_padre, buen_pagador } = query;
   const where = { estado: 1 };
   const qLimpio = (q || '').trim();
   if (qLimpio) {
@@ -192,6 +227,7 @@ function construirWhereLeads(query) {
   // cuyo padre es ese id; ausente/'todos' = sin filtro.
   if (id_padre === 'sin') where.id_tipo_servicio_solicitado = null;
   else if (id_padre) where.tipo_servicio = { is: { id_padre: Number(id_padre) } };
+  if (buen_pagador && esBuenPagadorValido(buen_pagador)) where.buen_pagador = buen_pagador;
   return where;
 }
 
@@ -250,17 +286,32 @@ const crear = async (req, res) => {
     if (!d.nombre_contacto || !d.telefono) {
       return res.status(400).json({ error: 'Nombre y teléfono son obligatorios' });
     }
-    // El tipo (padre) + subtipo de servicio es obligatorio al crear el lead.
+    // El tipo (padre) + subtipo de servicio es OPCIONAL al crear el lead: en la
+    // primera consulta muchas veces todavía no se sabe qué se va a contratar.
+    // Se vuelve obligatorio al convertir el lead (POST /:id/convertir).
     // Se persiste el subtipo; el padre se deriva de él (tipo_servicio.id_padre).
-    if (!d.id_tipo_servicio_solicitado) {
-      return res.status(400).json({ error: 'Debe seleccionar el tipo y subtipo de servicio solicitado' });
-    }
-    const subtipo = await prisma.tbl_tipos_servicio.findUnique({ where: { id: Number(d.id_tipo_servicio_solicitado) } });
-    if (!subtipo || subtipo.estado !== 1 || subtipo.id_padre == null) {
-      return res.status(400).json({ error: 'El subtipo de servicio solicitado no es válido' });
+    if (d.id_tipo_servicio_solicitado) {
+      const subtipo = await prisma.tbl_tipos_servicio.findUnique({ where: { id: Number(d.id_tipo_servicio_solicitado) } });
+      if (!subtipo || subtipo.estado !== 1 || subtipo.id_padre == null) {
+        return res.status(400).json({ error: 'El subtipo de servicio solicitado no es válido' });
+      }
     }
     const comerciales = await resolverCamposComerciales(d, { requeridos: true });
     if (comerciales.error) return res.status(400).json({ error: comerciales.error });
+    // Un prospecto ya registrado (como lead o como cliente) no se vuelve a dar
+    // de alta: se responde 409 con las coincidencias para que el usuario abra
+    // el registro existente en vez de duplicar la cartera.
+    const duplicados = await buscarDuplicadosLead({
+      telefono: d.telefono,
+      nombre: d.nombre_contacto,
+      razon_social: comerciales.data.razon_social,
+      documento: comerciales.data.ruc
+    // Si el lead se declara de un cliente existente, compartir sus datos con
+    // ese cliente no es un duplicado: es la vinculación esperada.
+    }, { excluirClienteId: d.cliente_existente && d.id_cliente ? Number(d.id_cliente) : null });
+    if (duplicados.length > 0) {
+      return res.status(409).json({ error: mensajeDuplicados(duplicados), duplicados });
+    }
     // Vendedora asignada: determina quién podrá ver y convertir este lead.
     const vendedor = await resolverVendedorAsignado(d.id_vendedor);
     if (vendedor.error) return res.status(400).json({ error: vendedor.error });
@@ -299,6 +350,32 @@ const actualizar = async (req, res) => {
     const previo = acceso.lead;
     const comerciales = await resolverCamposComerciales(d, { requeridos: false });
     if (comerciales.error) return res.status(400).json({ error: comerciales.error });
+    // Mismo control que en el alta, pero SOLO sobre los datos que esta edición
+    // cambia. Un lead que ya venía coincidiendo con otro registro (la cartera
+    // histórica tiene duplicados, y convertir un lead crea un cliente con sus
+    // mismos datos) debe poder seguir corrigiéndose en el resto de campos: si
+    // se validara todo, esos leads quedarían imposibles de editar.
+    const nuevos = {
+      telefono: d.telefono ?? previo.telefono,
+      nombre: d.nombre_contacto ?? previo.nombre_contacto,
+      razon_social: 'razon_social' in comerciales.data ? comerciales.data.razon_social : previo.razon_social,
+      documento: 'ruc' in comerciales.data ? comerciales.data.ruc : previo.ruc
+    };
+    const cambiados = {
+      telefono: nuevos.telefono !== previo.telefono ? nuevos.telefono : null,
+      nombre: nuevos.nombre !== previo.nombre_contacto ? nuevos.nombre : null,
+      razon_social: nuevos.razon_social !== previo.razon_social ? nuevos.razon_social : null,
+      documento: nuevos.documento !== previo.ruc ? nuevos.documento : null
+    };
+    if (Object.values(cambiados).some(Boolean)) {
+      const duplicados = await buscarDuplicadosLead(cambiados, {
+        excluirLeadId: id,
+        excluirClienteId: previo.id_cliente || null
+      });
+      if (duplicados.length > 0) {
+        return res.status(409).json({ error: mensajeDuplicados(duplicados), duplicados });
+      }
+    }
     // La asignación de vendedora la decide la Central de ventas / administración:
     // la Vendedora conserva la suya (si pudiera cambiarla, se quitaría el lead a
     // sí misma o se lo pasaría a otra sin control).
@@ -414,10 +491,12 @@ const convertir = async (req, res) => {
     if (!d.id_cliente || !d.id_ascensor || !d.id_tipo_servicio || !d.fecha_programada) {
       return res.status(400).json({ error: 'Faltan datos para convertir (cliente, ascensor, subtipo, fecha)' });
     }
-    // El precio es opcional: roles comerciales (Vendedora) no manejan precios.
-    // Si no llega, el servicio se crea con 0 (default de la columna) y el precio
-    // lo completa luego un rol con visibilidad de precios.
-    const precioInterno = (d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')
+    // El precio es opcional: los roles sin visibilidad financiera (Vendedora,
+    // Coordinador) no manejan precios. Si no llega —o llega desde un rol que no
+    // puede fijarlo— el servicio se crea con 0 y lo completa luego un rol con
+    // visibilidad de precios.
+    const precioInterno = (!puedeVerFinanzasReq(req)
+      || d.precio_interno === undefined || d.precio_interno === null || d.precio_interno === '')
       ? 0
       : d.precio_interno;
 
@@ -768,8 +847,52 @@ const listarVendedores = async (req, res) => {
   }
 };
 
+/**
+ * Verificación de duplicados EN VIVO para el formulario de leads: devuelve las
+ * coincidencias de teléfono / nombre / documento contra la cartera de leads y
+ * de clientes, sin crear nada. El alta y la edición vuelven a comprobarlo por
+ * su cuenta: esto es solo para avisar mientras se escribe.
+ */
+const verificarDuplicados = async (req, res) => {
+  try {
+    const { telefono, nombre, razon_social, documento, excluir_id } = req.query;
+    const duplicados = await buscarDuplicadosLead(
+      { telefono, nombre, razon_social, documento },
+      { excluirLeadId: excluir_id ? Number(excluir_id) : null }
+    );
+    res.json({ data: duplicados });
+  } catch (err) {
+    console.error('[leads.verificarDuplicados]', err);
+    res.status(500).json({ error: 'Error al verificar duplicados' });
+  }
+};
+
+/**
+ * Personas a las que se puede ASIGNAR un lead: usuarios activos cuyo rol puede
+ * trabajarlo y convertirlo (ver ROLES_ASIGNABLES_LEAD). Vive en el módulo de
+ * leads —y no en /usuarios— porque la Central de ventas es un rol confinado a
+ * este módulo, y porque el selector debe seguir el criterio del negocio, no el
+ * catálogo genérico de usuarios.
+ */
+const listarAsignables = async (_req, res) => {
+  try {
+    const usuarios = await prisma.tbl_usuarios.findMany({
+      where: { estado: 1, rol: { is: { codigo: { in: ROLES_ASIGNABLES_LEAD } } } },
+      select: { id: true, nombres: true, rol: { select: { codigo: true, nombre: true } } },
+      orderBy: { nombres: 'asc' }
+    });
+    res.json({
+      data: usuarios.map(u => ({ id: u.id, nombres: u.nombres.trim(), rol: u.rol?.nombre || null }))
+    });
+  } catch (err) {
+    console.error('[leads.listarAsignables]', err);
+    res.status(500).json({ error: 'Error al listar las vendedoras asignables' });
+  }
+};
+
 module.exports = {
   listar, crear, actualizar, historial, convertir, cambiarEstado,
+  verificarDuplicados, listarAsignables,
   listarCotizaciones, subirCotizacion,
   listarDocumentos, agregarDocumentos, eliminarDocumento,
   listarVendedores

@@ -1,6 +1,9 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_FINALIZADO, ESTADO_EVENTO_CANCELADO } = require('../utils/estadoEvento');
 const { registrarAuditoria } = require('../utils/auditoria');
+// Roles con visibilidad de datos económicos (SSoT compartido con el resto del backend).
+const { ROLES_FINANZAS: ROLES_PRECIO } = require('../utils/visibilidadFinanzas');
+const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const {
   cambiarEstadoServicio,
@@ -8,9 +11,10 @@ const {
   esServicioEditable,
   esServicioPostRevision,
   estaServicioFinalizado,
-  ESTADO_SERVICIO_FINALIZADO_TECNICO,
-  ESTADO_SERVICIO_FINALIZADO_OBSERVADO,
+  ESTADO_SERVICIO_PENDIENTE,
+  ESTADO_SERVICIO_ASIGNADO,
   ESTADO_SERVICIO_EN_CURSO,
+  ESTADO_SERVICIO_FINALIZADO,
   ESTADOS_SERVICIO,
   ESTADO_ADMIN_REVISADO,
   ESTADO_ADMIN_OBSERVADO,
@@ -26,9 +30,12 @@ const {
 const {
   ESTADO_FACTURA_ANULADA,
   ESTADO_FACTURACION_SIN,
-  calcularEstadoFacturacion
+  calcularEstadoFacturacion,
+  esPorFacturar,
+  esFacturado
 } = require('../utils/estadoFactura');
-const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC } = require('../utils/tiempo');
+const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const {
   sincronizarRecordatorioServicio,
@@ -38,20 +45,25 @@ const {
 } = require('../utils/recordatoriosAuto');
 const {
   sincronizarDiasYEventos,
-  diasSinEvidencia,
+  fechasProgramadas,
+  reprogramarConservandoForma,
   ConfirmacionRequeridaError
 } = require('../utils/diasServicio');
+const {
+  normalizarProgramacion,
+  agruparEnTramos,
+  ProgramacionInvalidaError
+} = require('../utils/programacionDias');
 const { paginar } = require('../utils/paginacion');
+const { registrarActividadTecnico } = require('../utils/actividadTecnico');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
-const { aplicaAlcance, aplicaAlcanceEdificio, tiposRegistroPermitidos, tiposEdificioPermitidos, porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { aplicaAlcance, aplicaAlcanceEdificio, tiposRegistroPermitidos, puedeVerTipoRegistro, tiposEdificioPermitidos, porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere, servicioVisiblePorEdificio } = require('../utils/visibilidadEdificio');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
-const { _recalcEstadoChecklist } = require('./checklistController');
 const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
 const { datosSitioParaServicio, normalizarCuartoMaquinas } = require('../utils/datosSitioAscensor');
-const { ensureChecklistFinalizacion } = require('./checklistFinalizacionController');
 const configuracion = require('../utils/configuracion');
 const { estadoPlazoCierre } = require('../utils/plazoCierre');
 
@@ -62,6 +74,17 @@ const { estadoPlazoCierre } = require('../utils/plazoCierre');
 async function plazoCierreDeServicio(servicio) {
   const dias = await configuracion.obtener('SERVICIO_CIERRE_PLAZO_DIAS');
   return estadoPlazoCierre(servicio, dias);
+}
+
+/**
+ * N días corridos desde una fecha, en 'YYYY-MM-DD'. Es la semántica del campo
+ * legacy `duracion_dias` cuando el formulario no manda una programación por
+ * tramos: el trabajo ocupa N días seguidos desde la fecha programada.
+ */
+function diasCorridos(fechaInicio, n) {
+  const inicio = ymdDeFecha(fechaInicio);
+  if (!inicio) return null;
+  return Array.from({ length: Math.max(1, Number(n) || 1) }, (_, i) => addDiasYMD(inicio, i));
 }
 
 /**
@@ -128,8 +151,6 @@ async function resolverAscensoresProyectoEnTx(tx, ascensores, idCliente, userId)
   return ids;
 }
 
-const ROLES_PRECIO = ['super_admin', 'admin', 'contabilidad'];
-
 function sanitizarPrecio(servicio, rolCodigo) {
   if (!servicio) return servicio;
   if (ROLES_PRECIO.includes(rolCodigo)) return servicio;
@@ -155,21 +176,35 @@ function sanitizarPrecio(servicio, rolCodigo) {
 }
 
 /**
- * Para el rol técnico, retira del detalle todo bloque económico (cobros y
- * facturas, con sus montos, pagos y cuotas). Complementa a `sanitizarPrecio`
- * (que solo anula precio_interno/monto): el técnico únicamente ve la información
- * operativa de sus servicios/proyectos asignados, nada económico.
+ * Retira del detalle todo bloque económico (cobros y facturas, con sus montos,
+ * pagos y cuotas) para los roles sin visibilidad financiera. Complementa a
+ * `sanitizarPrecio` (que solo anula precio_interno/monto): el técnico y el
+ * coordinador únicamente ven la información operativa del servicio.
+ *
+ * De la cotización de origen les llega SOLO el alcance del trabajo: los ítems y
+ * las fotos de esos ítems. Los archivos ADJUNTOS de la cotización no viajan —ni
+ * siquiera las imágenes—: son el expediente comercial del acuerdo (cotización
+ * firmada, orden de compra, presupuestos, capturas de conversaciones) y no hacen
+ * falta para ejecutar el trabajo.
+ *
+ * Diferencia entre ambos respecto a la cotización de origen:
+ *  - técnico: no ve ni el código ni el enlace (solo ítems y fotos, más abajo).
+ *  - coordinador: sí ve el código y puede abrir la cotización, que el módulo de
+ *    cotizaciones le entrega igualmente sin adjuntos ni datos financieros.
  */
-function sanitizarEconomicoTecnico(servicio, rolCodigo) {
-  if (!servicio || rolCodigo !== 'tecnico') return servicio;
+function sanitizarEconomico(servicio, rolCodigo) {
+  if (!servicio || ROLES_PRECIO.includes(rolCodigo)) return servicio;
   const clon = { ...servicio };
   delete clon.cobro;
   delete clon.facturas;
-  // El técnico no ve la cotización de origen (ni su código ni el enlace), pero
-  // sí sus ítems y sus fotos: se conservan `versiones` y `archivos`.
   if (clon.cotizacion) {
-    const { id, codigo, estado_global, ...restoCot } = clon.cotizacion;
-    clon.cotizacion = restoCot;
+    // Ningún adjunto de la cotización viaja al servicio: lo operativo son los
+    // ítems y sus fotos, que van dentro de cada versión.
+    clon.cotizacion = { ...clon.cotizacion, archivos: [] };
+    if (rolCodigo === 'tecnico') {
+      const { id, codigo, estado_global, ...restoCot } = clon.cotizacion;
+      clon.cotizacion = restoCot;
+    }
   }
   return clon;
 }
@@ -243,7 +278,11 @@ const listar = async (req, res) => {
           cliente: { select: { id: true, nombre: true, telefono: true, whatsapp: true } },
           ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true, distrito: true, direccion: true } } } } } },
           tipo_servicio: true,
-          asignaciones: { where: { estado: 1 }, include: { tecnico: true } }
+          asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
+          // Días programados: el panel del técnico agrupa por ellos ("hoy",
+          // "próximos 7 días"). Con días no corridos, `fecha_programada` solo
+          // marca el primero y no basta para saber si se trabaja hoy.
+          dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' }, select: { id: true, orden: true, fecha: true } }
         }
       },
       req.query
@@ -254,6 +293,67 @@ const listar = async (req, res) => {
     res.status(500).json({ error: 'Error al listar servicios' });
   }
 };
+
+/**
+ * Correctivos anteriores del MISMO ascensor, para mostrarlos como antecedentes
+ * en el detalle de un correctivo. Excluye el que se está viendo.
+ *
+ * Devuelve la falla reportada y, cuando el servicio ya se ejecutó, lo que el
+ * técnico dejó escrito (observaciones y descargo): sin eso el historial diría
+ * qué se rompió pero no qué se hizo, que es la mitad útil.
+ *
+ * No lleva ningún dato económico, así que sirve igual para el técnico —que no
+ * ve precios— sin pasar por los sanitizadores.
+ */
+async function correctivosDelAscensor(idAscensor, idCorrectivoActual) {
+  const previos = await prisma.tbl_correctivos.findMany({
+    where: {
+      estado: 1,
+      id_ascensor: idAscensor,
+      id: { not: idCorrectivoActual }
+    },
+    orderBy: { fecha_reporte: 'desc' },
+    take: 50,
+    select: {
+      id: true,
+      falla: true,
+      nivel_urgencia: true,
+      estado_correctivo: true,
+      fecha_reporte: true,
+      servicio: {
+        select: {
+          id: true,
+          codigo: true,
+          estado_servicio: true,
+          fecha_programada: true,
+          asignaciones: {
+            where: { estado: 1 },
+            select: { tecnico: { select: { id: true, nombre: true } } }
+          },
+          servicio_realizado: {
+            select: { fecha_realizacion: true, observaciones_tecnicas: true, descargo_tecnico: true }
+          }
+        }
+      }
+    }
+  });
+  // Se aplana lo que la UI necesita para pintar una fila, en vez de obligarla a
+  // navegar tres niveles de relación por cada ítem.
+  return previos.map(c => ({
+    id: c.id,
+    id_servicio: c.servicio?.id || null,
+    codigo: c.servicio?.codigo || null,
+    falla: c.falla,
+    nivel_urgencia: c.nivel_urgencia,
+    estado_correctivo: c.estado_correctivo,
+    estado_servicio: c.servicio?.estado_servicio || null,
+    fecha_reporte: c.fecha_reporte,
+    fecha_realizacion: c.servicio?.servicio_realizado?.fecha_realizacion || null,
+    observaciones_tecnicas: c.servicio?.servicio_realizado?.observaciones_tecnicas || null,
+    descargo_tecnico: c.servicio?.servicio_realizado?.descargo_tecnico || null,
+    tecnicos: (c.servicio?.asignaciones || []).map(a => a.tecnico?.nombre).filter(Boolean)
+  }));
+}
 
 const obtener = async (req, res) => {
   try {
@@ -316,24 +416,25 @@ const obtener = async (req, res) => {
         correctivo: { select: { id: true, id_ascensor: true, falla: true, nivel_urgencia: true, estado_correctivo: true, fecha_reporte: true } },
         asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
         dias: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
-        checklists: { include: { items: { where: { estado: 1 } } } },
         guias: { include: { archivo: true, tecnico: true } },
         evidencias: { where: { estado: 1 }, include: { archivo: true, tecnico: true } },
         entregas: { include: { archivo: true } },
         cobro: { include: { pagos: { where: { estado: 1 }, include: { archivo: true } }, cuotas: { where: { estado: 1 } } } },
         facturas: { include: { archivo: true } },
         historial_estados: { orderBy: { fecha_cambio: 'desc' } },
-        servicio_realizado: { include: { archivo_ot: true } },
+        // La OT es del servicio, no del folder contable (relación "ServicioOt").
+        archivo_ot: true,
+        servicio_realizado: true,
         finalizacion_checklist: { include: { archivo_pdf: { select: { id: true, nombre_original: true, ruta_almacenamiento: true, mime_type: true } } } }
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
     // Ámbito: un servicio/proyecto fuera del ámbito no es accesible ni por URL.
-    if (aplicaAlcance(req.user)) {
-      const permitidos = tiposRegistroPermitidos(req.user);
-      if (!permitidos.includes(servicio.tipo_registro)) {
-        return res.status(404).json({ error: 'Servicio no encontrado' });
-      }
+    // Vía `puedeVerTipoRegistro`, que ya contempla el caso "rol acotado pero con
+    // TODOS los ámbitos habilitados" — ahí `tiposRegistroPermitidos` devuelve
+    // null (sin restricción) y llamar a .includes() sobre él reventaba con un 500.
+    if (!puedeVerTipoRegistro(req.user, servicio.tipo_registro)) {
+      return res.status(404).json({ error: 'Servicio no encontrado' });
     }
     // Un servicio/proyecto de un edificio inactivo no es accesible (salvo super_admin).
     if (!servicioVisiblePorEdificio(req.user, servicio)) {
@@ -354,7 +455,7 @@ const obtener = async (req, res) => {
       const asignado = (servicio.asignaciones || []).some(a => a.id_tecnico === req.user.id_tecnico);
       if (!asignado) return res.status(404).json({ error: 'Servicio no encontrado' });
     }
-    const data = sanitizarEconomicoTecnico(
+    const data = sanitizarEconomico(
       sanitizarPrecio(servicio, req.user.rol_codigo),
       req.user.rol_codigo
     );
@@ -362,6 +463,16 @@ const obtener = async (req, res) => {
     // lo habilitó fuera de plazo). Lo consume el panel del técnico para explicar
     // el bloqueo y el detalle del servicio para ofrecer la habilitación.
     data.plazo_cierre = await plazoCierreDeServicio(servicio);
+    // Antecedentes del EQUIPO: si esto es un correctivo, qué otros correctivos
+    // se le hicieron al mismo ascensor. El técnico llega a la máquina sabiendo
+    // qué se le reportó y qué se hizo antes, que es lo que evita repetir un
+    // diagnóstico ya descartado. Se calcula solo para correctivos.
+    if (servicio.correctivo?.id_ascensor) {
+      data.historial_correctivos_ascensor = await correctivosDelAscensor(
+        servicio.correctivo.id_ascensor,
+        servicio.correctivo.id
+      );
+    }
     res.json({ data });
   } catch (err) {
     console.error(err);
@@ -415,8 +526,20 @@ const crear = async (req, res) => {
     const tipoRegistro = clasificacion.tipo_registro;
     const origenDerivado = clasificacion.modulo_asociado || 'directo';
 
-    // Duración en días (consecutivos desde la fecha programada). Default 1.
-    const duracionDias = Math.max(1, parseInt(d.duracion_dias, 10) || 1);
+    // Programación de los días de trabajo. `dias` admite rangos y/o fechas
+    // sueltas en cualquier combinación (ver utils/programacionDias); si no viene,
+    // se conserva el formato clásico fecha_programada + duracion_dias corridos.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    const duracionDias = fechasProgramacion
+      ? fechasProgramacion.length
+      : Math.max(1, parseInt(d.duracion_dias, 10) || 1);
+    // La fecha programada es SIEMPRE el primer día del trabajo: con programación
+    // por tramos se deriva de ella, no del campo suelto del formulario.
+    const fechaProgramadaInicial = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : parseYMDLima(d.fecha_programada);
 
     // Ámbito: un usuario acotado no puede crear registros fuera de su ámbito.
     const permitidosCrear = tiposRegistroPermitidos(req.user);
@@ -445,7 +568,7 @@ const crear = async (req, res) => {
             origen: origenDerivado,
             titulo: d.titulo || `Servicio ${codigo}`,
             descripcion: d.descripcion || null,
-            fecha_programada: parseYMDLima(d.fecha_programada),
+            fecha_programada: fechaProgramadaInicial,
             hora_programada: d.hora_programada || null,
             duracion_dias: duracionDias,
             fecha_estimada_entrega: d.fecha_estimada_entrega ? parseYMDLima(d.fecha_estimada_entrega) : null,
@@ -475,7 +598,7 @@ const crear = async (req, res) => {
           idsAscensores,
           idCliente: Number(d.id_cliente),
           horaProgramada: d.hora_programada || null,
-          fechaProgramada: parseYMDLima(d.fecha_programada),
+          fechaProgramada: fechaProgramadaInicial,
           usuarioId: req.user.id,
           datosModulo: d,
           origenEtiqueta: `servicio ${codigo}`
@@ -493,8 +616,10 @@ const crear = async (req, res) => {
     // Solo registrar en calendario, historiales y notificar a otros módulos si NO es borrador.
     // Los borradores quedan invisibles para todos los flujos operativos hasta promoverse.
     if (!esBorrador) {
-      // Genera la grilla de días (1..N) y un evento de calendario por día.
-      await sincronizarDiasYEventos(prisma, servicio.id, { userId: req.user.id });
+      // Genera la grilla de días programados y un evento de calendario por día.
+      await sincronizarDiasYEventos(prisma, servicio.id, {
+        userId: req.user.id, fechas: fechasProgramacion
+      });
       sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync recordatorio:', err));
 
       await prisma.tbl_clientes_historial.create({
@@ -515,6 +640,13 @@ const crear = async (req, res) => {
           }
         });
       }
+    } else if (fechasProgramacion) {
+      // Borrador con programación por tramos: se guarda la grilla de días para no
+      // perder las fechas cargadas, pero SIN eventos de calendario (el borrador
+      // sigue invisible en la agenda). Al promoverlo se crean sus eventos.
+      await sincronizarDiasYEventos(prisma, servicio.id, {
+        userId: req.user.id, fechas: fechasProgramacion, sinEventos: true
+      });
     }
 
     await prisma.tbl_servicios_estados_historial.create({
@@ -673,7 +805,7 @@ const actualizar = async (req, res) => {
     }
 
     // Gate de estado: solo se edita en estados pre-ejecución. Una vez que el
-    // servicio sale a campo (En camino / En curso / Finalizado...) la edición
+    // servicio sale a campo (En curso / Finalizado...) la edición
     // libre rompería historial, evidencias, guías, cobros y facturación.
     if (!esServicioEditable(previo.estado_servicio)) {
       return res.status(409).json({
@@ -693,11 +825,22 @@ const actualizar = async (req, res) => {
       if (!validacion.ok) return res.status(400).json({ error: validacion.error });
     }
 
-    const nuevaFechaProgramada = d.fecha_programada ? parseYMDLima(d.fecha_programada) : previo.fecha_programada;
+    // Programación de los días de trabajo. `dias` (rangos y/o fechas sueltas)
+    // manda sobre fecha_programada/duracion_dias: la fecha programada pasa a ser
+    // el primer día del tramo y la duración, la cantidad de días programados.
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(d.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const nuevaFechaProgramada = fechasProgramacion
+      ? parseYMDLima(fechasProgramacion[0])
+      : (d.fecha_programada ? parseYMDLima(d.fecha_programada) : previo.fecha_programada);
     const nuevaHoraProgramada = d.hora_programada ?? previo.hora_programada;
-    const nuevaDuracionDias = d.duracion_dias !== undefined
-      ? Math.max(1, parseInt(d.duracion_dias, 10) || 1)
-      : previo.duracion_dias;
+    const nuevaDuracionDias = fechasProgramacion
+      ? fechasProgramacion.length
+      : (d.duracion_dias !== undefined
+        ? Math.max(1, parseInt(d.duracion_dias, 10) || 1)
+        : previo.duracion_dias);
     const cambiaDuracion = nuevaDuracionDias !== previo.duracion_dias;
     // `fecha_programada` puede ser null (servicio aprobado sin programar): la
     // comparación debe ser null-safe para no romper al registrar la fecha.
@@ -774,11 +917,34 @@ const actualizar = async (req, res) => {
     // llevar al calendario. No aplica a borradores (no tienen días/eventos).
     if (previo.estado_servicio !== 'Borrador') {
       const cambiaTitulo = d.titulo !== undefined && d.titulo !== previo.titulo;
-      if ((cambiaFechaHora || cambiaTitulo || cambiaDuracion) && nuevaFechaProgramada) {
+      if ((cambiaFechaHora || cambiaTitulo || cambiaDuracion || fechasProgramacion) && nuevaFechaProgramada) {
+        // Qué fechas materializar:
+        //  - `dias` explícitos: mandan tal cual;
+        //  - cambió la duración sin `dias`: días corridos desde la fecha (clásico);
+        //  - solo se movió la fecha: se desplaza la programación vigente
+        //    conservando su forma (10/15/20 movido una semana → 17/22/27);
+        //  - nada de lo anterior: null, se conserva la grilla y solo se
+        //    re-etiquetan los eventos (cambio de título/hora).
+        let fechas = fechasProgramacion;
+        if (!fechas && !cambiaDuracion && cambiaFechaHora && d.fecha_programada !== undefined) {
+          fechas = await reprogramarConservandoForma(prisma, id, {
+            nuevoInicio: String(d.fecha_programada).substring(0, 10)
+          });
+        }
+        if (!fechas && cambiaDuracion) {
+          fechas = diasCorridos(nuevaFechaProgramada, nuevaDuracionDias);
+        }
         // `actualizar` solo opera en estados pre-campo (esServicioEditable), donde
         // aún no hay evidencia: regenerar es seguro sin pedir confirmación.
-        await sincronizarDiasYEventos(prisma, id, { userId: req.user.id, confirmar: true });
+        await sincronizarDiasYEventos(prisma, id, { userId: req.user.id, confirmar: true, fechas });
       }
+    } else if (fechasProgramacion || cambiaDuracion) {
+      // El borrador conserva su programación en la grilla, todavía sin llevarla al
+      // calendario (ver `crear`). Los eventos se crean al promoverlo.
+      await sincronizarDiasYEventos(prisma, id, {
+        userId: req.user.id, confirmar: true, sinEventos: true,
+        fechas: fechasProgramacion || diasCorridos(nuevaFechaProgramada, nuevaDuracionDias)
+      });
     }
 
     await registrarAuditoria({
@@ -831,27 +997,49 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
+/**
+ * Asigna los técnicos de un servicio y, con ellos, su fecha de programación.
+ *
+ * "Asignado" significa que el trabajo YA se puede ejecutar, y eso exige las dos
+ * cosas a la vez: alguien que lo haga y un día en que hacerlo. Por eso la fecha
+ * viaja en el mismo formulario que los técnicos: sin días programados el
+ * servicio se queda en "Pendiente" aunque tenga técnico, porque no habría nada
+ * en la agenda de nadie.
+ *
+ * Body: { tecnicos: [...], dias?: [...], fecha_programada?, hora_programada? }
+ * `dias` admite rangos y fechas sueltas (ver utils/programacionDias); si no
+ * viene, se conserva la programación que ya tuviera el servicio.
+ */
 const asignarTecnicos = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { tecnicos = [], items_checklist = [] } = req.body;
+    const { tecnicos = [] } = req.body;
     if (!Array.isArray(tecnicos) || tecnicos.length === 0) {
       return res.status(400).json({ error: 'Debe asignar al menos un técnico' });
     }
 
-    const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({ where: { id }, select: { estado_servicio: true } });
+    const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: { estado_servicio: true, fecha_programada: true, hora_programada: true }
+    });
     if (!servicioActual) return res.status(404).json({ error: 'Servicio no encontrado' });
     if (servicioActual.estado_servicio === 'Borrador') {
       return res.status(400).json({ error: 'Debe promover el borrador antes de asignar técnicos' });
     }
     if (estaServicioFinalizado(servicioActual.estado_servicio)) {
       return res.status(400).json({
-        error: `El servicio está ${servicioActual.estado_servicio}: ya no se pueden modificar técnicos ni ítems del checklist`
+        error: `El servicio está ${servicioActual.estado_servicio}: ya no se pueden modificar sus técnicos`
       });
     }
 
     const consistencia = validarConsistenciaAsignaciones(tecnicos);
     if (!consistencia.ok) return res.status(400).json({ error: consistencia.error });
+
+    // Programación enviada junto con los técnicos (o la que ya tuviera).
+    let fechasProgramacion;
+    try { fechasProgramacion = normalizarProgramacion(req.body.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    const horaPedida = typeof req.body.hora_programada === 'string' ? req.body.hora_programada.trim() : null;
 
     // Validar todos los técnicos antes de tocar la BD (evita estado parcial si alguno falla)
     const idsNuevos = tecnicos.map(t => Number(t.id_tecnico));
@@ -878,7 +1066,6 @@ const asignarTecnicos = async (req, res) => {
           rol_asignacion: t.rol_asignacion || 'Apoyo',
           responsable_principal: t.responsable_principal ? 1 : 0,
           responsable_documentacion: t.responsable_documentacion ? 1 : 0,
-          responsable_checklist: t.responsable_checklist ? 1 : 0,
           estado: 1,
           estado_asignacion: 'activa',
           asignado_por: req.user.id,
@@ -891,92 +1078,35 @@ const asignarTecnicos = async (req, res) => {
           rol_asignacion: t.rol_asignacion || 'Apoyo',
           responsable_principal: t.responsable_principal ? 1 : 0,
           responsable_documentacion: t.responsable_documentacion ? 1 : 0,
-          responsable_checklist: t.responsable_checklist ? 1 : 0,
           asignado_por: req.user.id,
           user_id_registration: req.user.id
         }
       });
     }
 
-    // Checklist (sin destruir el progreso del técnico)
-    const tecChecklist = tecnicos.find(t => t.responsable_checklist) || tecnicos[0];
-    const checklistExist = await prisma.tbl_checklists_salida.findUnique({ where: { id_servicio: id } });
-    let checklist;
-    if (checklistExist) {
-      checklist = await prisma.tbl_checklists_salida.update({
-        where: { id_servicio: id },
-        data: {
-          id_tecnico_responsable: Number(tecChecklist.id_tecnico),
-          user_id_modification: req.user.id, date_time_modification: new Date()
-        }
+    // Programar: genera la grilla de días y sus eventos de calendario. Solo si
+    // llegan días nuevos o si el servicio aún no tenía ninguno.
+    if (horaPedida && horaPedida !== servicioActual.hora_programada) {
+      await prisma.tbl_servicios_proyectos.update({
+        where: { id },
+        data: { hora_programada: horaPedida, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
-    } else {
-      checklist = await prisma.tbl_checklists_salida.create({
-        data: {
-          id_servicio: id,
-          id_tecnico_responsable: Number(tecChecklist.id_tecnico),
-          estado_checklist: 'Pendiente',
-          user_id_registration: req.user.id
-        }
+    }
+    if (fechasProgramacion) {
+      await sincronizarDiasYEventos(prisma, id, {
+        userId: req.user.id, confirmar: true, fechas: fechasProgramacion
       });
     }
 
-    // Merge de ítems por id: preserva estado_item del técnico.
-    // - id existente → update de campos editables (sin tocar estado_item)
-    // - sin id (o id desconocido) → create con estado_item = 'Pendiente' (default)
-    // - ítems activos que ya no vienen → soft-delete (estado = 0)
-    const itemsExistentes = await prisma.tbl_checklists_salida_items.findMany({
-      where: { id_checklist: checklist.id, estado: 1 },
-      select: { id: true }
-    });
-    const idsExistentes = new Set(itemsExistentes.map(it => it.id));
-    const idsEntrantes = new Set();
-    for (const it of items_checklist) {
-      if (!it.nombre) continue;
-      const idInc = Number(it.id) || null;
-      const base = {
-        tipo_item: it.tipo_item || 'Herramienta',
-        nombre: it.nombre,
-        cantidad: it.cantidad || 1,
-        unidad: it.unidad || 'Unidad',
-        observaciones: it.observaciones || null
-      };
-      if (idInc && idsExistentes.has(idInc)) {
-        idsEntrantes.add(idInc);
-        await prisma.tbl_checklists_salida_items.update({
-          where: { id: idInc },
-          data: { ...base, user_id_modification: req.user.id, date_time_modification: new Date() }
-        });
-      } else {
-        await prisma.tbl_checklists_salida_items.create({
-          data: { id_checklist: checklist.id, ...base, user_id_registration: req.user.id }
-        });
-      }
-    }
-    const idsAEliminar = [...idsExistentes].filter(idx => !idsEntrantes.has(idx));
-    if (idsAEliminar.length > 0) {
-      await prisma.tbl_checklists_salida_items.updateMany({
-        where: { id: { in: idsAEliminar } },
-        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
-      });
-    }
-
-    // Recalcular estado_checklist según los ítems que sobrevivieron al merge.
-    // El helper sólo promueve estado_servicio (Checklist de salida pendiente → Listo para salida),
-    // nunca lo demota, así que es seguro llamarlo aun si el servicio está más avanzado.
-    await _recalcEstadoChecklist(checklist.id, req.user.id);
-
-    // estado_servicio: ajustar sólo si el servicio aún está en la fase pre-checklist.
-    // Si el técnico ya completó el checklist y el servicio avanzó (Listo para salida / En camino /
-    // En curso / etc.), una re-asignación administrativa no debe demotarlo.
-    // 'Pendiente' es el estado inicial al crear el servicio: incluirlo aquí es
-    // lo que mueve el servicio de la fase "recién creado" a la fase operativa.
-    // Sin esto, asignar técnicos a un servicio recién creado deja el estado en
-    // 'Pendiente' indefinidamente y los botones de Iniciar/Finalizar nunca aparecen.
-    const estadosPreChecklist = ['Pendiente', 'Asignado', 'Checklist de salida pendiente'];
+    // "Asignado" exige técnico Y fecha: si el servicio sigue sin programar, se
+    // queda en Pendiente para que el hueco quede a la vista en la agenda.
+    const yaProgramado = !!(fechasProgramacion || servicioActual.fecha_programada);
     const estadoActual = servicioActual.estado_servicio;
-    const nuevoEstadoServicio = estadosPreChecklist.includes(estadoActual)
-      ? (items_checklist.length > 0 ? 'Checklist de salida pendiente' : 'Asignado')
+    // Solo se mueve el estado en la fase previa a la ejecución: si el técnico ya
+    // empezó (En curso), una reasignación administrativa no debe hacerlo retroceder.
+    const enFasePrevia = [ESTADO_SERVICIO_PENDIENTE, ESTADO_SERVICIO_ASIGNADO].includes(estadoActual);
+    const nuevoEstadoServicio = enFasePrevia
+      ? (yaProgramado ? ESTADO_SERVICIO_ASIGNADO : ESTADO_SERVICIO_PENDIENTE)
       : estadoActual;
     if (nuevoEstadoServicio !== estadoActual) {
       // cambiarEstadoServicio registra historial, sincroniza recordatorio y
@@ -989,92 +1119,32 @@ const asignarTecnicos = async (req, res) => {
       });
     }
 
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      estado: nuevoEstadoServicio,
+      // El cliente avisa cuando falta la fecha: es lo único que separa el
+      // servicio de quedar realmente asignado.
+      falta_programar: !yaProgramado
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al asignar técnicos: ' + err.message });
   }
 };
 
-const iniciarServicio = async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { accion = 'iniciar_servicio' } = req.body;
-    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
-      where: { id },
-      include: {
-        checklists: { include: { items: { where: { estado: 1 } } } },
-        asignaciones: { where: { estado: 1 } },
-        emergencia: { select: { id: true } },
-        correctivo: { select: { id: true } }
-      }
-    });
-    if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-    // Un servicio ya finalizado (por técnico / observado) o que pasó al circuito
-    // administrativo-contable (revisión, cobro, facturación, cerrado) NO se
-    // vuelve a poner en marcha por esta vía: reabrirlo dejaría otra vez visible
-    // el botón "Finalizar" y permitiría finalizarlo dos veces. La única
-    // reapertura legítima es la revisión administrativa cuando observa o
-    // rechaza el servicio (`revisarServicio`).
-    if (servicio.estado_servicio === 'Cancelado' || estaServicioFinalizado(servicio.estado_servicio)) {
-      return res.status(400).json({
-        error: `El servicio está ${servicio.estado_servicio}: ya no se puede volver a poner en curso`
-      });
-    }
-
-    // Validar checklist completo si la acción es iniciar_servicio
-    const chk = servicio.checklists[0];
-    if (chk && chk.estado_checklist !== 'Completo' && chk.estado_checklist !== 'Aprobado' && chk.items.length > 0 && accion === 'iniciar_servicio') {
-      return res.status(400).json({ error: 'El checklist de salida debe estar completo' });
-    }
-
-    let nuevoEstado = servicio.estado_servicio;
-    if (accion === 'en_camino') nuevoEstado = 'En camino';
-    else if (accion === 'iniciar_servicio') nuevoEstado = 'En curso';
-
-    await cambiarEstadoServicio(id, nuevoEstado, req.user.id);
-
-    // Al pasar a "En curso" se crea el checklist de finalización para que el
-    // técnico lo vaya completando durante la ejecución (foto por ítem). Si la
-    // plantilla de la categoría no tiene ítems configurados no se crea (el panel
-    // mostrará el aviso para configurarla); no debe bloquear el inicio.
-    if (nuevoEstado === 'En curso') {
-      try {
-        await ensureChecklistFinalizacion(prisma, servicio, req.user.id);
-      } catch (err) {
-        console.error('[iniciarServicio] No se pudo crear el checklist de finalización:', err.message);
-      }
-    }
-
-    // Marcar técnicos como ocupados
-    for (const a of servicio.asignaciones) {
-      await prisma.tbl_tecnicos.update({
-        where: { id: a.id_tecnico },
-        data: { estado_operativo: nuevoEstado === 'En curso' ? 'En servicio' : 'Ocupado' }
-      });
-    }
-
-    res.json({ ok: true, estado: nuevoEstado });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error al iniciar servicio: ' + err.message });
-  }
-};
-
 const finalizarServicio = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { observaciones_tecnicas, descargo_tecnico, codigo_guia, id_archivo_guia, finalizar_observado, id_archivos_evidencias, numero_ot, id_archivo_ot } = req.body;
-    const numeroOtNormalizado = typeof numero_ot === 'string' ? numero_ot.trim() : '';
-    const idArchivoOtNormalizado = Number.isFinite(Number(id_archivo_ot)) && Number(id_archivo_ot) > 0
-      ? Number(id_archivo_ot)
-      : null;
+    const { observaciones_tecnicas, descargo_tecnico, codigo_guia, id_archivo_guia, finalizar_observado, id_archivos_evidencias } = req.body;
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id },
       include: {
         asignaciones: { where: { estado: 1 } },
         guias: { where: { estado: 1 } },
-        ascensores: { where: { estado: 1 } }
+        ascensores: { where: { estado: 1 } },
+        // La grilla de días alimenta el cálculo del plazo de cierre: con días no
+        // corridos el último día programado no es fecha_programada + duración.
+        dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' } }
       }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
@@ -1091,43 +1161,35 @@ const finalizarServicio = async (req, res) => {
     if (servicio.estado_servicio !== ESTADO_SERVICIO_EN_CURSO) {
       return res.status(400).json({ error: 'El servicio debe estar en curso para finalizarlo' });
     }
+    // El cierre no vuelve a pedir documentación: la guía, las fotos y la OT se
+    // registran DURANTE el servicio, cada una en su sección. Aquí todos los
+    // campos son opcionales; lo único que se sigue exigiendo al técnico es tener
+    // la OT cargada (más abajo), porque de ella tira el circuito administrativo.
     const sinGuia = !id_archivo_guia && servicio.guias.length === 0;
-    const sinObservaciones = !observaciones_tecnicas;
-    if (sinGuia && sinObservaciones) {
-      return res.status(400).json({ error: 'Se requiere guía o al menos observación técnica' });
-    }
     // Checklist de finalización: OPCIONAL. La configuración de plantillas es
     // opcional y un checklist incompleto (o inexistente) no impide cerrar el
     // servicio. Si existe informe generado se conserva enlazado; si no, se cierra
     // igual. Por eso ya no se valida su existencia aquí.
 
-    // Evidencias del trabajo terminado: obligatorias para técnicos al finalizar.
-    // Admin/SuperAdmin pueden cerrar sin evidencias (igual que con la guía).
+    // Compatibilidad: si algún cliente todavía manda fotos en el cierre se
+    // vinculan igual, pero ya no se exigen — las evidencias se suben durante el
+    // servicio, no al cerrarlo.
     const evidenciasIds = Array.isArray(id_archivos_evidencias)
       ? id_archivos_evidencias.map(Number).filter(Number.isFinite)
       : [];
-    if (req.user.rol_codigo === 'tecnico' && evidenciasIds.length === 0) {
-      return res.status(400).json({ error: 'Debe adjuntar al menos una foto de evidencia del trabajo terminado' });
+    // OT (Orden de Trabajo): obligatoria para técnicos al finalizar. Ya no se
+    // adjunta aquí — se sube desde su propia sección del servicio, junto a la
+    // guía de salida —, así que el cierre solo comprueba que esté cargada.
+    // Admin/SuperAdmin pueden cerrar sin ella (destraban el caso).
+    if (req.user.rol_codigo === 'tecnico' && (!servicio.numero_ot || !servicio.id_archivo_ot)) {
+      return res.status(400).json({
+        error: 'Debe registrar la OT (número y documento) en la sección "Orden de trabajo" antes de finalizar',
+        falta_ot: true
+      });
     }
-    // OT (Orden de Trabajo): obligatoria para técnicos al finalizar.
-    // Admin/SuperAdmin pueden cerrar sin OT (mismo patrón que guía y evidencias).
-    if (req.user.rol_codigo === 'tecnico' && (!numeroOtNormalizado || !idArchivoOtNormalizado)) {
-      return res.status(400).json({ error: 'Debe adjuntar la OT (número y documento) para finalizar' });
-    }
-    // Servicios multidía: el técnico no puede subir la OT si algún día programado
-    // quedó sin evidencia. Admin/SuperAdmin pueden cerrar igual (mismo patrón que
-    // guía/evidencia/OT). Los servicios de un solo día conservan la regla previa.
-    if (req.user.rol_codigo === 'tecnico' && servicio.duracion_dias > 1) {
-      const faltantes = await diasSinEvidencia(prisma, id);
-      if (faltantes.length > 0) {
-        const lista = faltantes.map(dd => `Día ${dd.orden}`).join(', ');
-        return res.status(400).json({ error: `Cada día debe tener al menos una evidencia antes de la OT. Faltan: ${lista}.` });
-      }
-    }
-    // Si no hay guía: solo Admin/Super Admin puede cerrar marcándolo como observado
-    if (sinGuia && !finalizar_observado) {
-      // permitir si hay observación técnica (regla original)
-    } else if (sinGuia && finalizar_observado && !['super_admin', 'admin'].includes(req.user.rol_codigo)) {
+    // Cerrar SIN guía marcándolo como observado sigue siendo cosa de admin: deja
+    // la guía en estado "Observada" y el servicio con el distintivo "Sin guía".
+    if (sinGuia && finalizar_observado && !['super_admin', 'admin'].includes(req.user.rol_codigo)) {
       return res.status(403).json({ error: 'Solo Admin o Super Admin pueden finalizar como observado sin guía' });
     }
 
@@ -1166,10 +1228,12 @@ const finalizarServicio = async (req, res) => {
     // 409, sin duplicar guías, evidencias, historial ni cobro.
     // (cambiarEstadoServicioSiEstaEn registra el historial, sincroniza el
     // recordatorio y el estado_global de la cotización origen.)
-    const estadoFinal = (sinGuia && finalizar_observado) ? ESTADO_SERVICIO_FINALIZADO_OBSERVADO : ESTADO_SERVICIO_FINALIZADO_TECNICO;
+    // Estado final ÚNICO. Un cierre sin guía no es otro estado: la guía queda en
+    // "Observada" y el detalle lo muestra con su distintivo, de modo que se
+    // reconoce y se puede completar después sin duplicar estados de servicio.
     const claim = await cambiarEstadoServicioSiEstaEn(
-      id, [ESTADO_SERVICIO_EN_CURSO], estadoFinal, req.user.id,
-      (sinGuia && finalizar_observado) ? 'Finalización observada por admin' : null
+      id, [ESTADO_SERVICIO_EN_CURSO], ESTADO_SERVICIO_FINALIZADO, req.user.id,
+      (sinGuia && finalizar_observado) ? 'Finalizado sin guía de salida (autorizado por admin)' : null
     );
     if (!claim) {
       const actual = await prisma.tbl_servicios_proyectos.findUnique({
@@ -1259,8 +1323,6 @@ const finalizarServicio = async (req, res) => {
         id_responsable_documentacion: responsableDoc?.id_tecnico || null,
         observaciones_tecnicas: observaciones_tecnicas || null,
         descargo_tecnico: descargo_tecnico || null,
-        numero_ot: numeroOtNormalizado || null,
-        id_archivo_ot: idArchivoOtNormalizado,
         // Salir de 'En ejecución' (creado al aprobar) → 'Pendiente revisión'.
         // No pisamos estados ya avanzados (Revisado/Cerrado/etc.) al finalizar.
         estado_administrativo: 'Pendiente revisión',
@@ -1280,8 +1342,6 @@ const finalizarServicio = async (req, res) => {
         id_responsable_documentacion: responsableDoc?.id_tecnico || null,
         observaciones_tecnicas: observaciones_tecnicas || null,
         descargo_tecnico: descargo_tecnico || null,
-        numero_ot: numeroOtNormalizado || null,
-        id_archivo_ot: idArchivoOtNormalizado,
         estado_administrativo: 'Pendiente revisión',
         estado_cobro: estadoCobroInicial,
         estado_facturacion: estadoFacturacionInicial,
@@ -1306,12 +1366,10 @@ const finalizarServicio = async (req, res) => {
     // Transición a "En revisión administrativa" (gate previo al envío a cobros).
     // Condicionada al estado que dejó el claim: si algo movió el servicio entre
     // medias, no lo pisamos.
-    if (estadoFinal === ESTADO_SERVICIO_FINALIZADO_TECNICO) {
-      await cambiarEstadoServicioSiEstaEn(
-        id, [ESTADO_SERVICIO_FINALIZADO_TECNICO], 'En revisión administrativa',
-        req.user.id, 'Servicio pendiente de revisión administrativa'
-      );
-    }
+    await cambiarEstadoServicioSiEstaEn(
+      id, [ESTADO_SERVICIO_FINALIZADO], 'En revisión administrativa',
+      req.user.id, 'Servicio pendiente de revisión administrativa'
+    );
 
     // Liberar técnicos
     for (const a of servicio.asignaciones) {
@@ -1319,21 +1377,26 @@ const finalizarServicio = async (req, res) => {
     }
 
     // Para planes continuos: auto-materializa el siguiente evento del plan
-    // como servicio (queda listo para asignar técnico, checklist y cobro)
+    // como servicio (queda listo para asignar técnico y cobro)
     // y actualiza `proximo_mantenimiento` de todos los ascensores del plan.
     if (servicio.id_mantenimiento_plan) {
       try {
+        // La cadena avanza dentro de la serie del ASCENSOR que se acaba de
+        // atender: con frecuencias distintas por ascensor, "el siguiente evento
+        // del plan" pertenecería a otro ascensor y lo adelantaría.
         const siguienteServicio = await materializarSiguienteEventoDelPlan({
           idPlan: servicio.id_mantenimiento_plan,
+          idServicioFinalizado: id,
           fechaServicioFinalizado: servicio.fecha_programada,
           userId: req.user.id
         });
         if (siguienteServicio) {
-          const plan = await prisma.tbl_mantenimientos_planes.findUnique({
-            where: { id: servicio.id_mantenimiento_plan },
-            select: { ascensores: { where: { estado: 1 }, select: { id_ascensor: true } } }
-          });
-          const idsAsc = (plan?.ascensores || []).map(a => a.id_ascensor);
+          // `proximo_mantenimiento` es por ascensor: solo se mueve el del
+          // ascensor que cubre el servicio recién creado, no el de todo el plan.
+          const idsAsc = (await prisma.tbl_servicios_ascensores.findMany({
+            where: { id_servicio: siguienteServicio.id, estado: 1 },
+            select: { id_ascensor: true }
+          })).map(a => a.id_ascensor);
           if (idsAsc.length > 0) {
             await prisma.tbl_ascensores.updateMany({
               where: { id: { in: idsAsc } },
@@ -1450,7 +1513,7 @@ const cancelar = async (req, res) => {
           id_tecnico: a.id_tecnico,
           estado: 1,
           id_servicio: { not: id },
-          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+          servicio: { estado_servicio: 'En curso', estado: 1 }
         }
       });
       if (otrasActivas === 0) {
@@ -1471,6 +1534,63 @@ const cancelar = async (req, res) => {
     res.status(500).json({ error: 'Error al cancelar' });
   }
 };
+
+/**
+ * Resumen de facturación sobre el conjunto de servicios realizados que cumple
+ * `where` — el MISMO filtro que la tabla, sin paginar, para que los indicadores
+ * cuadren con lo que el usuario está viendo.
+ *
+ * Dos grupos, los que pide Contabilidad:
+ *   · por_facturar → emisión pendiente de verdad (ver `esPorFacturar`: excluye
+ *     los marcados "no requiere factura" y los gratuitos).
+ *   · facturado    → emisión completa ('Facturado' / 'Enviada').
+ *
+ * El importe de cada servicio es su total cobrable: el monto del cobro si ya
+ * existe y, si no, el precio del servicio (mismo criterio que la columna
+ * "Total" de la tabla y que el tope del modal de emisión). Los montos se
+ * agrupan POR MONEDA: la cartera tiene servicios en PEN y en USD, y sumarlos
+ * en un único número daría un total falso.
+ */
+async function resumenFacturacion(where) {
+  const filas = await prisma.tbl_servicios_realizados.findMany({
+    where,
+    select: {
+      estado_facturacion: true,
+      servicio: {
+        select: {
+          moneda: true, precio_interno: true, sin_cobro: true, requiere_factura: true,
+          cobro: { select: { monto_total: true } }
+        }
+      }
+    }
+  });
+
+  const grupos = {
+    por_facturar: { cantidad: 0, montos: new Map() },
+    facturado: { cantidad: 0, montos: new Map() }
+  };
+  for (const f of filas) {
+    const destino = esPorFacturar(f) ? 'por_facturar'
+      : esFacturado(f.estado_facturacion) ? 'facturado'
+      : null;
+    if (!destino) continue;
+    const g = grupos[destino];
+    g.cantidad++;
+    const moneda = f.servicio?.moneda || MONEDA_POR_DEFECTO;
+    const total = Number(f.servicio?.cobro?.monto_total ?? f.servicio?.precio_interno ?? 0);
+    g.montos.set(moneda, (g.montos.get(moneda) || 0) + (Number.isFinite(total) ? total : 0));
+  }
+
+  // El Map se serializa como array ordenado por importe descendente: la moneda
+  // principal queda primero y la UI puede pintarlas todas sin adivinar.
+  const aSalida = (g) => ({
+    cantidad: g.cantidad,
+    montos: [...g.montos.entries()]
+      .map(([moneda, total]) => ({ moneda, total: Math.round(total * 100) / 100 }))
+      .sort((a, b) => b.total - a.total)
+  });
+  return { por_facturar: aSalida(grupos.por_facturar), facturado: aSalida(grupos.facturado) };
+}
 
 const realizados = async (req, res) => {
   try {
@@ -1494,12 +1614,15 @@ const realizados = async (req, res) => {
     if (id_cliente) servicioWhere.id_cliente = Number(id_cliente);
     if (q) {
       // Buscador amplio: código de servicio, razón social (nombre del cliente),
-      // documento (RUC/DNI) y código del edificio/ascensor.
+      // documento (RUC/DNI), y del sitio tanto el CÓDIGO del ascensor como el
+      // NOMBRE del edificio/obra — contabilidad busca por el nombre que conoce
+      // ("Las Gardenias"), no por el código interno.
       servicioWhere.OR = [
         { codigo: { contains: q, mode: 'insensitive' } },
         { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
         { cliente: { numero_documento: { contains: q, mode: 'insensitive' } } },
-        { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } }
+        { ascensores: { some: { estado: 1, ascensor: { codigo: { contains: q, mode: 'insensitive' } } } } },
+        { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } }
       ];
     }
     // Filtro por tipo de servicio: correctivo | preventivo (mantenimiento) |
@@ -1534,24 +1657,41 @@ const realizados = async (req, res) => {
       {
         where, orderBy: { id: 'desc' },
         include: {
-          archivo_ot: true,
           servicio: {
             include: {
+              // La OT es del servicio, no de su folder contable.
+              archivo_ot: true,
               cliente: true,
               ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
               tipo_servicio: true,
               asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
               guias: { where: { estado: 1 }, include: { archivo: true } },
               evidencias: { where: { estado: 1 } },
-              checklists: { include: { items: { where: { estado: 1 } } } },
-              cobro: { include: { facturas: true } }
+                    cobro: { include: { facturas: true } }
             }
           }
         }
       },
       req.query
     );
-    res.json({ ...result, data: result.data.map(r => ({ ...r, servicio: sanitizarPrecio(r.servicio, req.user.rol_codigo) })) });
+    // Resumen de facturación de TODO el conjunto filtrado (no solo de la página
+    // visible): alimenta los dos indicadores de Contabilidad. Es dato económico,
+    // así que solo se calcula y envía a los roles que pueden verlo.
+    const resumen_facturacion = ROLES_PRECIO.includes(req.user.rol_codigo)
+      ? await resumenFacturacion(where)
+      : undefined;
+
+    // El bloque de cobro/facturas del servicio solo viaja a los roles con
+    // visibilidad financiera; al resto se le quita entero (no basta con anular
+    // el precio: el cobro trae monto_total, saldo y las facturas sus importes).
+    res.json({
+      ...result,
+      ...(resumen_facturacion ? { resumen_facturacion } : {}),
+      data: result.data.map(r => ({
+        ...r,
+        servicio: sanitizarEconomico(sanitizarPrecio(r.servicio, req.user.rol_codigo), req.user.rol_codigo)
+      }))
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar servicios realizados' });
@@ -1573,19 +1713,130 @@ function puedeUsuarioGestionarGuia(user, asignaciones) {
 }
 
 /**
- * Si el servicio está finalizado observado y la guía resultante tiene archivo,
- * regulariza el servicio pasándolo a finalizado por técnico.
+ * Registra (o reemplaza) la ORDEN DE TRABAJO del servicio.
+ *
+ * La OT se sube durante la ejecución, junto a la guía de salida, no al cerrar:
+ * es el documento que el técnico trae firmado de la obra. Vive en el servicio,
+ * así que de aquí la leen el cierre, Contabilidad, Gestión de cobros y los
+ * reportes — una sola fuente, sin copias que se desincronicen.
+ *
+ * Body: { numero_ot, id_archivo }
  */
-async function regularizarSiObservado(servicio, idArchivo, idUsuario) {
-  if (!idArchivo) return;
-  if (servicio.estado_servicio !== ESTADO_SERVICIO_FINALIZADO_OBSERVADO) return;
-  await cambiarEstadoServicio(
-    servicio.id,
-    ESTADO_SERVICIO_FINALIZADO_TECNICO,
-    idUsuario,
-    'Guía regularizada por coordinador/admin'
-  );
-}
+const guardarOt = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { numero_ot, id_archivo } = req.body || {};
+    const numero = typeof numero_ot === 'string' ? numero_ot.trim() : '';
+    const idArchivo = Number.isFinite(Number(id_archivo)) && Number(id_archivo) > 0
+      ? Number(id_archivo)
+      : null;
+    if (!numero) return res.status(400).json({ error: 'El número de OT es obligatorio' });
+    if (!idArchivo) return res.status(400).json({ error: 'Debe adjuntar el documento de la OT' });
+
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: {
+        id: true, estado: true, estado_servicio: true, numero_ot: true, id_archivo_ot: true,
+        asignaciones: { where: { estado: 1 }, select: { id_tecnico: true, responsable_documentacion: true } }
+      }
+    });
+    if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
+    // Una vez que el servicio pasó a revisión/cobro su documentación queda
+    // congelada: corregir la OT ahí cambiaría lo que contabilidad ya revisó.
+    if (esServicioPostRevision(servicio.estado_servicio)) {
+      return res.status(409).json({
+        error: `El servicio está en "${servicio.estado_servicio}": la OT ya no se puede modificar`
+      });
+    }
+    // El técnico solo toca la OT de un servicio suyo (mismo criterio que la guía).
+    if (req.user.rol_codigo === 'tecnico'
+        && !puedeUsuarioGestionarGuia(req.user, servicio.asignaciones)) {
+      return res.status(403).json({ error: 'Solo el responsable documental puede registrar la OT' });
+    }
+
+    const actualizado = await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: {
+        numero_ot: numero,
+        id_archivo_ot: idArchivo,
+        ot_subida_por: req.user.id,
+        ot_subida_en: new Date(),
+        user_id_modification: req.user.id,
+        date_time_modification: new Date()
+      },
+      include: { archivo_ot: true }
+    });
+
+    // Subir la OT es trabajo del técnico: enciende "En curso" si hacía falta.
+    await registrarActividadTecnico(id, req.user.id, 'Orden de trabajo registrada');
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: { numero_ot: servicio.numero_ot, id_archivo_ot: servicio.id_archivo_ot },
+      valor_nuevo: { numero_ot: numero, id_archivo_ot: idArchivo }, ip: req.ip
+    });
+    res.json({
+      data: {
+        numero_ot: actualizado.numero_ot,
+        id_archivo_ot: actualizado.id_archivo_ot,
+        archivo_ot: actualizado.archivo_ot,
+        ot_subida_en: actualizado.ot_subida_en
+      }
+    });
+  } catch (err) {
+    console.error('[servicios.guardarOt]', err);
+    res.status(500).json({ error: 'Error al registrar la OT: ' + err.message });
+  }
+};
+
+/**
+ * Quita la OT del servicio (para volver a subirla corregida). El archivo se da
+ * de baja para que no quede huérfano en el almacén.
+ */
+const eliminarOt = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id },
+      select: { id: true, estado: true, estado_servicio: true, numero_ot: true, id_archivo_ot: true }
+    });
+    if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (esServicioPostRevision(servicio.estado_servicio)) {
+      return res.status(409).json({
+        error: `El servicio está en "${servicio.estado_servicio}": la OT ya no se puede modificar`
+      });
+    }
+    if (!servicio.numero_ot && !servicio.id_archivo_ot) {
+      return res.status(400).json({ error: 'El servicio no tiene OT registrada' });
+    }
+
+    await prisma.tbl_servicios_proyectos.update({
+      where: { id },
+      data: {
+        numero_ot: null, id_archivo_ot: null, ot_subida_por: null, ot_subida_en: null,
+        user_id_modification: req.user.id, date_time_modification: new Date()
+      }
+    });
+    if (servicio.id_archivo_ot) {
+      await prisma.tbl_archivos.updateMany({
+        where: { id: servicio.id_archivo_ot, estado: 1 },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
+      accion: 'UPDATE',
+      valor_anterior: { numero_ot: servicio.numero_ot, id_archivo_ot: servicio.id_archivo_ot },
+      valor_nuevo: { numero_ot: null, id_archivo_ot: null }, ip: req.ip
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[servicios.eliminarOt]', err);
+    res.status(500).json({ error: 'Error al eliminar la OT: ' + err.message });
+  }
+};
 
 const crearGuia = async (req, res) => {
   try {
@@ -1638,7 +1889,9 @@ const crearGuia = async (req, res) => {
       include: { archivo: true, tecnico: true }
     });
 
-    await regularizarSiObservado(servicio, archivoNormalizado, req.user.id);
+    // La guía es trabajo del técnico: si el servicio seguía en Pendiente/Asignado,
+    // este registro es lo que lo pone En curso.
+    await registrarActividadTecnico(id_servicio, req.user.id, 'Guía de salida registrada');
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: guia.id,
@@ -1704,8 +1957,7 @@ const actualizarGuia = async (req, res) => {
       include: { archivo: true, tecnico: true }
     });
 
-    const archivoResultante = guia.id_archivo;
-    await regularizarSiObservado(guiaPrevia.servicio, archivoResultante, req.user.id);
+    await registrarActividadTecnico(guiaPrevia.id_servicio, req.user.id, 'Guía de salida actualizada');
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: id_guia,
@@ -1715,6 +1967,55 @@ const actualizarGuia = async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al actualizar guía: ' + err.message });
+  }
+};
+
+/**
+ * Corrige el INFORME DE CIERRE que dejó el técnico: sus observaciones técnicas
+ * y el descargo. Vive en tbl_servicios_realizados y hasta ahora no lo podía
+ * editar nadie — si el técnico se equivocaba al finalizar, el texto quedaba así
+ * para siempre en el expediente y en el informe.
+ *
+ * El N° de OT y su documento tienen sus propios endpoints (PUT/DELETE
+ * /:id/ot), que ya contemplan a coordinación con el mismo corte.
+ */
+const actualizarInformeTecnico = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const realizado = await prisma.tbl_servicios_realizados.findFirst({
+      where: { id_servicio: id, estado: 1 },
+      include: { servicio: { select: { id: true, codigo: true, estado_servicio: true } } }
+    });
+    if (!realizado) {
+      return res.status(404).json({ error: 'Este servicio todavía no tiene informe de cierre' });
+    }
+    const bloqueo = motivoBloqueo(req.user, realizado.servicio, 'editar el informe del técnico');
+    if (bloqueo) {
+      return res.status(esRolGestion(req.user) ? 400 : 403).json({ error: bloqueo });
+    }
+
+    const data = { user_id_modification: req.user.id, date_time_modification: new Date() };
+    // Solo se tocan los campos presentes: así corregir el descargo no borra las
+    // observaciones por venir ausentes en el payload.
+    for (const campo of ['observaciones_tecnicas', 'descargo_tecnico']) {
+      if (req.body?.[campo] !== undefined) {
+        const v = String(req.body[campo] ?? '').trim();
+        data[campo] = v || null;
+      }
+    }
+    if (Object.keys(data).length === 2) {
+      return res.status(400).json({ error: 'No hay cambios que guardar' });
+    }
+
+    const actualizado = await prisma.tbl_servicios_realizados.update({ where: { id: realizado.id }, data });
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_servicios_realizados', id_entidad: realizado.id,
+      accion: 'UPDATE', valor_anterior: realizado, valor_nuevo: actualizado, ip: req.ip
+    });
+    res.json({ data: actualizado });
+  } catch (err) {
+    console.error('[servicios.actualizarInformeTecnico]', err);
+    res.status(500).json({ error: 'Error al actualizar el informe del técnico' });
   }
 };
 
@@ -1791,7 +2092,7 @@ const eliminar = async (req, res) => {
       const otrasActivas = await prisma.tbl_servicios_asignaciones.count({
         where: {
           id_tecnico: a.id_tecnico, estado: 1, id_servicio: { not: id },
-          servicio: { estado_servicio: { in: ['En camino', 'En curso'] }, estado: 1 }
+          servicio: { estado_servicio: 'En curso', estado: 1 }
         }
       });
       if (otrasActivas === 0) {
@@ -1828,6 +2129,11 @@ const cambiarRequiereFactura = async (req, res) => {
     if (!servicio || servicio.estado === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
     if (servicio.facturas.length > 0) {
       return res.status(409).json({ error: 'El servicio ya tiene una factura emitida; no se puede cambiar la marca de facturación.' });
+    }
+    // Gratuito ⇒ sin factura (utils/gratuidadServicio): no se factura lo que no
+    // se cobra. Para facturarlo hay que quitarle antes la marca de sin costo.
+    if (nuevo === 1 && servicio.sin_cobro === 1) {
+      return res.status(409).json({ error: 'El servicio está marcado sin costo: no se puede facturar. Quítele la gratuidad primero si debe cobrarse.' });
     }
     if (servicio.requiere_factura !== nuevo) {
       await prisma.tbl_servicios_proyectos.update({
@@ -1920,51 +2226,86 @@ const actualizarDatosContacto = async (req, res) => {
 };
 
 /**
- * Cambia la duración (días) de un servicio ya programado y regenera su grilla de
- * días + eventos de calendario. A diferencia de `actualizar` (gated a estados
- * pre-campo), esto opera también con el servicio En camino/En curso, conservando
- * los días ya trabajados con su evidencia.
+ * Reprograma los DÍAS DE TRABAJO de un servicio ya programado y regenera su
+ * grilla de días + eventos de calendario. A diferencia de `actualizar` (gated a
+ * estados pre-campo), esto opera también con el servicio En curso,
+ * conservando los días ya trabajados con su evidencia.
  *
- * Si reducir la duración dejaría fuera días que YA tienen evidencia, responde 409
- * con `requiere_confirmacion: true`; el cliente debe reenviar con `confirmar: true`.
+ * Body (una de las dos formas):
+ *   - `dias`: programación por tramos — rangos { desde, hasta } y/o fechas
+ *     sueltas 'YYYY-MM-DD', en cualquier combinación. Es la forma completa: sirve
+ *     para "del 10 al 14", para "el 10, el 15 y el 20" y para mezclas de ambas.
+ *   - `duracion_dias`: atajo clásico de N días CORRIDOS desde la fecha programada.
+ * Opcionalmente `hora_programada` mueve la hora de todos los días.
+ *
+ * Si la nueva programación dejaría fuera días que YA tienen evidencia, responde
+ * 409 con `requiere_confirmacion: true`; el cliente reenvía con `confirmar: true`.
  */
-const cambiarDuracion = async (req, res) => {
+const cambiarProgramacion = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const confirmar = req.body.confirmar === true || req.body.confirmar === 1;
-    const nuevaDuracion = Math.max(1, parseInt(req.body.duracion_dias, 10) || 0);
-    if (!nuevaDuracion) return res.status(400).json({ error: 'Duración inválida (mínimo 1 día)' });
+
+    let fechas;
+    try { fechas = normalizarProgramacion(req.body.dias ?? null); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     const servicio = await prisma.tbl_servicios_proyectos.findUnique({
       where: { id },
-      select: { id: true, estado_servicio: true, duracion_dias: true, fecha_programada: true }
+      select: {
+        id: true, estado_servicio: true, duracion_dias: true,
+        fecha_programada: true, hora_programada: true
+      }
     });
     if (!servicio) return res.status(404).json({ error: 'Servicio no encontrado' });
-    if (!servicio.fecha_programada) {
-      return res.status(400).json({ error: 'El servicio no tiene fecha programada: prográmela antes de definir la duración' });
+
+    // Sin `dias` se usa el atajo por duración: N días corridos desde la fecha
+    // programada (que en ese caso tiene que existir).
+    if (!fechas) {
+      const nuevaDuracion = Math.max(1, parseInt(req.body.duracion_dias, 10) || 0);
+      if (!nuevaDuracion) {
+        return res.status(400).json({ error: 'Indique los días de trabajo o una duración (mínimo 1 día)' });
+      }
+      if (!servicio.fecha_programada) {
+        return res.status(400).json({ error: 'El servicio no tiene fecha programada: prográmela antes de definir la duración' });
+      }
+      fechas = diasCorridos(servicio.fecha_programada, nuevaDuracion);
     }
-    // Editable desde que está programado hasta que está En curso (no en borrador
-    // ni una vez finalizado/cancelado).
-    const editables = ['Pendiente', 'Asignado', 'Checklist de salida pendiente', 'Listo para salida', 'En camino', 'En curso'];
+
+    // Reprogramable desde el borrador hasta que está En curso (no una vez
+    // finalizado/cancelado). El borrador guarda sus días pero NO los lleva al
+    // calendario: sigue invisible en la agenda hasta que se promueve.
+    const editables = ['Borrador', ESTADO_SERVICIO_PENDIENTE, ESTADO_SERVICIO_ASIGNADO, ESTADO_SERVICIO_EN_CURSO];
     if (!editables.includes(servicio.estado_servicio)) {
-      return res.status(409).json({ error: `No se puede cambiar la duración de un servicio en estado "${servicio.estado_servicio}"` });
+      return res.status(409).json({ error: `No se puede reprogramar un servicio en estado "${servicio.estado_servicio}"` });
     }
+    const esBorrador = servicio.estado_servicio === 'Borrador';
+
+    const horaPedida = typeof req.body.hora_programada === 'string' ? req.body.hora_programada.trim() : null;
+    const programacionAnterior = await fechasProgramadas(prisma, id);
 
     try {
       await prisma.$transaction(async (tx) => {
-        await tx.tbl_servicios_proyectos.update({
-          where: { id },
-          data: { duracion_dias: nuevaDuracion, user_id_modification: req.user.id, date_time_modification: new Date() }
-        });
-        await sincronizarDiasYEventos(tx, id, { userId: req.user.id, confirmar });
-      });
+        if (horaPedida && horaPedida !== servicio.hora_programada) {
+          await tx.tbl_servicios_proyectos.update({
+            where: { id },
+            data: { hora_programada: horaPedida, user_id_modification: req.user.id, date_time_modification: new Date() }
+          });
+        }
+        // sincronizarDiasYEventos deriva fecha_programada y duracion_dias de la
+        // grilla, así que no hay que tocarlos aquí.
+        await sincronizarDiasYEventos(tx, id, { userId: req.user.id, confirmar, fechas, sinEventos: esBorrador });
+      }, { timeout: 20000 });
     } catch (e) {
       if (e instanceof ConfirmacionRequeridaError || e.code === 'REQUIERE_CONFIRMACION') {
         return res.status(409).json({
-          error: 'Reducir la duración eliminaría días que ya tienen evidencia',
+          error: 'La nueva programación dejaría fuera días que ya tienen evidencia',
           requiere_confirmacion: true,
           dias_con_evidencia: e.diasConEvidencia || []
         });
+      }
+      if (e instanceof ProgramacionInvalidaError || e.code === 'PROGRAMACION_INVALIDA') {
+        return res.status(400).json({ error: e.message });
       }
       throw e;
     }
@@ -1972,14 +2313,20 @@ const cambiarDuracion = async (req, res) => {
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: id,
       accion: 'UPDATE',
-      valor_anterior: { duracion_dias: servicio.duracion_dias },
-      valor_nuevo: { duracion_dias: nuevaDuracion }, ip: req.ip
+      valor_anterior: { duracion_dias: servicio.duracion_dias, dias: programacionAnterior },
+      valor_nuevo: { duracion_dias: fechas.length, dias: fechas }, ip: req.ip
     });
     sincronizarRecordatorioServicio(id).catch(err => console.error('Sync recordatorio:', err));
-    res.json({ ok: true, duracion_dias: nuevaDuracion });
+    res.json({
+      ok: true,
+      duracion_dias: fechas.length,
+      fecha_programada: fechas[0],
+      dias: fechas,
+      tramos: agruparEnTramos(fechas)
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Error al cambiar la duración: ' + err.message });
+    res.status(500).json({ error: 'Error al reprogramar el servicio: ' + err.message });
   }
 };
 
@@ -2005,7 +2352,8 @@ const habilitarCierreFueraPlazo = async (req, res) => {
       select: {
         id: true, codigo: true, estado: true, estado_servicio: true,
         fecha_programada: true, duracion_dias: true,
-        cierre_fuera_plazo_habilitado: true
+        cierre_fuera_plazo_habilitado: true,
+        dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' }, select: { fecha: true, estado: true } }
       }
     });
     if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
@@ -2041,8 +2389,9 @@ const habilitarCierreFueraPlazo = async (req, res) => {
 
 module.exports = {
   listar, obtener, crear, actualizar, cambiarEstado,
-  asignarTecnicos, iniciarServicio, finalizarServicio, cancelar, eliminar, realizados,
-  promoverBorrador, revisarServicio, cambiarRequiereFactura, cambiarDuracion,
+  asignarTecnicos, finalizarServicio, cancelar, eliminar, realizados,
+  promoverBorrador, revisarServicio, cambiarRequiereFactura, cambiarProgramacion,
   actualizarDatosContacto, habilitarCierreFueraPlazo,
-  crearGuia, actualizarGuia, eliminarGuia
+  crearGuia, actualizarGuia, eliminarGuia, actualizarInformeTecnico,
+  guardarOt, eliminarOt
 };

@@ -152,7 +152,7 @@ async function main() {
     { codigo: 'SRV-0001', subtipo: 'Mantenimiento preventivo', estado: 'Pendiente', titulo: 'Mantenimiento mensual', prioridad: 'media', precio: 450 },
     { codigo: 'SRV-0002', subtipo: 'Reparación correctiva', estado: 'Asignado', titulo: 'Cambio de cables de tracción', prioridad: 'alta', precio: 1800 },
     { codigo: 'SRV-0003', subtipo: 'Emergencia 24/7', estado: 'En curso', titulo: 'Persona atrapada en cabina', prioridad: 'alta', precio: 300 },
-    { codigo: 'SRV-0004', subtipo: 'Atención rápida', estado: 'Finalizado por técnico', titulo: 'Ajuste de puertas', prioridad: 'baja', precio: 150 },
+    { codigo: 'SRV-0004', subtipo: 'Atención rápida', estado: 'Finalizado', titulo: 'Ajuste de puertas', prioridad: 'baja', precio: 150 },
     { codigo: 'PRY-0001', subtipo: 'Instalación de ascensor', estado: 'Pendiente', titulo: 'Instalación ascensor 8 paradas', prioridad: 'media', precio: 85000 }
   ];
   const hoy = new Date();
@@ -195,7 +195,6 @@ async function main() {
           rol_asignacion: 'Responsable',
           responsable_principal: 1,
           responsable_documentacion: 1,
-          responsable_checklist: 1
         });
     }
   }

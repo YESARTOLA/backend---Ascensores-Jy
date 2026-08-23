@@ -20,19 +20,20 @@ router.post(
   permitirRoles('super_admin', 'admin', 'coordinador'),
   c.materializarEvento
 );
-// Precio del plan: por ascensor y/o global (se reparte proporcional al desglose
-// vigente). Editable mientras haya periodos sin aprobar; los ya aprobados
-// conservan su monto en la cuota del cobro.
-router.put('/:id/precios', permitirRoles('super_admin', 'admin'), c.actualizarPrecios);
-// Precio de UNA ocurrencia concreta del plan (mantenimiento de un ascensor en
-// una fecha), sin tocar el precio pactado del plan.
-router.put('/servicios/:idServicio/precio', permitirRoles('super_admin', 'admin'), c.actualizarPrecioServicio);
+// Precio del plan: UN monto global mensual. Es el único importe facturable; se
+// cobra igual cada mes sin importar cuántos mantenimientos caigan en él. Rige
+// para los meses aún no facturados.
+router.put('/:id/monto-mensual', permitirRoles('super_admin', 'admin'), c.actualizarMontoMensual);
 
-// Facturación por PERIODO del plan (unidad = ocurrencia de la frecuencia; una
-// factura y un pago por el total de todos los ascensores de ese periodo).
+// Cronograma del plan: todas las fechas de cada ascensor con su frecuencia.
+// El PUT activa u omite fechas concretas (omitir no cambia el monto mensual).
+router.get('/:id/programacion', c.listarProgramacion);
+router.put('/:id/programacion', permitirRoles('super_admin', 'admin', 'coordinador'), c.cambiarActivoProgramacion);
+
+// Facturación por MES del plan: una factura y un pago por mes, por el monto
+// mensual pactado, con el detalle de todas las visitas de ese mes.
 router.get('/:id/periodos', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.listarPeriodos);
 router.post('/:id/periodos/aprobar', permitirRoles('super_admin', 'admin'), c.aprobarPeriodo);
-router.post('/:id/periodos/ajustar', permitirRoles('super_admin', 'admin'), c.ajustarPeriodo);
 
 // Preview del borrado en cascada (solo lectura). Mismo rol que el DELETE: lo
 // consulta el modal de confirmación para mostrar el impacto real antes de borrar.
