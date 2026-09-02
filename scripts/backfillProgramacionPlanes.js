@@ -22,10 +22,14 @@
  *   node scripts/backfillProgramacionPlanes.js --dry-run  (solo informa)
  */
 const prisma = require('../config/prisma');
-const { ymdDeFecha, parseYMDLima } = require('../utils/tiempo');
+const { ymdDeFecha } = require('../utils/tiempo');
 const { programacionDelPlan } = require('../utils/programacionPlanMantenimiento');
-const { frecuenciaDeAscensor, tituloBasePlan, eventoDeVisita } = require('../utils/planMantenimientoMensual');
+const { frecuenciaDeAscensor } = require('../utils/planMantenimientoMensual');
 const { obtenerFrecuencia } = require('../utils/frecuenciaMantenimiento');
+// MISMA reparación que ofrece el botón "Generar programación" del detalle del
+// plan (POST /mantenimientos/:id/programacion/reconstruir): una sola
+// implementación para el arreglo masivo y para el de un plan suelto.
+const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPlan');
 
 const DRY = process.argv.includes('--dry-run');
 const USER_SISTEMA = null;
@@ -54,121 +58,37 @@ async function procesarPlan(plan, resumen) {
     return;
   }
 
-  // Servicios ya materializados del plan, indexados por ascensor + fecha.
-  const servicios = await prisma.tbl_servicios_proyectos.findMany({
-    where: { id_mantenimiento_plan: plan.id, estado: 1 },
-    select: {
-      id: true, fecha_programada: true,
-      ascensores: { where: { estado: 1 }, select: { id_ascensor: true } },
-      eventos_calendario: { where: { estado: 1 }, select: { id: true }, take: 1 }
-    }
-  });
-  const servicioPorClave = new Map();
-  for (const s of servicios) {
-    for (const a of s.ascensores) {
-      servicioPorClave.set(`${a.id_ascensor}|${ymdDeFecha(s.fecha_programada)}`, s);
-    }
-  }
-
-  // Eventos del plan sin servicio (programación futura del modelo anterior).
-  // El modelo viejo no ligaba evento ↔ ascensor, así que solo se pueden
-  // reutilizar por fecha; se reparten entre los ascensores de esa fecha.
-  const eventosLibres = await prisma.tbl_calendario_eventos.findMany({
-    where: { id_mantenimiento_plan: plan.id, estado: 1, id_servicio: null },
-    select: { id: true, fecha_inicio: true },
-    orderBy: { fecha_inicio: 'asc' }
-  });
-  const librePorFecha = new Map();
-  for (const e of eventosLibres) {
-    const k = ymdDeFecha(e.fecha_inicio);
-    if (!librePorFecha.has(k)) librePorFecha.set(k, []);
-    librePorFecha.get(k).push(e.id);
-  }
-
-  const junctionPorAscensor = new Map(activos.map(f => [f.id_ascensor, f]));
-  const tituloBase = tituloBasePlan(activos.map(f => f.ascensor?.edificio?.nombre).find(Boolean) || null);
-
-  // Visitas a crear. A la serie teórica se le añaden las fechas de servicios
-  // reales que no coincidan con ninguna teórica (reagendados), para no perder
-  // ningún mantenimiento ya ejecutado.
-  const clavesTeoricas = new Set(teoricas.map(t => `${t.id_ascensor}|${t.fecha}`));
-  const extra = [];
-  for (const [clave, s] of servicioPorClave) {
-    if (clavesTeoricas.has(clave)) continue;
-    const [idAsc, fecha] = clave.split('|');
-    if (!junctionPorAscensor.has(Number(idAsc))) continue;
-    extra.push({ id_ascensor: Number(idAsc), fecha, numero_mes: null, ordinal: null });
-  }
-
-  const todas = [...teoricas, ...extra].sort((a, b) =>
-    a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : a.id_ascensor - b.id_ascensor
-  );
-
-  // Ordinal correlativo por ascensor sobre el conjunto final ordenado por fecha.
-  const contador = new Map();
-  const filas = todas.map(t => {
-    const n = (contador.get(t.id_ascensor) || 0) + 1;
-    contador.set(t.id_ascensor, n);
-    // Mes del plan: el teórico, o el que corresponda a la fecha para los extra.
-    let numeroMes = t.numero_mes;
-    if (numeroMes == null) {
-      const { mesDeFecha } = require('../utils/programacionPlanMantenimiento');
-      numeroMes = mesDeFecha(fechaInicioYMD, Math.max(duracionMeses, 600), t.fecha) || 1;
-    }
-    return { ...t, ordinal: n, numero_mes: numeroMes };
-  });
-
+  // DRY-RUN: solo informa cuántas visitas saldrían y cuántas engancharían con un
+  // servicio ya existente. No toca la base.
   if (DRY) {
+    const servicios = await prisma.tbl_servicios_proyectos.findMany({
+      where: { id_mantenimiento_plan: plan.id, estado: 1 },
+      select: { fecha_programada: true, ascensores: { where: { estado: 1 }, select: { id_ascensor: true } } }
+    });
+    const claves = new Set();
+    for (const s of servicios) {
+      for (const a of s.ascensores) claves.add(`${a.id_ascensor}|${ymdDeFecha(s.fecha_programada)}`);
+    }
+    const clavesTeoricas = new Set(teoricas.map(t => `${t.id_ascensor}|${t.fecha}`));
+    const extra = [...claves].filter(k => !clavesTeoricas.has(k)).length;
     resumen.planes++;
-    resumen.visitas += filas.length;
-    resumen.enganchadas += filas.filter(f => servicioPorClave.has(`${f.id_ascensor}|${f.fecha}`)).length;
+    resumen.visitas += teoricas.length + extra;
+    resumen.enganchadas += claves.size;
     return;
   }
 
-  await prisma.$transaction(async (tx) => {
-    for (const f of filas) {
-      const junction = junctionPorAscensor.get(f.id_ascensor);
-      if (!junction) continue;
-      const clave = `${f.id_ascensor}|${f.fecha}`;
-      const servicio = servicioPorClave.get(clave) || null;
-
-      let idEvento = servicio?.eventos_calendario?.[0]?.id || null;
-      if (!idEvento) {
-        const libres = librePorFecha.get(f.fecha) || [];
-        idEvento = libres.shift() || null;
-      }
-      if (!idEvento) {
-        const nuevo = await tx.tbl_calendario_eventos.create({
-          data: eventoDeVisita({
-            plan, fechaYMD: f.fecha, tituloBase, codigoAscensor: junction.ascensor?.codigo || null
-          })
-        });
-        idEvento = nuevo.id;
-        resumen.eventosCreados++;
-      }
-
-      await tx.tbl_mantenimientos_programacion.create({
-        data: {
-          id_plan: plan.id,
-          id_plan_ascensor: junction.id,
-          id_ascensor: f.id_ascensor,
-          numero_mes: f.numero_mes,
-          ordinal: f.ordinal,
-          fecha_programada: parseYMDLima(f.fecha),
-          id_servicio: servicio?.id || null,
-          id_evento: idEvento,
-          user_id_registration: USER_SISTEMA
-        }
-      });
-      if (servicio) resumen.enganchadas++;
-    }
-    await tx.tbl_mantenimientos_planes.update({
-      where: { id: plan.id }, data: { cantidad_mantenimientos: filas.length }
-    });
-  }, { timeout: 120000 });
+  // La reconstrucción real vive en utils/reconstruirCronogramaPlan: la misma que
+  // usa el botón "Generar programación" del detalle del plan.
+  const r = await prisma.$transaction(
+    (tx) => reconstruirCronogramaPlan(tx, plan, { userId: USER_SISTEMA }),
+    { timeout: 120000 }
+  );
+  if (r.motivo) { resumen.errores.push(`Plan ${plan.id}: ${r.motivo}`); return; }
 
   resumen.planes++;
-  resumen.visitas += filas.length;
+  resumen.visitas += r.creadas;
+  resumen.enganchadas += r.enganchadas;
+  resumen.eventosCreados += r.eventosCreados;
 }
 
 (async () => {

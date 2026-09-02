@@ -1,11 +1,34 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
+const { idTecnicoFiltro } = require('../utils/visibilidadCalendario');
+
+/**
+ * El TÉCNICO solo se ve a sí mismo en este módulo.
+ *
+ * El resto de la aplicación ya le acota todo a lo suyo (servicios, calendario,
+ * emergencias, correctivos, mantenimientos…), pero este endpoint era la puerta
+ * de atrás: el listado devuelve la ficha completa de la plantilla —nombre,
+ * documento, teléfono y correo— y el detalle incluye TODAS las asignaciones
+ * activas del técnico consultado, es decir la programación de un compañero.
+ *
+ * Se acota el alcance en vez de responder 403 a propósito: los formularios de
+ * gestión piden esta lista junto a clientes y ascensores en un mismo
+ * `Promise.all`, y un rechazo tumbaría también esas cargas. Devolviendo su
+ * propia ficha, quien no deba ver la plantilla recibe una respuesta válida y
+ * ninguna pantalla se queda a medias.
+ *
+ * `idTecnicoFiltro` es el mismo SSoT que usan calendario y mantenimientos:
+ * devuelve null para los roles que ven todo, y el id del técnico (o -1 si el
+ * usuario no tiene ficha vinculada) para los que solo ven lo suyo.
+ */
 
 const listar = async (req, res) => {
   try {
     const { q, estado_operativo } = req.query;
     const where = { estado: 1 };
+    const idTec = idTecnicoFiltro(req.user);
+    if (idTec !== null) where.id = idTec;
     if (q) where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
       { documento: { contains: q, mode: 'insensitive' } },
@@ -35,6 +58,13 @@ const listar = async (req, res) => {
 const obtener = async (req, res) => {
   try {
     const id = Number(req.params.id);
+    // Un técnico solo abre su propia ficha: la de otro traería su agenda
+    // completa. 404 y no 403, igual que en el detalle de servicios, para no
+    // confirmar qué fichas existen.
+    const idTec = idTecnicoFiltro(req.user);
+    if (idTec !== null && id !== idTec) {
+      return res.status(404).json({ error: 'Técnico no encontrado' });
+    }
     const tecnico = await prisma.tbl_tecnicos.findUnique({
       where: { id },
       include: {

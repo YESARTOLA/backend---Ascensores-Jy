@@ -46,14 +46,18 @@ function conFechaInicioServicio(f) {
   };
 }
 
+// Las dos situaciones que Facturas presenta como indicadores y como filtro
+// rápido de la cabecera. Valores admitidos por el parámetro `situacion`.
+const SITUACIONES_FACTURA = ['facturado', 'pendiente_cobro'];
+
 /**
- * Resumen de facturación del conjunto FILTRADO completo (no de la página
- * visible): alimenta el indicador de la cabecera de Facturas.
+ * Analiza el conjunto FILTRADO completo (no la página visible) y devuelve, por
+ * factura, su importe emitido, su moneda y cuánto de ese importe sigue
+ * pendiente de cobro. De aquí salen dos cosas que deben coincidir siempre:
+ * los indicadores de la cabecera y el filtro rápido por situación.
  *
- *   - `facturado`: las facturas del filtro con su importe. Las ANULADAS se
- *     excluyen: no son facturación válida aunque sigan listadas.
- *   - `pendiente`: de esas mismas facturas, cuántas siguen con saldo y cuánto
- *     falta cobrar.
+ * Las facturas ANULADAS quedan fuera: no son facturación válida aunque sigan
+ * listadas en la tabla.
  *
  * Cómo se reparte el saldo entre las facturas de un mismo cobro (para no
  * contarlo dos veces): una factura de cuota se lleva el saldo de SU cuota; las
@@ -63,10 +67,10 @@ function conFechaInicioServicio(f) {
  * sigue perteneciendo a la factura general que cubre el cobro. En ambos casos el
  * pendiente de una factura nunca supera su propio importe.
  *
- * Los importes van desglosados POR MONEDA: la cartera mezcla PEN y USD y sumarlos
- * daría un número falso.
+ * @returns {Promise<Array<{id:number, moneda:string, monto:number, pendiente:number}>>}
+ *          importes en CENTAVOS enteros (sin residuos de coma flotante).
  */
-async function resumenFacturas(where) {
+async function analizarFacturas(where) {
   const filas = await prisma.tbl_facturas.findMany({
     where,
     select: {
@@ -124,24 +128,40 @@ async function resumenFacturas(where) {
     pendientePorFactura.set(f.id, Math.min(cent(f.monto), saldoCuota(f.cuota)));
   }
 
+  return activas.map(f => ({
+    id: f.id,
+    moneda: monedaDe(f),
+    monto: cent(f.monto),
+    pendiente: pendientePorFactura.get(f.id) || 0
+  }));
+}
+
+/**
+ * Resume las facturas analizadas en los dos indicadores de la cabecera.
+ *
+ *   - `facturado`: cuántas facturas hay y por cuánto se emitieron;
+ *   - `pendiente`: de esas mismas, las que siguen con saldo y cuánto falta.
+ *
+ * Los importes van desglosados POR MONEDA: la cartera mezcla PEN y USD y
+ * sumarlos daría un número falso. Mismo formato que `resumen_facturacion` de
+ * Contabilidad: monedas ordenadas de mayor a menor, para que la UI las pinte
+ * sin adivinar.
+ */
+function resumirFacturas(analizadas) {
   const facturado = { cantidad: 0, montos: new Map() };
   const pendiente = { cantidad: 0, montos: new Map() };
   const acumular = (grupo, moneda, centavos) =>
     grupo.montos.set(moneda, (grupo.montos.get(moneda) || 0) + centavos);
 
-  for (const f of activas) {
-    const moneda = monedaDe(f);
+  for (const f of analizadas) {
     facturado.cantidad++;
-    acumular(facturado, moneda, cent(f.monto));
-    const saldo = pendientePorFactura.get(f.id) || 0;
-    if (saldo > 0) {
+    acumular(facturado, f.moneda, f.monto);
+    if (f.pendiente > 0) {
       pendiente.cantidad++;
-      acumular(pendiente, moneda, saldo);
+      acumular(pendiente, f.moneda, f.pendiente);
     }
   }
 
-  // Mismo formato que `resumen_facturacion` de Contabilidad: importes por moneda
-  // ordenados de mayor a menor, para que la UI los pinte sin adivinar.
   const aSalida = (g) => ({
     cantidad: g.cantidad,
     montos: [...g.montos.entries()]
@@ -153,7 +173,7 @@ async function resumenFacturas(where) {
 
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, desde, hasta } = req.query;
+    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, desde, hasta } = req.query;
     // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
     // tipo de servicio): asignarlos a where.OR directamente se pisarían.
     const and = [];
@@ -222,6 +242,25 @@ const listar = async (req, res) => {
     // Alcance por tipo de edificio (Administrador): factura de servicio o de plan.
     conAlcance(where, porServicioOPlanAscensorEdificioWhere(req.user));
 
+    // Análisis del conjunto filtrado ANTES de paginar y antes de aplicar la
+    // situación: de él salen los dos indicadores y el propio filtro rápido, así
+    // que pulsar "Pendiente de cobro" deja en la tabla exactamente las facturas
+    // que ese indicador cuenta.
+    const analizadas = await analizarFacturas(where);
+    // El pendiente de una factura no es una columna de la tabla (se reparte el
+    // saldo del cobro entre sus facturas), así que el recorte va por id.
+    // Un valor desconocido se ignora, en vez de devolver una lista vacía silenciosa.
+    const situacionFiltro = SITUACIONES_FACTURA.includes(situacion) ? situacion : null;
+    const visibles = situacionFiltro === 'pendiente_cobro'
+      ? analizadas.filter(f => f.pendiente > 0)
+      : analizadas;
+    if (situacionFiltro === 'pendiente_cobro') {
+      and.push({ id: { in: visibles.map(f => f.id) } });
+    } else if (situacionFiltro === 'facturado') {
+      // "Facturado" son las facturas válidas del filtro: todas menos las anuladas.
+      and.push({ estado_factura: { not: ESTADO_FACTURA_ANULADA } });
+    }
+
     const result = await paginar(
       prisma.tbl_facturas,
       {
@@ -266,11 +305,11 @@ const listar = async (req, res) => {
       req.query
     );
     if (Array.isArray(result?.data)) result.data = result.data.map(conFechaInicioServicio);
-    // El resumen se calcula con el MISMO `where` que la tabla y antes de paginar:
-    // así los indicadores describen todo el recorte elegido, no las 25 filas
-    // visibles, y no pueden desincronizarse de los filtros. La ruta ya está
-    // restringida a roles con visibilidad financiera (ver facturasRoutes).
-    res.json({ ...result, resumen_facturas: await resumenFacturas(where) });
+    // El resumen describe TODO el recorte elegido, no las 25 filas visibles, y
+    // sale del mismo análisis que alimenta el filtro: no pueden desincronizarse.
+    // La ruta ya está restringida a roles con visibilidad financiera (ver
+    // facturasRoutes).
+    res.json({ ...result, resumen_facturas: resumirFacturas(visibles) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar facturas' });
@@ -439,13 +478,26 @@ const crear = async (req, res) => {
     });
     if (!servicio) return res.status(400).json({ error: 'Servicio no existe' });
     // Servicios de un PLAN de mantenimiento: la facturación es única a nivel de
-    // plan (una factura por periodo, contra la cuota del cobro del plan). Emitir
-    // un comprobante por el mantenimiento de un solo ascensor duplicaría lo que
-    // ya se factura en el total del periodo.
+    // plan (una factura por mes, contra la cuota del cobro del plan). Emitir un
+    // comprobante por el mantenimiento de un solo ascensor duplicaría lo que ya
+    // se factura en el total del mes.
+    //
+    // EXCEPCIÓN legacy: planes del modelo anterior (sin cobro único de plan)
+    // cuyos servicios nacieron con cobro PROPIO. Ahí no existe cuota de plan
+    // que facturar — el único vehículo de cobro/factura es el del servicio, y
+    // bloquearlo dejaría esas cuotas incobrables. Se permite el flujo normal
+    // por servicio SOLO en ese caso.
     if (servicio.id_mantenimiento_plan) {
-      return res.status(400).json({
-        error: 'Este mantenimiento pertenece a un plan: se factura por el total del periodo, no por servicio. Emita la factura desde el cobro del plan.'
+      const cobroPlan = await prisma.tbl_cobros.findFirst({
+        where: { id_mantenimiento_plan: servicio.id_mantenimiento_plan, estado: 1 },
+        select: { id: true }
       });
+      const cobroPropioVivo = servicio.cobro && servicio.cobro.estado === 1;
+      if (cobroPlan || !cobroPropioVivo) {
+        return res.status(400).json({
+          error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura desde el detalle del plan (Facturación mensual) o en Gestión de cobros → Por facturar.'
+        });
+      }
     }
     // Regla ÚNICA de elegibilidad contable (utils/elegibilidadContable):
     //  - Origen cotización → habilitado por conversión efectiva a servicio.

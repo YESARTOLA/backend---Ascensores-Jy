@@ -57,6 +57,34 @@ const AREAS_CLIENTE = Object.keys(CAMPOS_CONTRATO_AREA);
 // Valor extra del filtro por área: el cliente registra las dos.
 const AREA_AMBAS = 'ambos';
 
+/**
+ * Áreas a las que pertenece un cliente POR CONTRATO: aquellas con inicio y fin
+ * registrados. Es la marca EXPLÍCITA del área y existe desde que se crea el
+ * cliente, antes de que tenga ningún servicio o proyecto.
+ *
+ * Espejo en JS de la primera condición de `clienteAlcanceWhere`
+ * (utils/alcanceUsuario.js): lo que allí se consulta en SQL, aquí se evalúa
+ * sobre una fila ya cargada. El cliente debe traer las columnas de contrato.
+ *
+ * @param {object} cliente fila de tbl_clientes (o un select con esas columnas)
+ * @returns {string[]} subconjunto de AREAS_CLIENTE
+ */
+function areasPorContrato(cliente) {
+  if (!cliente) return [];
+  return AREAS_CLIENTE.filter(area => {
+    const campos = CAMPOS_CONTRATO_AREA[area];
+    return cliente[campos.inicio] != null && cliente[campos.fin] != null;
+  });
+}
+
+/** Columnas de contrato que necesita `areasPorContrato`, como `select` de Prisma. */
+const SELECT_CONTRATO_AREAS = Object.fromEntries(
+  AREAS_CLIENTE.flatMap(area => {
+    const campos = CAMPOS_CONTRATO_AREA[area];
+    return [[campos.inicio, true], [campos.fin, true]];
+  })
+);
+
 module.exports = {
   CLASIFICACIONES,
   CLASIFICACIONES_CODIGOS,
@@ -64,5 +92,7 @@ module.exports = {
   CAMPOS_CONTRATO_AREA,
   ETIQUETA_AREA,
   AREAS_CLIENTE,
-  AREA_AMBAS
+  AREA_AMBAS,
+  areasPorContrato,
+  SELECT_CONTRATO_AREAS
 };

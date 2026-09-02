@@ -11,8 +11,8 @@ const TIPOS_CUENTA = [
 ];
 
 const MONEDAS = [
-  { codigo: 'PEN', etiqueta: 'Soles (PEN)', simbolo: 'S/' },
-  { codigo: 'USD', etiqueta: 'Dólares (USD)', simbolo: '$' }
+  { codigo: 'PEN', etiqueta: 'Soles (PEN)', etiqueta_corta: 'Soles', simbolo: 'S/' },
+  { codigo: 'USD', etiqueta: 'Dólares (USD)', etiqueta_corta: 'Dólares', simbolo: '$' }
 ];
 
 const METODOS_PAGO = [
@@ -23,6 +23,17 @@ const METODOS_PAGO = [
   { codigo: 'Depósito',       etiqueta: 'Depósito',       requiere_cuenta: true  },
   { codigo: 'Otro',           etiqueta: 'Otro',           requiere_cuenta: false }
 ];
+
+/**
+ * Nombre corto de la moneda ("Soles" / "Dólares"), para la columna filtrable de
+ * las exportaciones a Excel: ahí el importe va como número puro (sumable), sin
+ * símbolo, y es esta columna la que permite separar una divisa de la otra.
+ * Devuelve '' si el código no está en el catálogo.
+ */
+function etiquetaMoneda(codigo) {
+  const m = MONEDAS.find(x => x.codigo === String(codigo || '').toUpperCase());
+  return m ? m.etiqueta_corta : '';
+}
 
 const TIPOS_CUENTA_CODIGOS = TIPOS_CUENTA.map(t => t.codigo);
 const MONEDAS_CODIGOS = MONEDAS.map(m => m.codigo);
@@ -36,6 +47,7 @@ const METODOS_REQUIEREN_CUENTA = METODOS_PAGO.filter(m => m.requiere_cuenta).map
 module.exports = {
   TIPOS_CUENTA,
   MONEDAS,
+  etiquetaMoneda,
   METODOS_PAGO,
   TIPOS_CUENTA_CODIGOS,
   MONEDAS_CODIGOS,

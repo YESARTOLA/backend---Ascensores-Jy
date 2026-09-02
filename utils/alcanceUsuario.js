@@ -109,13 +109,22 @@ function clienteAlcanceWhere(user) {
   return { OR: condiciones };
 }
 
-/** Fragmento Prisma para tbl_ascensores: solo ascensores de clientes del ámbito (vía edificio). */
+/**
+ * Fragmento Prisma para tbl_ascensores: solo ascensores de clientes del ámbito
+ * (vía edificio).
+ *
+ * Delega en `clienteAlcanceWhere` para que "cliente del ámbito" signifique
+ * EXACTAMENTE lo mismo aquí que en la lista de clientes. Antes esta función
+ * repetía por su cuenta solo la segunda señal (tener servicios del área) y
+ * omitía la del contrato: un cliente recién creado se veía en la lista, pero sus
+ * ascensores no aparecían por ningún lado hasta que alguien le registrara el
+ * primer servicio — y como para registrarlo hay que elegir el ascensor, el
+ * usuario acotado quedaba sin salida (no podía cotizar ni crear el servicio).
+ */
 function ascensorAlcanceWhere(user) {
   const tipos = tiposRegistroPermitidos(user);
   if (tipos === null) return {};
-  return {
-    edificio: { is: { cliente: { is: { servicios: { some: { estado: 1, tipo_registro: inTipos(tipos) } } } } } }
-  };
+  return { edificio: { is: { cliente: { is: clienteAlcanceWhere(user) } } } };
 }
 
 /**

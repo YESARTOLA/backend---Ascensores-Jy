@@ -146,6 +146,17 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   });
   await tx.tbl_recordatorios.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
+  // --- Cronograma del plan de mantenimiento ---
+  // Si el servicio materializaba una visita del cronograma, la visita queda
+  // desenganchada (no se ejecutó; sin esto quedaría ocupada por un servicio
+  // muerto y jamás podría volver a programarse). Aquí solo se desengancha; los
+  // flujos que además deben devolver la fecha al calendario (cancelar/eliminar
+  // servicio) usan planMantenimientoMensual.liberarVisitasDeServicio.
+  await tx.tbl_mantenimientos_programacion.updateMany({
+    where: { id_servicio: idServicio, estado: 1 },
+    data: { id_servicio: null, ...stamp }
+  });
+
   // --- Archivos (fila BD + key Wasabi) ---
   for (const idArchivo of archivoIds) {
     const key = await bajaArchivoEnTx(tx, idArchivo, userId);

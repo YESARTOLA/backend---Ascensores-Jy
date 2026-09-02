@@ -133,6 +133,18 @@ function estaServicioFinalizado(estadoServicio) {
   return ESTADOS_POST_EJECUCION.includes(estadoServicio);
 }
 
+/**
+ * ¿El servicio cuenta como REALIZADO (trabajo ejecutado en campo)?
+ *
+ * Igual que `estaServicioFinalizado` pero excluye 'Cancelado': un servicio
+ * cancelado está en post-ejecución para el candado operativo, pero el trabajo
+ * NO se hizo. Es el criterio del avance de los planes de mantenimiento
+ * (visitas realizadas del mes) — espejo de utils/ejecucionFechas.estadoEjecucion.
+ */
+function estaServicioRealizado(estadoServicio) {
+  return estadoServicio !== ESTADO_SERVICIO_CANCELADO && estaServicioFinalizado(estadoServicio);
+}
+
 function esServicioEditable(estadoServicio) {
   return ESTADOS_SERVICIO_EDITABLES.includes(estadoServicio);
 }
@@ -313,6 +325,7 @@ module.exports = {
   cambiarEstadoServicioSiEstaEn,
   estadoServicioDesdeCobro,
   estaServicioFinalizado,
+  estaServicioRealizado,
   esServicioEditable,
   esServicioPostRevision,
   esEmergenciaCerrada,

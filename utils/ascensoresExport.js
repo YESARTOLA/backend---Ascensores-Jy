@@ -13,6 +13,11 @@ const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
 const { CLASIFICACIONES } = require('./catalogosClientes');
+const { etiquetaMoneda } = require('./catalogosBancarios');
+
+// Máscara del año: sin separador de miles (2026, no "2,026").
+const FMT_ANIO = '0';
+const FMT_ENTERO = '#,##0';
 
 const CLASIFICACION_MAP = Object.fromEntries(CLASIFICACIONES.map(c => [c.codigo, c.etiqueta]));
 
@@ -39,13 +44,14 @@ const COLUMNAS = [
   { header: 'Marca',               key: 'marca',                 width: 16 },
   { header: 'Modelo',              key: 'modelo',                width: 16 },
   { header: 'Capacidad',           key: 'capacidad',             width: 16 },
-  { header: 'Pisos',               key: 'pisos',                 width: 8 },
-  { header: 'Año aprox.',          key: 'anio_aproximado',       width: 11 },
+  { header: 'Pisos',               key: 'pisos',                 width: 8,  numFmt: FMT_ENTERO },
+  { header: 'Año aprox.',          key: 'anio_aproximado',       width: 11, numFmt: FMT_ANIO },
   { header: 'Ubicación',           key: 'ubicacion',             width: 24 },
   { header: 'Estado operativo',    key: 'estado_operativo',      width: 18 },
   { header: 'Registro',            key: 'registro',              width: 11 },
   { header: 'Instalación',         key: 'fecha_instalacion',     width: 13 },
   { header: 'Próx. mantenimiento', key: 'proximo_mantenimiento', width: 17 },
+  { header: 'Moneda',              key: 'moneda',                width: 10 },
   { header: 'Precios por servicio',key: 'precios',               width: 40 },
   { header: 'Observaciones',       key: 'observaciones',         width: 30 },
   { header: 'Registrado',          key: 'registrado',            width: 12 }
@@ -71,6 +77,9 @@ function mapearFila(a) {
     registro: a.estado === 0 ? 'Inactivo' : 'Activo',
     fecha_instalacion: fechaISO(a.fecha_instalacion),
     proximo_mantenimiento: fechaISO(a.proximo_mantenimiento),
+    // Un ascensor tiene un precio por subtipo de servicio: el detalle va como
+    // texto y esta columna resume la(s) divisa(s) para poder filtrar por ella.
+    moneda: [...new Set(precios.map(p => etiquetaMoneda(p.moneda)).filter(Boolean))].join(', '),
     precios: precios
       .map(p => `${p.tipo_servicio?.nombre || `Subtipo #${p.id_tipo_servicio}`}: ${p.moneda} ${Number(p.precio).toFixed(2)}`)
       .join(' · '),
@@ -102,7 +111,7 @@ async function generarExcelAscensores(ascensores) {
   ws.getCell('A2').font = { size: 9, color: { argb: 'FF6B7280' } };
 
   // Encabezados de tabla en fila 4
-  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width }));
+  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width, style: c.numFmt ? { numFmt: c.numFmt } : undefined }));
   const headerRow = ws.getRow(4);
   COLUMNAS.forEach((c, i) => {
     const cell = headerRow.getCell(i + 1);

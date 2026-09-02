@@ -19,7 +19,8 @@
 const { ymdDeFecha, parseYMDLima, combinarFechaHoraLima } = require('./tiempo');
 const { ESTADO_EVENTO_PROGRAMADO } = require('./estadoEvento');
 const { COLORES } = require('./recordatoriosAuto');
-const { estaServicioFinalizado } = require('./estadoServicio');
+const { estaServicioRealizado } = require('./estadoServicio');
+const { ESTADO_FACTURA_ANULADA } = require('./estadoFactura');
 const { programacionDelPlan, ventanaMes } = require('./programacionPlanMantenimiento');
 
 const COLOR_MANTENIMIENTO = COLORES.mantenimiento;
@@ -174,6 +175,58 @@ async function generarProgramacion(tx, { plan, filasJunction, userId }) {
 }
 
 /**
+ * Libera las visitas del cronograma enganchadas a un servicio que se CANCELA o
+ * ELIMINA: la visita vuelve a ser una fecha pendiente, materializable de nuevo.
+ *
+ * Sin esto la visita quedaría ocupada por un servicio muerto: no contaría como
+ * realizada (mesesDelPlan filtra servicios vivos/cancelados) pero tampoco se
+ * podría volver a programar, y el mes jamás llegaría a "completo".
+ *
+ * Para cada visita ACTIVA se crea un evento de calendario nuevo en estado
+ * programado (el del servicio quedó cancelado), para que la fecha siga visible
+ * y materializable desde el calendario. Las visitas omitidas solo se
+ * desenganchan.
+ *
+ * @param {object} client prisma o tx
+ * @param {number} idServicio
+ * @param {number} userId
+ * @returns {Promise<number>} visitas liberadas
+ */
+async function liberarVisitasDeServicio(client, idServicio, userId) {
+  const visitas = await client.tbl_mantenimientos_programacion.findMany({
+    where: { id_servicio: Number(idServicio), estado: 1 },
+    include: {
+      plan: { select: { id: true, hora_programada: true } },
+      ascensor: { select: { codigo: true, edificio: { select: { nombre: true } } } }
+    }
+  });
+  for (const v of visitas) {
+    let idEvento = null;
+    if (v.activo === 1) {
+      const evento = await client.tbl_calendario_eventos.create({
+        data: eventoDeVisita({
+          plan: v.plan,
+          fechaYMD: ymdDeFecha(v.fecha_programada),
+          tituloBase: tituloBasePlan(v.ascensor?.edificio?.nombre || null),
+          codigoAscensor: v.ascensor?.codigo || null
+        })
+      });
+      idEvento = evento.id;
+    }
+    await client.tbl_mantenimientos_programacion.update({
+      where: { id: v.id },
+      data: {
+        id_servicio: null,
+        ...(idEvento ? { id_evento: idEvento } : {}),
+        user_id_modification: userId,
+        date_time_modification: new Date()
+      }
+    });
+  }
+  return visitas.length;
+}
+
+/**
  * Estado de facturación del plan agrupado por MES DEL PLAN — la unidad de cobro.
  *
  * Por cada mes devuelve el detalle de visitas (qué ascensor, cuántas veces y en
@@ -214,9 +267,14 @@ async function mesesDelPlan(client, idPlan) {
         select: { id: true, numero_cuota: true, numero_mes: true, fecha_vencimiento: true, monto: true, monto_pagado: true, estado_cuota: true }
       })
     : [];
+  // Una factura ANULADA no cubre el mes: la cuota vuelve a "Por facturar" y el
+  // mes debe volver a 'aprobado' (mismo criterio que cuotasNoFacturadas).
   const facturas = plan.cobro
     ? await client.tbl_facturas.findMany({
-        where: { id_mantenimiento_plan: Number(idPlan), estado: 1, id_cuota: { not: null } },
+        where: {
+          id_mantenimiento_plan: Number(idPlan), estado: 1,
+          id_cuota: { not: null }, estado_factura: { not: ESTADO_FACTURA_ANULADA }
+        },
         select: { id_cuota: true }
       })
     : [];
@@ -256,7 +314,9 @@ async function mesesDelPlan(client, idPlan) {
       }
       const item = porAscensor.get(key);
       const servicioVivo = v.servicio && v.servicio.estado === 1 ? v.servicio : null;
-      const realizada = !!servicioVivo && estaServicioFinalizado(servicioVivo.estado_servicio);
+      // 'Cancelado' no cuenta: el trabajo no se hizo aunque el servicio esté
+      // en un estado post-ejecución (ver estaServicioRealizado).
+      const realizada = !!servicioVivo && estaServicioRealizado(servicioVivo.estado_servicio);
       item.visitas += 1;
       if (realizada) item.realizadas += 1;
       item.fechas.push({
@@ -410,6 +470,7 @@ module.exports = {
   tituloBasePlan,
   eventoDeVisita,
   generarProgramacion,
+  liberarVisitasDeServicio,
   mesesDelPlan,
   detalleMensualDeCuota,
   detalleMensualPorCuota,

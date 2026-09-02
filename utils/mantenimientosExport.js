@@ -17,6 +17,12 @@ const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
 const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
 const { totalesDelPlan } = require('./planMantenimientoMensual');
+const { etiquetaMoneda, MONEDA_POR_DEFECTO } = require('./catalogosBancarios');
+
+// Máscaras de número de Excel. Los importes se escriben como NÚMERO (sumable en
+// la hoja) y sin símbolo: la divisa va en su propia columna "Moneda".
+const FMT_DECIMAL = '#,##0.00';
+const FMT_ENTERO = '#,##0';
 
 // Paleta corporativa (espejada con frontend/src/utils/pdfReport.js)
 const BRAND = {
@@ -68,12 +74,6 @@ function labelFrecuencia(plan) {
   return etiquetaDe(plan.frecuencia, plan.frecuencia_dias_custom);
 }
 
-function formatMonto(monto, moneda) {
-  if (monto == null) return '';
-  const simbolo = moneda === 'USD' ? '$' : 'S/';
-  return `${simbolo} ${Number(monto).toFixed(2)}`;
-}
-
 function _descripcionFiltros(filtros) {
   const partes = [];
   if (filtros.ids_cliente?.length > 0) partes.push(`Clientes seleccionados: ${filtros.ids_cliente.length}`);
@@ -100,7 +100,7 @@ const COLUMNAS_PROG = [
   { header: 'Estado',           key: 'estado',            width: 14 },
   { header: 'Inicio real',      key: 'inicio_real',       width: 18 },
   { header: 'Fin real',         key: 'fin_real',          width: 18 },
-  { header: 'Días',             key: 'dias',              width: 6 },
+  { header: 'Días',             key: 'dias',              width: 6, numFmt: FMT_ENTERO },
   { header: 'Gratis',           key: 'gratis',            width: 7 },
   { header: 'Servicio',         key: 'codigo_servicio',   width: 14 }
 ];
@@ -111,14 +111,17 @@ const COLUMNAS_PLAN = [
   { header: 'Tipo servicio',     key: 'tipo_servicio',    width: 22 },
   { header: 'Modalidad',         key: 'modalidad',        width: 12 },
   { header: 'Frecuencia',        key: 'frecuencia',       width: 26 },
-  { header: 'Duración (meses)',  key: 'duracion_meses',   width: 15 },
-  { header: 'Mantenimientos',    key: 'cantidad',         width: 15 },
-  { header: 'Ejecutados',        key: 'ejecutados',       width: 12 },
+  // Ambas admiten el texto 'Indef.' cuando el plan no tiene tope; `_escribirFila`
+  // solo aplica la máscara si el valor llega numérico.
+  { header: 'Duración (meses)',  key: 'duracion_meses',   width: 15, numFmt: FMT_ENTERO },
+  { header: 'Mantenimientos',    key: 'cantidad',         width: 15, numFmt: FMT_ENTERO },
+  { header: 'Ejecutados',        key: 'ejecutados',       width: 12, numFmt: FMT_ENTERO },
   { header: 'Gratuitos',         key: 'gratuitos',        width: 12 },
   { header: 'Inicio',            key: 'inicio',           width: 14 },
-  { header: 'Meses facturables', key: 'meses_facturables', width: 16 },
-  { header: 'Monto mensual',     key: 'monto_mensual',    width: 14 },
-  { header: 'Total del plan',    key: 'precio',           width: 14 },
+  { header: 'Meses facturables', key: 'meses_facturables', width: 16, numFmt: FMT_ENTERO },
+  { header: 'Moneda',            key: 'moneda',           width: 10 },
+  { header: 'Monto mensual',     key: 'monto_mensual',    width: 14, numFmt: FMT_DECIMAL },
+  { header: 'Total del plan',    key: 'precio',           width: 14, numFmt: FMT_DECIMAL },
   { header: 'Estado plan',       key: 'estado_plan',      width: 12 }
 ];
 
@@ -153,7 +156,7 @@ function _mapearFilaPlan(p) {
   const tot = totalesDelPlan(p);
   const mensual = tot.monto_mensual;
   const meses = tot.meses;
-  const moneda = p.moneda || (p.ascensores || [])[0]?.moneda || 'PEN';
+  const moneda = p.moneda || (p.ascensores || [])[0]?.moneda || MONEDA_POR_DEFECTO;
   return {
     ascensor: ascs.map(a => a.codigo).filter(Boolean).join(', '),
     ubicacion: ascs.map(a => a.ubicacion).filter(Boolean).join(', '),
@@ -165,11 +168,27 @@ function _mapearFilaPlan(p) {
     ejecutados: p.mantenimientos_ejecutados_total ?? 0,
     gratuitos: `${p.mantenimientos_gratuitos_ejecutados || 0} / ${p.cantidad_mantenimientos_gratuitos || 0}`,
     inicio: fechaISO(p.fecha_inicio),
-    monto_mensual: formatMonto(mensual, moneda),
     meses_facturables: tot.meses_facturables,
-    precio: formatMonto(tot.total, moneda),
+    moneda: etiquetaMoneda(moneda),
+    // Importes numéricos: en Excel deben sumarse, no leerse como texto.
+    monto_mensual: mensual == null ? null : Number(mensual),
+    precio: tot.total == null ? null : Number(tot.total),
     estado_plan: p.estado_plan || ''
   };
+}
+
+/**
+ * Vuelca una fila de datos en la hoja aplicando la máscara declarada en la
+ * columna. Sin `numFmt` un importe numérico se vería como "1200" en vez de
+ * "1,200.00"; con él la celda sigue siendo NÚMERO y se muestra formateada.
+ */
+function _escribirFila(fila, columnas, datos) {
+  columnas.forEach((c, i) => {
+    const celda = fila.getCell(i + 1);
+    const valor = datos[c.key];
+    celda.value = valor === undefined ? null : valor;
+    if (c.numFmt && typeof valor === 'number') celda.numFmt = c.numFmt;
+  });
 }
 
 function _aplicarEstilosCabecera(cell, fillArgb = BRAND.tealDark, color = 'FFFFFFFF') {
@@ -286,7 +305,7 @@ function _dibujarHojaCliente(ws, empresa, hoy, grupo) {
     grupo.planes.forEach((p, idx) => {
       const fila = ws.getRow(cursor);
       const datos = _mapearFilaPlan(p);
-      COLUMNAS_PLAN.forEach((c, i) => { fila.getCell(i + 1).value = datos[c.key]; });
+      _escribirFila(fila, COLUMNAS_PLAN, datos);
       fila.font = { size: 10, color: { argb: BRAND.carbon } };
       if (idx % 2 === 1) {
         fila.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND.ivoryMid } }; });
@@ -318,7 +337,7 @@ function _dibujarHojaCliente(ws, empresa, hoy, grupo) {
     grupo.programaciones.forEach((i, idx) => {
       const fila = ws.getRow(cursor);
       const datos = _mapearFilaPrograma(i);
-      COLUMNAS_PROG.forEach((c, k) => { fila.getCell(k + 1).value = datos[c.key]; });
+      _escribirFila(fila, COLUMNAS_PROG, datos);
       fila.font = { size: 10, color: { argb: BRAND.carbon } };
       if (idx % 2 === 1) {
         fila.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND.ivoryMid } }; });

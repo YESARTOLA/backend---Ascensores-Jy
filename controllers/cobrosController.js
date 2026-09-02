@@ -142,6 +142,18 @@ async function persistirEstadoMora(cobro) {
 }
 
 /**
+ * ¿A este cobro le falta cobrar? Es el criterio ÚNICO de "Por cobrar": lo usan
+ * el contador de la tarjeta "Pendientes a cobrar" y el botón de filtro
+ * homónimo, de modo que pulsarlo deja en la tabla exactamente los cobros que la
+ * tarjeta cuenta.
+ *
+ * Un cobro está abierto mientras su saldo no sea cero — incluidos los
+ * parcialmente pagados, que siguen debiendo. Se compara en centavos para no
+ * arrastrar el error del float (mismo criterio que el resto del módulo).
+ */
+const estaPorCobrar = (c) => aCentavos(c.saldo_pendiente) !== 0;
+
+/**
  * Resumen de cobranza del conjunto de cobros YA FILTRADO (sin paginar): los dos
  * indicadores de la cabecera de Gestión de cobros.
  *
@@ -172,8 +184,8 @@ function resumenCobranza(cobros) {
     const moneda = c.moneda || MONEDA_POR_DEFECTO;
     const saldo = aCentavos(c.saldo_pendiente);
     const abonado = aCentavos(c.total_abonado);
-    if (saldo === 0) cobrados.cantidad++;
-    else pendientes.cantidad++;
+    if (estaPorCobrar(c)) pendientes.cantidad++;
+    else cobrados.cantidad++;
     acumular(cobrados, moneda, abonado);
     acumular(pendientes, moneda, saldo);
   }
@@ -192,7 +204,7 @@ const listar = async (req, res) => {
     const {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
       id_cliente, id_tipo_servicio, id_proyecto,
-      tipo_categoria, situacion_cobro, banco, id_cuenta_bancaria,
+      tipo_categoria, situacion_cobro, por_cobrar, banco, id_cuenta_bancaria,
       monto_min, monto_max,
       fecha_proximo_desde, fecha_proximo_hasta,
       orden, direccion
@@ -311,6 +323,10 @@ const listar = async (req, res) => {
         return true;
       });
     }
+    // Botón "Por cobrar" del encabezado: mismo predicado que cuenta la tarjeta
+    // "Pendientes a cobrar". Es más amplio que la opción "Pendiente" del select
+    // de situación, que además exige que no haya ningún abono.
+    if (por_cobrar === '1') data = data.filter(estaPorCobrar);
     // Filtros legacy (compatibilidad; la UI ahora usa `situacion_cobro`).
     if (vencidos === '1') data = data.filter(c => c.vencido);
     if (en_mora === '1') data = data.filter(c => c.dias_mora > 0);

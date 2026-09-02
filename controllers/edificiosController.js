@@ -2,6 +2,7 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { TIPOS_EDIFICIO, normalizarTipoEdificio } = require('../utils/catalogosEdificios');
 const { TIPO_REGISTRO } = require('../utils/clasificacionServicio');
+const { areasPorContrato, SELECT_CONTRATO_AREAS } = require('../utils/catalogosClientes');
 const { bajaEdificioCascadaEnTx, calcularImpactoEdificio } = require('../utils/bajaEdificioCascada');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { whereEstadoDesdeFiltro } = require('../utils/filtroEstadoRegistro');
@@ -53,8 +54,13 @@ const listarDistritos = async (_req, res) => {
 // Edificios de un cliente (o búsqueda global por nombre/distrito con ?q).
 // Además de cliente y conteo de ascensores, deriva por edificio:
 //   - tipos_ascensores: tipos distintos de sus ascensores activos (para buscar)
-//   - tiene_servicios / tiene_proyectos: si alguno de sus ascensores participa en
-//     un servicio o proyecto (tbl_servicios_proyectos.tipo_registro), para filtrar.
+//   - tiene_servicios / tiene_proyectos: el ÁREA del edificio. Se hereda del
+//     contrato del cliente (un cliente con contrato de servicios hace que sus
+//     edificios sean del área de servicios desde el minuto uno) y se amplía con
+//     la actividad: si algún ascensor participa en un servicio o proyecto de la
+//     otra área, también se marca. Mismo criterio con el que `clienteAlcanceWhere`
+//     decide a qué área pertenece un cliente, para que la columna no diga "—" en
+//     edificios que sí tienen área asignada.
 const listar = async (req, res) => {
   try {
     const { id_cliente, q, estado } = req.query;
@@ -71,7 +77,8 @@ const listar = async (req, res) => {
       where,
       orderBy: { id: 'desc' },
       include: {
-        cliente: { select: { id: true, nombre: true } },
+        // Las columnas de contrato alimentan el área heredada del cliente.
+        cliente: { select: { id: true, nombre: true, ...SELECT_CONTRATO_AREAS } },
         _count: { select: { ascensores: true } },
         ascensores: {
           where: { estado: 1 },
@@ -89,8 +96,12 @@ const listar = async (req, res) => {
     const data = filas.map(({ ascensores, ...edificio }) => {
       const tiposAscensores = [...new Set(ascensores.map(a => a.tipo).filter(Boolean))]
         .sort((a, b) => a.localeCompare(b, 'es'));
-      let tieneServicios = false;
-      let tieneProyectos = false;
+      // Punto de partida: el área que el edificio HEREDA de su cliente, según
+      // los contratos registrados. La actividad de los ascensores solo puede
+      // añadir áreas, nunca quitarlas.
+      const areasCliente = areasPorContrato(edificio.cliente);
+      let tieneServicios = areasCliente.includes(TIPO_REGISTRO.SERVICIO);
+      let tieneProyectos = areasCliente.includes(TIPO_REGISTRO.PROYECTO);
       for (const a of ascensores) {
         for (const sa of a.servicios_ascensores) {
           const tr = sa.servicio?.tipo_registro;
@@ -99,7 +110,15 @@ const listar = async (req, res) => {
         }
         if (tieneServicios && tieneProyectos) break;
       }
-      return { ...edificio, tipos_ascensores: tiposAscensores, tiene_servicios: tieneServicios, tiene_proyectos: tieneProyectos };
+      return {
+        ...edificio,
+        // El cliente sale como antes (id + nombre): las columnas de contrato se
+        // trajeron solo para derivar el área y no tienen por qué viajar.
+        cliente: edificio.cliente && { id: edificio.cliente.id, nombre: edificio.cliente.nombre },
+        tipos_ascensores: tiposAscensores,
+        tiene_servicios: tieneServicios,
+        tiene_proyectos: tieneProyectos
+      };
     });
     res.json({ data });
   } catch (err) {
@@ -114,7 +133,8 @@ const obtener = async (req, res) => {
     const edificio = await prisma.tbl_edificios.findUnique({
       where: { id },
       include: {
-        cliente: { select: { id: true, nombre: true } },
+        // Las columnas de contrato alimentan el área heredada del cliente.
+        cliente: { select: { id: true, nombre: true, ...SELECT_CONTRATO_AREAS } },
         ascensores: { where: { estado: 1 }, orderBy: { id: 'desc' } }
       }
     });

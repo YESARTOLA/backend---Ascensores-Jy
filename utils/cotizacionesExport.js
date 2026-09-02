@@ -9,6 +9,7 @@ const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
+const { etiquetaMoneda } = require('./catalogosBancarios');
 
 const PALETA = {
   acento: '#e8853a',
@@ -62,7 +63,7 @@ function mapearFila(cot) {
     estado_global: cot.estado_global || '',
     version: v ? `v${v.numero_version}` : '',
     estado_version: v?.estado_version || '',
-    moneda: v?.moneda || '',
+    moneda: etiquetaMoneda(v?.moneda),
     monto_total: monto,
     // Forma lista para el PDF: "PEN 1,200.00" (en Excel el monto va numérico).
     monto_fmt: monto != null ? `${v?.moneda || ''} ${fmtMonto(monto)}`.trim() : '',

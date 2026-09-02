@@ -60,6 +60,38 @@ function esPorFacturar(realizado) {
   return ESTADOS_FACTURACION_PENDIENTE_EMISION.includes(realizado.estado_facturacion);
 }
 
+// Los dos grupos que Contabilidad presenta como indicadores: "Por facturar" y
+// "Facturado". Valores admitidos por el filtro `grupo_facturacion`.
+const GRUPOS_FACTURACION = ['por_facturar', 'facturado'];
+
+/**
+ * Traducción a cláusula Prisma (sobre tbl_servicios_realizados) de los MISMOS
+ * predicados que `esPorFacturar` / `esFacturado`.
+ *
+ * Existe para que el CONTEO de las tarjetas y el FILTRO de la tabla salgan del
+ * mismo criterio: pulsar "Por facturar" deja en la tabla exactamente los
+ * servicios que la tarjeta cuenta. Si cambia uno de los predicados, cambia
+ * también esta función.
+ *
+ * @param {string} grupo 'por_facturar' | 'facturado'
+ * @returns {object|null} cláusula Prisma, o null si el grupo no es válido.
+ */
+function whereGrupoFacturacion(grupo) {
+  if (grupo === 'por_facturar') {
+    // Espejo de esPorFacturar: requiere_factura ≠ 0, no gratuito y emisión
+    // todavía incompleta (incluye 'Parcialmente facturado').
+    return {
+      estado_facturacion: { in: ESTADOS_FACTURACION_PENDIENTE_EMISION },
+      servicio: { is: { requiere_factura: { not: 0 }, sin_cobro: { not: 1 } } }
+    };
+  }
+  if (grupo === 'facturado') {
+    // Espejo de esFacturado: emisión completa ('Facturado' / 'Enviada').
+    return { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA } };
+  }
+  return null;
+}
+
 function esEstadoFacturaValido(estado) {
   return ESTADOS_FACTURA.includes(estado);
 }
@@ -126,6 +158,8 @@ module.exports = {
   ESTADO_FACTURACION_ENVIADA,
   ESTADOS_FACTURACION_COMPLETA,
   ESTADOS_FACTURACION_PENDIENTE_EMISION,
+  GRUPOS_FACTURACION,
+  whereGrupoFacturacion,
   esPorFacturar,
   esEstadoFacturaValido,
   esFacturaActiva,

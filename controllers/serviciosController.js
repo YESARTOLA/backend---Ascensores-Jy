@@ -31,6 +31,7 @@ const {
   ESTADO_FACTURA_ANULADA,
   ESTADO_FACTURACION_SIN,
   calcularEstadoFacturacion,
+  whereGrupoFacturacion,
   esPorFacturar,
   esFacturado
 } = require('../utils/estadoFactura');
@@ -62,6 +63,7 @@ const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { aplicaAlcance, aplicaAlcanceEdificio, tiposRegistroPermitidos, puedeVerTipoRegistro, tiposEdificioPermitidos, porJunctionAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { visibilidadPorJunctionWhere, aplicarVisibilidadWhere, servicioVisiblePorEdificio } = require('../utils/visibilidadEdificio');
 const { materializarSiguienteEventoDelPlan } = require('./mantenimientosController');
+const { liberarVisitasDeServicio } = require('../utils/planMantenimientoMensual');
 const { validarAscensores, repartirParejo } = require('../utils/ascensoresMonto');
 const { datosSitioParaServicio, normalizarCuartoMaquinas } = require('../utils/datosSitioAscensor');
 const configuracion = require('../utils/configuracion');
@@ -276,7 +278,10 @@ const listar = async (req, res) => {
         where, orderBy: { id: 'desc' },
         include: {
           cliente: { select: { id: true, nombre: true, telefono: true, whatsapp: true } },
-          ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true, distrito: true, direccion: true } } } } } },
+          // lat/lng del edificio: el panel del técnico ofrece "Cómo llegar" sobre
+          // la propia tarjeta del servicio. Sin estos dos campos el botón no se
+          // pintaba nunca, porque `coordsDe` no encontraba coordenadas.
+          ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, contacto_nombre: true, contacto_telefono: true, edificio: { select: { id: true, nombre: true, tipo: true, distrito: true, direccion: true, latitud: true, longitud: true } } } } } },
           tipo_servicio: true,
           asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
           // Días programados: el panel del técnico agrupa por ellos ("hoy",
@@ -1494,6 +1499,12 @@ const cancelar = async (req, res) => {
     await prisma.tbl_calendario_eventos.updateMany({
       where: { id_servicio: id }, data: { estado_evento: ESTADO_EVENTO_CANCELADO }
     });
+    // Servicio de un plan de mantenimiento: la visita del cronograma vuelve a
+    // quedar pendiente (con evento programado nuevo) — un mantenimiento
+    // cancelado no se hizo y la fecha debe poder programarse de nuevo.
+    if (previo.id_mantenimiento_plan) {
+      await liberarVisitasDeServicio(prisma, id, req.user.id);
+    }
 
     // Si existía folder contable (creado al aprobar la cotización), darlo de
     // baja lógica para que Contabilidad no siga viendo el caso como activo.
@@ -1594,7 +1605,7 @@ async function resumenFacturacion(where) {
 
 const realizados = async (req, res) => {
   try {
-    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion } = req.query;
+    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1648,6 +1659,12 @@ const realizados = async (req, res) => {
       servicioWhere.sin_cobro = { not: 1 };
       where.estado_cobro = { notIn: ['Pagado', 'Cerrado'] };
     }
+    // Filtro por grupo de facturación ("Por facturar" / "Facturado"): usa el
+    // MISMO predicado con el que se cuentan las tarjetas del resumen, así que la
+    // tabla filtrada contiene exactamente los servicios que el indicador suma.
+    // Va dentro de AND para no pisar los filtros ya construidos.
+    const whereGrupo = whereGrupoFacturacion(grupo_facturacion);
+    if (whereGrupo) where.AND = [...(where.AND || []), whereGrupo];
     // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
     const tiposRealizados = tiposRegistroPermitidos(req.user);
     if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };
@@ -2082,6 +2099,12 @@ const eliminar = async (req, res) => {
       where: { id_servicio: id, estado: 1 },
       data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
+    // Servicio de un plan de mantenimiento: liberar su visita del cronograma
+    // (vuelve a pendiente, con evento programado nuevo) para que la fecha
+    // pueda materializarse otra vez.
+    if (previo.id_mantenimiento_plan) {
+      await liberarVisitasDeServicio(prisma, id, req.user.id);
+    }
     // Recordatorios automáticos vinculados al servicio: baja lógica.
     await prisma.tbl_recordatorios.updateMany({
       where: { id_servicio: id, estado: 1 },

@@ -10,11 +10,15 @@ const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion, visitasEnMes
 const {
   generarProgramacion, mesesDelPlan, tituloBasePlan, eventoDeVisita, frecuenciaDeAscensor
 } = require('../utils/planMantenimientoMensual');
+// Cálculo de las fechas teóricas del plan. Lo usa `_regenerarProgramacion` al
+// recalcular el cronograma tras editar duración, frecuencias o fecha de inicio.
+const { programacionDelPlan } = require('../utils/programacionPlanMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarPertenenciaAscensores } = require('../utils/ascensoresMonto');
 const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
-const { estaServicioFinalizado, esServicioEditable } = require('../utils/estadoServicio');
+const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPlan');
+const { estaServicioRealizado, esServicioEditable, ESTADO_SERVICIO_CANCELADO } = require('../utils/estadoServicio');
 const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
 const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { sincronizarDiasYEventos } = require('../utils/diasServicio');
@@ -203,6 +207,10 @@ async function _materializarVisita(tx, { visita, plan, tituloBase, esGratuito, u
         id_servicio: servicio.id,
         titulo: tituloEvento,
         fecha_inicio: fechaEvento,
+        // Revive el evento si quedó cancelado (visita cuyo servicio anterior
+        // se canceló/eliminó): la visita vuelve a estar programada.
+        estado: 1,
+        estado_evento: ESTADO_EVENTO_PROGRAMADO,
         user_id_modification: userId,
         date_time_modification: new Date()
       }
@@ -620,6 +628,185 @@ async function _regenerarProgramacion(tx, plan, userId) {
   return { creadas, eliminadas, total };
 }
 
+/**
+ * Servicios VIVOS del plan que cubren alguno de `idsAscensor`.
+ * Se consulta por la junction servicio↔ascensor: es lo que realmente se ejecutó.
+ */
+async function _serviciosDelPlanPorAscensor(idPlan, idsAscensor) {
+  if (!idsAscensor || idsAscensor.length === 0) return [];
+  return prisma.tbl_servicios_proyectos.findMany({
+    where: {
+      id_mantenimiento_plan: idPlan,
+      estado: 1,
+      ascensores: { some: { estado: 1, id_ascensor: { in: idsAscensor } } }
+    },
+    select: { id: true, codigo: true, estado_servicio: true }
+  });
+}
+
+/**
+ * Un servicio bloquea el cambio si ya salió a campo (o pasó de ahí). Los
+ * PENDIENTES se pueden dar de baja; los CANCELADOS no representan trabajo hecho,
+ * así que tampoco bloquean.
+ */
+const _bloqueaCambio = (s) =>
+  !esServicioEditable(s.estado_servicio) && s.estado_servicio !== ESTADO_SERVICIO_CANCELADO;
+
+/**
+ * Valida el cambio de CLIENTE y del CONJUNTO DE ASCENSORES de un plan y devuelve
+ * el alcance final ya resuelto.
+ *
+ * Reglas — solo protegen hechos consumados:
+ *   · Quitar un ascensor exige que no tenga mantenimientos en campo o ya
+ *     ejecutados. Los pendientes se dan de baja al aplicar.
+ *   · Cambiar de cliente exige que el plan no tenga NINGÚN mantenimiento
+ *     ejecutado ni mes aprobado (cuota emitida): esos datos ya son del cliente
+ *     anterior y moverlos falsearía su historial y su cobro.
+ *   · Los ascensores finales deben pertenecer al cliente final.
+ *
+ * @returns {Promise<{error?:string, status?:number, cambia:boolean,
+ *   idCliente:number, cambiaCliente:boolean, idsFinal:number[],
+ *   idsAnadidos:number[], idsQuitados:number[],
+ *   frecuenciasPorAscensor:Map<number,object>, serviciosAQuitar:number[]}>}
+ */
+async function _validarCambioDeAlcance(d, previo) {
+  const activosPrevios = (previo.ascensores || []).filter(f => f.estado === 1);
+  const idsPrevios = activosPrevios.map(f => f.id_ascensor);
+
+  const idCliente = d.id_cliente !== undefined && d.id_cliente !== null && d.id_cliente !== ''
+    ? Number(d.id_cliente)
+    : previo.id_cliente;
+  const cambiaCliente = idCliente !== previo.id_cliente;
+
+  // El conjunto de ascensores puede llegar como `ascensores` (lista completa,
+  // igual que al crear). Sin ese campo, el alcance no cambia.
+  const entradas = Array.isArray(d.ascensores) ? d.ascensores : null;
+  const idsFinal = entradas
+    ? entradas.map(a => Number(a?.id_ascensor ?? a)).filter(Number.isFinite)
+    : idsPrevios;
+
+  if (entradas) {
+    if (idsFinal.length === 0) return { error: 'El plan debe cubrir al menos un ascensor' };
+    if (new Set(idsFinal).size !== idsFinal.length) {
+      return { error: 'No se puede repetir un mismo ascensor en el plan' };
+    }
+  }
+
+  const idsAnadidos = idsFinal.filter(id => !idsPrevios.includes(id));
+  const idsQuitados = idsPrevios.filter(id => !idsFinal.includes(id));
+  const cambiaAlcance = idsAnadidos.length > 0 || idsQuitados.length > 0;
+
+  if (!cambiaCliente && !cambiaAlcance) {
+    return { cambia: false, idCliente, cambiaCliente: false, idsFinal, idsAnadidos: [], idsQuitados: [], serviciosAQuitar: [] };
+  }
+
+  // Los ascensores del plan tienen que ser del cliente del plan.
+  const pertenencia = await validarPertenenciaAscensores(idsFinal, idCliente);
+  if (!pertenencia.ok) return { error: pertenencia.error, status: 400 };
+
+  // Quitar ascensores: nada que ya haya salido a campo.
+  let serviciosAQuitar = [];
+  if (idsQuitados.length > 0) {
+    const servicios = await _serviciosDelPlanPorAscensor(previo.id, idsQuitados);
+    const bloqueantes = servicios.filter(_bloqueaCambio);
+    if (bloqueantes.length > 0) {
+      return {
+        status: 409,
+        error: `No se pueden quitar esos ascensores: tienen mantenimientos en curso o ya ejecutados (${bloqueantes.map(s => s.codigo).join(', ')}). Omita sus fechas futuras desde la programación si ya no se atenderán.`
+      };
+    }
+    serviciosAQuitar = servicios.filter(s => esServicioEditable(s.estado_servicio)).map(s => s.id);
+  }
+
+  // Cambiar de cliente: el plan tiene que estar limpio de historial.
+  if (cambiaCliente) {
+    const ejecutados = (await prisma.tbl_servicios_proyectos.findMany({
+      where: { id_mantenimiento_plan: previo.id, estado: 1 },
+      select: { codigo: true, estado_servicio: true }
+    })).filter(_bloqueaCambio);
+    if (ejecutados.length > 0) {
+      return {
+        status: 409,
+        error: `No se puede cambiar el cliente: el plan ya tiene mantenimientos en curso o ejecutados (${ejecutados.map(s => s.codigo).join(', ')}). Cree un plan nuevo para el otro cliente.`
+      };
+    }
+    const cuotas = await prisma.tbl_cobros_cuotas.count({
+      where: { estado: 1, cobro: { is: { estado: 1, id_mantenimiento_plan: previo.id } } }
+    });
+    if (cuotas > 0) {
+      return {
+        status: 409,
+        error: 'No se puede cambiar el cliente: el plan ya tiene meses aprobados para cobro. Cree un plan nuevo para el otro cliente.'
+      };
+    }
+  }
+
+  return {
+    cambia: true, idCliente, cambiaCliente, idsFinal, idsAnadidos, idsQuitados, serviciosAQuitar
+  };
+}
+
+/**
+ * Aplica el cambio de alcance dentro de la transacción de `actualizar`:
+ * da de baja lo que sale, añade lo que entra y reapunta el cliente.
+ *
+ * El cronograma NO se toca aquí: `_regenerarProgramacion` corre después y
+ * recalcula las fechas de los ascensores vigentes (las visitas sin servicio del
+ * ascensor retirado se borran allí, porque ya no está entre los activos).
+ */
+async function _aplicarCambioDeAlcance(tx, previo, cambio, entradasFrecuencia, normalizado, userId) {
+  const stamp = { user_id_modification: userId, date_time_modification: new Date() };
+
+  // Ascensores que salen: sus mantenimientos pendientes se dan de baja (con su
+  // evento) y la fila de la junction queda inactiva.
+  for (const idServicio of cambio.serviciosAQuitar) {
+    await bajaServicioCascadaEnTx(tx, idServicio, userId);
+  }
+  if (cambio.idsQuitados.length > 0) {
+    await tx.tbl_mantenimientos_planes_ascensores.updateMany({
+      where: { id_plan: previo.id, id_ascensor: { in: cambio.idsQuitados }, estado: 1 },
+      data: { estado: 0, ...stamp }
+    });
+  }
+
+  // Ascensores que entran: se crea (o reactiva) su fila con la frecuencia dada.
+  for (const idAsc of cambio.idsAnadidos) {
+    const frec = _normalizarFrecuencia(
+      entradasFrecuencia.get(idAsc) || {}, normalizado, `el ascensor ${idAsc}`
+    );
+    const existente = await tx.tbl_mantenimientos_planes_ascensores.findFirst({
+      where: { id_plan: previo.id, id_ascensor: idAsc }
+    });
+    if (existente) {
+      await tx.tbl_mantenimientos_planes_ascensores.update({
+        where: { id: existente.id },
+        data: { estado: 1, frecuencia: frec.frecuencia, frecuencia_dias_custom: frec.frecuencia_dias_custom, ...stamp }
+      });
+    } else {
+      await tx.tbl_mantenimientos_planes_ascensores.create({
+        data: {
+          id_plan: previo.id, id_ascensor: idAsc,
+          frecuencia: frec.frecuencia, frecuencia_dias_custom: frec.frecuencia_dias_custom,
+          moneda: previo.moneda, user_id_registration: userId
+        }
+      });
+    }
+  }
+
+  // Cliente nuevo: lo siguen el cobro del plan y los mantenimientos vivos (que
+  // en este punto solo pueden ser pendientes; los ejecutados ya bloquearon).
+  if (cambio.cambiaCliente) {
+    await tx.tbl_cobros.updateMany({
+      where: { id_mantenimiento_plan: previo.id, estado: 1 },
+      data: { id_cliente: cambio.idCliente, ...stamp }
+    });
+    await tx.tbl_servicios_proyectos.updateMany({
+      where: { id_mantenimiento_plan: previo.id, estado: 1 },
+      data: { id_cliente: cambio.idCliente, ...stamp }
+    });
+  }
+}
+
 const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -633,15 +820,14 @@ const actualizar = async (req, res) => {
     });
     if (!previo) return res.status(404).json({ error: 'No encontrado' });
 
-    // Cliente y conjunto de ascensores son inmutables: ya existen servicios
-    // materializados apuntando a ellos. Cambiarlos rompería historial y
-    // reportes; para otro cliente o conjunto se crea un plan nuevo. La
-    // FRECUENCIA de cada ascensor sí es editable (ver `ascensores_frecuencias`).
-    if (d.id_cliente !== undefined && Number(d.id_cliente) !== previo.id_cliente) {
-      return res.status(409).json({ error: 'El cliente del plan no se puede cambiar. Cree un plan nuevo para otro cliente.' });
-    }
-    if (d.ascensores !== undefined) {
-      return res.status(409).json({ error: 'Los ascensores del plan no se pueden cambiar. Cree un plan nuevo para otro conjunto de ascensores.' });
+    // TODOS los campos del plan son editables, incluidos el cliente y el conjunto
+    // de ascensores. Lo único intocable es lo que ya ocurrió: un mantenimiento
+    // ejecutado (o en campo) y un mes ya aprobado para cobro son hechos, y el
+    // plan no puede reescribirlos. Las guardas de abajo protegen exactamente eso
+    // y nada más.
+    const cambioAscensores = await _validarCambioDeAlcance(d, previo);
+    if (cambioAscensores.error) {
+      return res.status(cambioAscensores.status || 409).json({ error: cambioAscensores.error });
     }
 
     const idTipoFinal = d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio;
@@ -659,22 +845,33 @@ const actualizar = async (req, res) => {
       monto_mensual: d.monto_mensual ?? previo.monto_mensual
     };
     let normalizado;
-    // Frecuencia por ascensor: llega como [{ id_ascensor, frecuencia, frecuencia_dias_custom }].
-    // Solo se aceptan ascensores que ya pertenecen al plan.
-    const nuevasFrecuencias = new Map();
+    // Frecuencia por ascensor: [{ id_ascensor, frecuencia, frecuencia_dias_custom }].
+    // Puede llegar en `ascensores` (lista completa, cuando también se edita el
+    // conjunto) o en `ascensores_frecuencias` (solo frecuencias).
+    const nuevasFrecuencias = new Map();   // id de fila junction → frecuencia
+    const entradasFrecuencia = new Map();  // id_ascensor → entrada cruda
     try {
       normalizado = _normalizarPlanInput(mergeInput, tipoServicioFinal);
-      if (Array.isArray(d.ascensores_frecuencias)) {
-        const porAscensor = new Map(previo.ascensores.map(f => [f.id_ascensor, f]));
-        for (const e of d.ascensores_frecuencias) {
-          const idAsc = Number(e?.id_ascensor);
-          const fila = porAscensor.get(idAsc);
-          if (!fila) throw new Error(`El ascensor ${idAsc} no pertenece a este plan`);
-          nuevasFrecuencias.set(
-            fila.id,
-            _normalizarFrecuencia(e, normalizado, `el ascensor ${fila.ascensor?.codigo || idAsc}`)
-          );
+      const entradas = Array.isArray(d.ascensores)
+        ? d.ascensores
+        : (Array.isArray(d.ascensores_frecuencias) ? d.ascensores_frecuencias : []);
+      const porAscensor = new Map(previo.ascensores.map(f => [f.id_ascensor, f]));
+      for (const e of entradas) {
+        const idAsc = Number(e?.id_ascensor);
+        if (!Number.isFinite(idAsc)) continue;
+        entradasFrecuencia.set(idAsc, e);
+        const fila = porAscensor.get(idAsc);
+        if (!fila) {
+          // Ascensor que se incorpora al plan: su fila se crea al aplicar el
+          // cambio de alcance. Con `ascensores_frecuencias` no cabe, porque ese
+          // campo solo corrige frecuencias del conjunto vigente.
+          if (Array.isArray(d.ascensores)) continue;
+          throw new Error(`El ascensor ${idAsc} no pertenece a este plan`);
         }
+        nuevasFrecuencias.set(
+          fila.id,
+          _normalizarFrecuencia(e, normalizado, `el ascensor ${fila.ascensor?.codigo || idAsc}`)
+        );
       }
     } catch (e) {
       return res.status(400).json({ error: e.message });
@@ -694,10 +891,16 @@ const actualizar = async (req, res) => {
       normalizado.frecuencia !== previo.frecuencia ||
       Number(normalizado.frecuencia_dias_custom || 0) !== Number(previo.frecuencia_dias_custom || 0) ||
       nuevaFechaInicio.getTime() !== previo.fecha_inicio.getTime() ||
-      cambioFrecuenciaAscensor;
+      cambioFrecuenciaAscensor ||
+      // Entra o sale un ascensor: su serie de visitas nace o desaparece.
+      cambioAscensores.cambia;
 
     const resultado = await prisma.$transaction(async (tx) => {
       const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+      // Altas/bajas de ascensores y cambio de cliente, antes de recalcular nada.
+      if (cambioAscensores.cambia) {
+        await _aplicarCambioDeAlcance(tx, previo, cambioAscensores, entradasFrecuencia, normalizado, req.user.id);
+      }
       for (const [idFila, f] of nuevasFrecuencias) {
         await tx.tbl_mantenimientos_planes_ascensores.update({
           where: { id: idFila },
@@ -707,6 +910,7 @@ const actualizar = async (req, res) => {
       const plan = await tx.tbl_mantenimientos_planes.update({
         where: { id },
         data: {
+          id_cliente: cambioAscensores.idCliente,
           id_tipo_servicio: idTipoFinal,
           ...normalizado,
           // `cantidad_mantenimientos` es derivado del cronograma: lo fija la
@@ -842,7 +1046,10 @@ const materializarEvento = async (req, res) => {
 
     const visita = await prisma.tbl_mantenimientos_programacion.findFirst({
       where: { id_evento: idEvento, id_plan: plan.id, estado: 1 },
-      include: { ascensor: { select: { codigo: true } } }
+      include: {
+        ascensor: { select: { codigo: true } },
+        servicio: { select: { id: true, estado: true } }
+      }
     });
     if (!visita) {
       return res.status(404).json({ error: 'El evento no tiene una visita del cronograma asociada' });
@@ -850,7 +1057,10 @@ const materializarEvento = async (req, res) => {
     if (visita.activo === 0) {
       return res.status(409).json({ error: 'Esta fecha fue omitida del plan. Reactívela antes de crear el servicio.' });
     }
-    if (visita.id_servicio) {
+    // Solo bloquea si el servicio enganchado sigue VIVO: una visita cuyo
+    // servicio fue eliminado (datos previos al desenganche automático) debe
+    // poder materializarse de nuevo.
+    if (visita.id_servicio && visita.servicio?.estado === 1) {
       return res.status(409).json({ error: 'Esta visita ya tiene un servicio creado' });
     }
 
@@ -1467,7 +1677,7 @@ async function _calcularImpactoEliminacion(id) {
     include: { pagos: { where: { estado: 1 } } }
   });
 
-  const ejecutados = serviciosGenerados.filter(s => estaServicioFinalizado(s.estado_servicio));
+  const ejecutados = serviciosGenerados.filter(s => estaServicioRealizado(s.estado_servicio));
 
   // Dinero real: abonos del cobro del plan + los de cobros por servicio (legacy).
   const abonadoPlan = cobroPlan ? Number(cobroPlan.total_abonado || 0) : 0;
@@ -1719,7 +1929,7 @@ const listarProgramacion = async (req, res) => {
             codigo_servicio: servicioVivo?.codigo || null,
             estado_servicio: servicioVivo?.estado_servicio || null,
             materializada: !!servicioVivo,
-            realizada: !!servicioVivo && estaServicioFinalizado(servicioVivo.estado_servicio)
+            realizada: !!servicioVivo && estaServicioRealizado(servicioVivo.estado_servicio)
           };
         })
       };
@@ -1769,11 +1979,13 @@ const cambiarActivoProgramacion = async (req, res) => {
     });
     if (visitas.length === 0) return res.status(404).json({ error: 'Fechas no encontradas en este plan' });
 
-    // Un mantenimiento que ya salió a campo no se puede omitir.
+    // Un mantenimiento que ya salió a campo no se puede omitir. Uno CANCELADO
+    // sí: el trabajo no se hizo, la visita puede retirarse del cronograma.
     if (nuevoActivo === 0) {
       const bloqueadas = visitas.filter(v => {
         const s = v.servicio;
-        return s && s.estado === 1 && !esServicioEditable(s.estado_servicio);
+        return s && s.estado === 1 && !esServicioEditable(s.estado_servicio)
+          && s.estado_servicio !== ESTADO_SERVICIO_CANCELADO;
       });
       if (bloqueadas.length > 0) {
         return res.status(409).json({
@@ -1787,8 +1999,10 @@ const cambiarActivoProgramacion = async (req, res) => {
       let serviciosDeBaja = 0;
       for (const v of visitas) {
         if (nuevoActivo === 0) {
-          // Da de baja el servicio pendiente (si lo hay) y su evento.
-          if (v.servicio && v.servicio.estado === 1) {
+          // Da de baja el servicio pendiente (si lo hay) y su evento. Un
+          // servicio CANCELADO no se toca: queda como constancia; la visita
+          // solo se desengancha.
+          if (v.servicio && v.servicio.estado === 1 && esServicioEditable(v.servicio.estado_servicio)) {
             await bajaServicioCascadaEnTx(tx, v.servicio.id, req.user.id);
             serviciosDeBaja++;
           }
@@ -1854,6 +2068,65 @@ const cambiarActivoProgramacion = async (req, res) => {
 };
 
 /**
+ * POST /:id/programacion/reconstruir — repara el cronograma de un plan.
+ *
+ * Existe porque los planes creados antes del modelo mensual nacieron SIN
+ * cronograma: se ven como "0 de 0" mantenimientos programados, sus meses van
+ * "0/0" y en el detalle no aparecen las visitas pendientes, solo los servicios
+ * ya creados. Sin esto la única salida era ejecutar un script en el servidor.
+ *
+ * Dos caminos, según el estado del plan:
+ *   · sin ninguna visita → reconstrucción completa (utils/reconstruirCronogramaPlan):
+ *     rearma la serie de cada ascensor, ENGANCHA los servicios que ya existen y
+ *     reutiliza los eventos de calendario que el modelo viejo había dejado.
+ *   · con cronograma parcial → regeneración normal: conserva lo materializado y
+ *     crea únicamente las fechas que faltan.
+ *
+ * Es idempotente: repetirlo sobre un plan ya sano no crea nada.
+ */
+const reconstruirProgramacion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+      where: { id },
+      include: {
+        tipo_servicio: true,
+        ascensores: {
+          where: { estado: 1 },
+          include: { ascensor: { select: { id: true, codigo: true, edificio: { select: { nombre: true } } } } }
+        }
+      }
+    });
+    if (!plan || plan.estado !== 1) return res.status(404).json({ error: 'Plan no encontrado' });
+
+    const existentes = await prisma.tbl_mantenimientos_programacion.count({ where: { id_plan: id } });
+
+    const resultado = await prisma.$transaction(async (tx) => {
+      if (existentes === 0) {
+        const r = await reconstruirCronogramaPlan(tx, plan, { userId: req.user.id });
+        return { modo: 'reconstruccion', ...r };
+      }
+      const r = await _regenerarProgramacion(tx, plan, req.user.id);
+      return { modo: 'regeneracion', creadas: r.creadas, eliminadas: r.eliminadas, enganchadas: 0 };
+    }, { timeout: 120000 });
+
+    const total = await prisma.tbl_mantenimientos_programacion.count({ where: { id_plan: id, estado: 1 } });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_mantenimientos_programacion', id_entidad: id,
+      accion: 'UPDATE',
+      valor_nuevo: { plan: id, ...resultado, total },
+      ip: req.ip
+    });
+
+    res.json({ data: { ...resultado, total } });
+  } catch (err) {
+    console.error('[mantenimientos.reconstruirProgramacion]', err);
+    res.status(500).json({ error: 'Error al reconstruir la programación: ' + err.message });
+  }
+};
+
+/**
  * POST /:id/periodos/aprobar — aprueba un MES del plan para facturación.
  *
  * El mes es la unidad de cobro: se le crea UNA cuota por `monto_mensual` en el
@@ -1869,6 +2142,21 @@ const aprobarPeriodo = async (req, res) => {
     const id = Number(req.params.id);
     const { numero_mes, ordinal, forzar } = req.body || {};
     const mesPedido = Number(numero_mes ?? ordinal);
+
+    // Un plan cancelado o dado de baja no aprueba meses NUEVOS (sería cobrar
+    // servicio no prestado). Las cuotas ya aprobadas siguen su curso normal de
+    // factura y cobro: lo ya prestado sí se cobra.
+    const planVigente = await prisma.tbl_mantenimientos_planes.findUnique({
+      where: { id }, select: { estado: true, estado_plan: true }
+    });
+    if (!planVigente || planVigente.estado !== 1) {
+      return res.status(404).json({ error: 'Plan no encontrado' });
+    }
+    if (planVigente.estado_plan !== ESTADO_PLAN_ACTIVO) {
+      return res.status(409).json({
+        error: `El plan está "${planVigente.estado_plan}": no se pueden aprobar meses nuevos. Los meses ya aprobados continúan su cobro y facturación.`
+      });
+    }
 
     const info = await mesesDelPlan(prisma, id);
     if (!info.id_cobro) return res.status(400).json({ error: 'El plan no tiene un cobro asociado' });
@@ -2105,7 +2393,7 @@ module.exports = {
   materializarSiguienteEventoDelPlan, listarInstancias, exportar,
   impactoEliminacion, eliminar,
   listarPeriodos, aprobarPeriodo,
-  listarProgramacion, cambiarActivoProgramacion,
+  listarProgramacion, cambiarActivoProgramacion, reconstruirProgramacion,
   // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
   // para no duplicar la lógica de instancias + proyecciones por rango de fechas.
   construirDatasetReporteMantenimientos: _construirDatasetReporte

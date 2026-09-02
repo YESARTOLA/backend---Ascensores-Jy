@@ -11,6 +11,9 @@ const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
 const { CLASIFICACIONES } = require('./catalogosClientes');
 
+// Máscara de los conteos: enteros, para que sumen y filtren como números.
+const FMT_ENTERO = '#,##0';
+
 const CLASIFICACION_MAP = Object.fromEntries(CLASIFICACIONES.map(c => [c.codigo, c.etiqueta]));
 
 const PALETA = {
@@ -56,9 +59,9 @@ const COLUMNAS = [
   { header: 'Proy. fin contrato',     key: 'proy_fin',               width: 15 },
   { header: 'Proy. estado',           key: 'proy_estado',            width: 12 },
   { header: 'Proy. contrato adjunto', key: 'proy_adjunto',           width: 20 },
-  { header: 'Adjuntos',               key: 'adjuntos',               width: 10 },
-  { header: 'Ascensores',             key: 'ascensores',             width: 11 },
-  { header: 'Servicios',              key: 'servicios',              width: 10 },
+  { header: 'Adjuntos',               key: 'adjuntos',               width: 10, numFmt: FMT_ENTERO },
+  { header: 'Ascensores',             key: 'ascensores',             width: 11, numFmt: FMT_ENTERO },
+  { header: 'Servicios',              key: 'servicios',              width: 10, numFmt: FMT_ENTERO },
   { header: 'Observaciones',          key: 'observaciones',          width: 30 },
   { header: 'Registrado',             key: 'registrado',             width: 12 }
 ];
@@ -122,7 +125,7 @@ async function generarExcelClientes(clientes) {
   ws.getCell('A2').font = { size: 9, color: { argb: 'FF6B7280' } };
 
   // Encabezados de tabla en fila 4
-  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width }));
+  ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width, style: c.numFmt ? { numFmt: c.numFmt } : undefined }));
   const headerRow = ws.getRow(4);
   COLUMNAS.forEach((c, i) => {
     const cell = headerRow.getCell(i + 1);

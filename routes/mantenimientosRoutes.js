@@ -29,6 +29,9 @@ router.put('/:id/monto-mensual', permitirRoles('super_admin', 'admin'), c.actual
 // El PUT activa u omite fechas concretas (omitir no cambia el monto mensual).
 router.get('/:id/programacion', c.listarProgramacion);
 router.put('/:id/programacion', permitirRoles('super_admin', 'admin', 'coordinador'), c.cambiarActivoProgramacion);
+// Repara el cronograma de planes anteriores al modelo mensual (nacieron sin
+// programación): reconstruye las fechas enganchando los servicios ya creados.
+router.post('/:id/programacion/reconstruir', permitirRoles('super_admin', 'admin'), c.reconstruirProgramacion);
 
 // Facturación por MES del plan: una factura y un pago por mes, por el monto
 // mensual pactado, con el detalle de todas las visitas de ese mes.
