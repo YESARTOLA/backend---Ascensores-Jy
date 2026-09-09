@@ -4,7 +4,7 @@ const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado 
 const { diffDiasLima, parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioCobro } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
-const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA, MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { ESTADO_FACTURACION_SIN, esFacturaActiva } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
@@ -205,7 +205,7 @@ const listar = async (req, res) => {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
       id_cliente, id_tipo_servicio, id_proyecto,
       tipo_categoria, situacion_cobro, por_cobrar, banco, id_cuenta_bancaria,
-      monto_min, monto_max,
+      moneda, monto_min, monto_max,
       fecha_proximo_desde, fecha_proximo_hasta,
       orden, direccion
     } = req.query;
@@ -214,6 +214,12 @@ const listar = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_proyecto) where.id_servicio = Number(id_proyecto);
+    // Filtro por moneda del cobro: es la divisa de sus tres importes (facturado,
+    // abonado y saldo) y la que agrupa el resumen de cobranza, así que recortar
+    // por ella deja tarjetas y tabla en una sola moneda. Un código fuera del
+    // catálogo se ignora (normalizarMoneda devuelve null).
+    const monedaFiltro = normalizarMoneda(moneda);
+    if (monedaFiltro) where.moneda = monedaFiltro;
     if (fecha_proximo_desde || fecha_proximo_hasta) {
       where.fecha_proximo_abono = {};
       if (fecha_proximo_desde) where.fecha_proximo_abono.gte = parseYMDLima(fecha_proximo_desde);
@@ -966,18 +972,23 @@ const cuotasCalendario = async (req, res) => {
  * Cada fila trae la fecha de vencimiento (la fecha registrada de la cuota), el
  * cliente, el proyecto/servicio o plan y el tipo, para saber qué falta facturar
  * y en qué fecha. Filtros: q (cliente/servicio/documento), id_cliente,
- * id_proyecto, tipo_categoria, rango de fecha_vencimiento y orden.
+ * id_proyecto, tipo_categoria, moneda, rango de fecha_vencimiento y orden.
  */
 const cuotasNoFacturadas = async (req, res) => {
   try {
     const {
-      q, id_cliente, id_proyecto, tipo_categoria,
+      q, id_cliente, id_proyecto, tipo_categoria, moneda,
       fecha_desde, fecha_hasta, orden, direccion
     } = req.query;
 
     const cobroWhere = { estado: 1 };
     if (id_cliente) cobroWhere.id_cliente = Number(id_cliente);
     if (id_proyecto) cobroWhere.id_servicio = Number(id_proyecto);
+    // Filtro por moneda: la cuota no tiene divisa propia, la hereda del cobro
+    // (misma regla que usa la tabla para rotular su importe). Recortar por ella
+    // deja además los totales del pie en una sola moneda.
+    const monedaCuotas = normalizarMoneda(moneda);
+    if (monedaCuotas) cobroWhere.moneda = monedaCuotas;
     // Alcance por tipo de edificio (Administrador): la cuota cuelga de un cobro,
     // que a su vez cuelga de un servicio o de un plan de mantenimiento.
     const alcance = porServicioOPlanAscensorEdificioWhere(req.user);

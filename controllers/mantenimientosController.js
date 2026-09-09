@@ -12,7 +12,7 @@ const {
 } = require('../utils/planMantenimientoMensual');
 // Cálculo de las fechas teóricas del plan. Lo usa `_regenerarProgramacion` al
 // recalcular el cronograma tras editar duración, frecuencias o fecha de inicio.
-const { programacionDelPlan } = require('../utils/programacionPlanMantenimiento');
+const { programacionDelPlan, teoricasFaltantes } = require('../utils/programacionPlanMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarPertenenciaAscensores } = require('../utils/ascensoresMonto');
 const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
@@ -545,9 +545,10 @@ async function _limpiarProgramacionNoMaterializada(tx, idPlan) {
  * Regenera el cronograma del plan conservando lo ya materializado.
  *
  * Recalcula la serie teórica de cada ascensor con su frecuencia y la duración
- * vigentes, y crea solo las visitas cuya fecha no esté ya ocupada por una visita
- * materializada de ESE ascensor. Sin ese filtro, ampliar la duración de un plan
- * con mantenimientos ya ejecutados duplicaría entradas en la misma fecha.
+ * vigentes, y crea solo las visitas que ese ascensor todavía no tiene en el MES
+ * correspondiente (`teoricasFaltantes`). El emparejamiento va por mes del plan y
+ * no por fecha exacta: un mantenimiento reagendado a otro día sigue siendo la
+ * visita de su mes, así que no debe reaparecer también en la fecha teórica.
  *
  * @returns {Promise<{creadas:number, eliminadas:number, total:number}>}
  */
@@ -562,9 +563,8 @@ async function _regenerarProgramacion(tx, plan, userId) {
   // Lo que sobrevive: visitas con servicio. Se respetan su fecha y su ordinal.
   const materializadas = await tx.tbl_mantenimientos_programacion.findMany({
     where: { id_plan: plan.id },
-    select: { id: true, id_ascensor: true, ordinal: true, fecha_programada: true }
+    select: { id: true, id_ascensor: true, ordinal: true, numero_mes: true, fecha_programada: true }
   });
-  const ocupadas = new Set(materializadas.map(v => `${v.id_ascensor}|${ymdDeFecha(v.fecha_programada)}`));
   const ordinalesUsados = new Map();
   for (const v of materializadas) {
     const actual = ordinalesUsados.get(v.id_ascensor) || new Set();
@@ -588,9 +588,16 @@ async function _regenerarProgramacion(tx, plan, userId) {
   const junctionPorAscensor = new Map(activos.map(f => [f.id_ascensor, f]));
   const tituloBase = tituloBasePlan(activos.map(f => f.ascensor?.edificio?.nombre).find(Boolean) || null);
 
+  // Solo lo que falta: un mes cuya visita ya existe —aunque se ejecute otro
+  // día— no vuelve a programarse.
+  const faltantes = teoricasFaltantes(teoricas, materializadas.map(v => ({
+    id_ascensor: v.id_ascensor,
+    numero_mes: v.numero_mes,
+    fecha: ymdDeFecha(v.fecha_programada)
+  })));
+
   let creadas = 0;
-  for (const t of teoricas) {
-    if (ocupadas.has(`${t.id_ascensor}|${t.fecha}`)) continue;
+  for (const t of faltantes) {
     const junction = junctionPorAscensor.get(t.id_ascensor);
     if (!junction) continue;
     // El ordinal debe seguir siendo único por (plan, ascensor): si el teórico ya

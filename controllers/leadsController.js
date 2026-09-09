@@ -313,7 +313,13 @@ const crear = async (req, res) => {
       return res.status(409).json({ error: mensajeDuplicados(duplicados), duplicados });
     }
     // Vendedora asignada: determina quién podrá ver y convertir este lead.
-    const vendedor = await resolverVendedorAsignado(d.id_vendedor);
+    // Cuando lo registra la propia Vendedora, el lead nace asignado a ella y no
+    // se admite otra asignación: solo ve los suyos, así que cederlo o dejarlo
+    // sin asignar lo haría desaparecer de su lista en el mismo momento de
+    // crearlo. La regla se aplica aquí, no en la UI.
+    const vendedor = soloSusLeads(req.user)
+      ? { id_vendedor: req.user.id }
+      : await resolverVendedorAsignado(d.id_vendedor);
     if (vendedor.error) return res.status(400).json({ error: vendedor.error });
     const lead = await prisma.tbl_leads.create({
       data: {

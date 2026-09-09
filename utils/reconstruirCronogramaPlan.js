@@ -15,7 +15,9 @@
  *  2. ENGANCHA los servicios que ya existen: un servicio del plan sobre un
  *     ascensor en una fecha se convierte en la visita de esa fecha (conservando
  *     su evento de calendario), de modo que lo ya ejecutado cuenta como
- *     realizado en su mes.
+ *     realizado en su mes. Un servicio ejecutado en un día distinto al teórico
+ *     OCUPA la visita de su mes: no se añade además la fecha teórica, que
+ *     dejaría el mes pidiendo una salida que ya se hizo.
  *  3. Para el resto reutiliza los eventos futuros que el modelo anterior dejó
  *     en el calendario (mismo ascensor+fecha) y solo crea evento nuevo cuando no
  *     hay ninguno que reutilizar — así no se duplican eventos.
@@ -30,7 +32,7 @@
  */
 
 const { ymdDeFecha, parseYMDLima } = require('./tiempo');
-const { programacionDelPlan, mesDeFecha } = require('./programacionPlanMantenimiento');
+const { programacionDelPlan, mesDeFecha, teoricasFaltantes } = require('./programacionPlanMantenimiento');
 const { frecuenciaDeAscensor, tituloBasePlan, eventoDeVisita } = require('./planMantenimientoMensual');
 const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
 
@@ -106,19 +108,26 @@ async function reconstruirCronogramaPlan(client, plan, { userId = null } = {}) {
   const junctionPorAscensor = new Map(activos.map(f => [f.id_ascensor, f]));
   const tituloBase = tituloBasePlan(activos.map(f => f.ascensor?.edificio?.nombre).find(Boolean) || null);
 
-  // A la serie teórica se le añaden las fechas de servicios REALES que no
-  // coincidan con ninguna teórica (visitas reagendadas), para no perder ningún
-  // mantenimiento ya ejecutado.
-  const clavesTeoricas = new Set(teoricas.map(t => `${t.id_ascensor}|${t.fecha}`));
-  const extra = [];
+  // El cronograma se arma con las visitas REALES (un servicio ya existente es
+  // una visita, en el día en que se ejecutó) más las teóricas que falten.
+  // Cada servicio ocupa la visita del MES en el que cae, aunque su día no sea
+  // el teórico: así una visita reagendada no se duplica con la fecha pactada.
+  // Una fecha anterior al inicio del plan no tiene ventana: cae al mes 1.
+  const mesDe = (fecha) =>
+    mesDeFecha(fechaInicioYMD, Math.max(duracionMeses, HORIZONTE_MESES_EXTRA), fecha) || 1;
+
+  const reales = [];
   for (const [clave] of servicioPorClave) {
-    if (clavesTeoricas.has(clave)) continue;
     const [idAsc, fecha] = clave.split('|');
     if (!junctionPorAscensor.has(Number(idAsc))) continue;
-    extra.push({ id_ascensor: Number(idAsc), fecha, numero_mes: null, ordinal: null });
+    reales.push({ id_ascensor: Number(idAsc), fecha, numero_mes: mesDe(fecha) });
   }
 
-  const todas = [...teoricas, ...extra].sort((a, b) =>
+  // Un mes con más servicios de los pactados conserva todos: lo ejecutado no se
+  // descarta. Lo que no se crea es la teórica que ese mes ya tiene cubierta.
+  const faltantes = teoricasFaltantes(teoricas, reales);
+
+  const todas = [...reales, ...faltantes].sort((a, b) =>
     a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : a.id_ascensor - b.id_ascensor
   );
 
@@ -127,11 +136,7 @@ async function reconstruirCronogramaPlan(client, plan, { userId = null } = {}) {
   const filas = todas.map(t => {
     const n = (contador.get(t.id_ascensor) || 0) + 1;
     contador.set(t.id_ascensor, n);
-    // Mes del plan: el teórico, o el que corresponda a la fecha para los extra.
-    // Una fecha anterior al inicio del plan no tiene ventana: cae al mes 1.
-    const numeroMes = t.numero_mes
-      ?? (mesDeFecha(fechaInicioYMD, Math.max(duracionMeses, HORIZONTE_MESES_EXTRA), t.fecha) || 1);
-    return { ...t, ordinal: n, numero_mes: numeroMes };
+    return { ...t, ordinal: n };
   });
 
   const salida = { ...vacio };

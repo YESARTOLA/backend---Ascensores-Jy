@@ -5,9 +5,11 @@
  *   1. La CENTRAL DE VENTAS (rol `central_ventas`) es el punto de captura: da de
  *      alta el lead y registra a qué Vendedora queda asignado. Solo tiene acceso
  *      a este módulo (ninguna otra ruta del sistema).
- *   2. La VENDEDORA asignada ve ÚNICAMENTE sus leads (id_vendedor = su usuario),
- *      puede editarlos y convertirlos en cliente/servicio. No da de alta leads
- *      ni ve la cartera de las demás.
+ *   2. La VENDEDORA ve ÚNICAMENTE sus leads (id_vendedor = su usuario), los
+ *      edita y los convierte en cliente/servicio. También da de alta los que
+ *      consigue por su cuenta, y esos nacen asignados a ella misma: es la única
+ *      asignación con la que podría seguir viéndolos. Lo que no hace es asignar
+ *      ni reasignar leads (eso es de la Central) ni ver la cartera de las demás.
  *   3. Administración (super_admin, admin, coordinador) mantiene la visión
  *      completa de la cartera.
  *
@@ -21,9 +23,11 @@ const ROL_CENTRAL_VENTAS = 'central_ventas';
 // Roles con visión de TODA la cartera de leads.
 const ROLES_LEADS_GLOBALES = ['super_admin', 'admin', 'coordinador', ROL_CENTRAL_VENTAS];
 
-// Alta de leads: la Central de ventas y el superadministrador. La Vendedora ya
-// no registra leads: solo trabaja los que la Central le asigna.
-const ROLES_ALTA_LEAD = ['super_admin', ROL_CENTRAL_VENTAS];
+// Alta de leads: la Central de ventas, el superadministrador y la Vendedora.
+// La Vendedora registra los prospectos que consigue ella misma; el lead queda
+// asignado a su usuario (lo fuerza `leadsController.crear`, no la UI), porque
+// solo ve los suyos y con cualquier otra asignación lo perdería de vista.
+const ROLES_ALTA_LEAD = ['super_admin', ROL_CENTRAL_VENTAS, ROL_VENDEDORA];
 
 // Lectura de la lista y del detalle (la Vendedora, acotada a los suyos).
 const ROLES_LECTURA_LEAD = [...ROLES_LEADS_GLOBALES, ROL_VENDEDORA];

@@ -211,7 +211,7 @@ async function sincronizarDiasYEventos(db, idServicio, opts = {}) {
       select: {
         id: true, codigo: true, titulo: true, tipo_registro: true,
         fecha_programada: true, hora_programada: true, duracion_dias: true,
-        estado_servicio: true
+        estado_servicio: true, id_mantenimiento_plan: true
       }
     });
     if (!servicio) return { dias: [], fechas: [] };
@@ -289,6 +289,23 @@ async function sincronizarDiasYEventos(db, idServicio, opts = {}) {
       await tx.tbl_servicios_proyectos.update({
         where: { id: idServicio },
         data: { fecha_programada: parseYMDLima(fechasYMD[0]), duracion_dias: n, ...stamp }
+      });
+    }
+
+    // 3b. Si el servicio ES la visita de un plan de mantenimiento, el cronograma
+    //     del plan sigue la misma fecha. Sin esto, reprogramar el mantenimiento
+    //     dejaba la visita anclada al día pactado: el cronograma mostraba una
+    //     fecha y el servicio otra, y al regenerar el plan esa fecha "libre" se
+    //     rellenaba con una visita fantasma.
+    //
+    //     `numero_mes` NO se recalcula: la visita sigue siendo la del mes que la
+    //     originó aunque se ejecute más tarde. Es lo que se pactó y lo que
+    //     factura el plan (un cobro por mes), así que mover el mes cambiaría
+    //     retroactivamente meses ya aprobados.
+    if (cambiaFecha && servicio.id_mantenimiento_plan) {
+      await tx.tbl_mantenimientos_programacion.updateMany({
+        where: { id_servicio: idServicio, estado: 1 },
+        data: { fecha_programada: parseYMDLima(fechasYMD[0]), ...stamp }
       });
     }
 

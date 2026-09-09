@@ -609,10 +609,13 @@ model tbl_servicios_evidencias {
   id_archivo             Int?
   tipo_evidencia         String                                 @default("Foto") @db.VarChar(30)
   descripcion            String?
-  // Momento de la evidencia dentro del trabajo: "Antes" o "Despues". NULL para
-  // evidencias sin clasificar (legado, fotos de ítem del checklist o del cierre):
-  // en la UI se muestran junto a las de "Despues".
-  momento                String?                                @db.VarChar(10)
+  // Sección del álbum a la que pertenece la evidencia:
+  //   "Antes" / "Despues" → el trabajo del técnico en obra;
+  //   "Coordinacion"      → registro propio de la Oficina Técnica (solo lo
+  //                         cargan Coordinador y Super Admin).
+  // NULL para evidencias sin clasificar (legado, fotos de ítem del checklist o
+  // del cierre): en la UI se muestran junto a las de "Despues".
+  momento                String?                                @db.VarChar(20)
   latitud                Decimal?                               @db.Decimal(10, 7)
   longitud               Decimal?                               @db.Decimal(10, 7)
   fecha_carga            DateTime                               @default(now()) @db.Timestamptz(6)

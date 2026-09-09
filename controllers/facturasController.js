@@ -23,7 +23,7 @@ const {
   calcularEstadoFacturacion
 } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
-const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
@@ -173,7 +173,7 @@ function resumirFacturas(analizadas) {
 
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, desde, hasta } = req.query;
+    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, moneda, desde, hasta } = req.query;
     // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
     // tipo de servicio): asignarlos a where.OR directamente se pisarían.
     const and = [];
@@ -218,6 +218,24 @@ const listar = async (req, res) => {
       and.push({ OR: [
         { servicio: { tipo_servicio: { modulo_asociado: 'mantenimiento' } } },
         { AND: [{ id_servicio: null }, { id_mantenimiento_plan: { not: null } }] }
+      ] });
+    }
+
+    // Filtro por moneda. La factura no guarda la suya: la HEREDA del cobro y,
+    // si no lo tiene, del servicio (misma regla que `monedaDe`, la que rotula
+    // cada importe de la tabla y agrupa el resumen). Por eso el filtro no es una
+    // columna sino un OR sobre la relación que aporta la divisa. El tercer caso
+    // —factura sin cobro y sin servicio— toma la moneda por defecto, así que
+    // solo entra cuando se filtra justamente por esa. Un código fuera del
+    // catálogo se ignora (normalizarMoneda devuelve null).
+    const monedaFiltro = normalizarMoneda(moneda);
+    if (monedaFiltro) {
+      and.push({ OR: [
+        { cobro: { is: { moneda: monedaFiltro } } },
+        { cobro: { is: null }, servicio: { is: { moneda: monedaFiltro } } },
+        ...(monedaFiltro === MONEDA_POR_DEFECTO
+          ? [{ cobro: { is: null }, servicio: { is: null } }]
+          : [])
       ] });
     }
 
@@ -495,7 +513,7 @@ const crear = async (req, res) => {
       const cobroPropioVivo = servicio.cobro && servicio.cobro.estado === 1;
       if (cobroPlan || !cobroPropioVivo) {
         return res.status(400).json({
-          error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura desde el detalle del plan (Facturación mensual) o en Gestión de cobros → Por facturar.'
+          error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura contra la cuota del plan desde Contabilidad → Por facturar, Gestión de cobros → Por facturar o el detalle del plan (Facturación mensual).'
         });
       }
     }

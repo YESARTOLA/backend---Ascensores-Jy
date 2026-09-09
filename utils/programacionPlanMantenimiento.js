@@ -153,6 +153,61 @@ function programacionDeAscensor({ fechaInicioYMD, frecuencia, frecuenciaDiasCust
 }
 
 /**
+ * Reparte las visitas que YA existen contra la serie teórica y devuelve las
+ * teóricas que todavía FALTA crear.
+ *
+ * El emparejamiento es por MES DEL PLAN, no por fecha exacta, y esa es toda la
+ * regla: la visita de un mes sigue siendo la de ese mes aunque se ejecute otro
+ * día. Comparar por fecha exacta dejaba "libre" el día teórico en cuanto la
+ * visita se reagendaba, y el cronograma se rellenaba con una visita fantasma
+ * —un plan mensual de 8 meses acababa pidiendo 12 salidas, con meses que nunca
+ * llegaban a "completo" porque les faltaba una visita que no existía.
+ *
+ * Dentro de cada mes se cubre primero por coincidencia exacta de fecha (para no
+ * mover lo que ya calza) y después una a una: si el mes teórico tiene k visitas
+ * y ya hay j registradas, se crean k - j. Un mes con MÁS visitas de las
+ * pactadas no genera ninguna y tampoco borra nada: lo ya ejecutado manda.
+ *
+ * @param {Array<{id_ascensor:number, numero_mes:number, fecha:string}>} teoricas
+ * @param {Array<{id_ascensor:number, numero_mes:number, fecha:string}>} existentes
+ *        Visitas ya registradas, con el mes del plan al que pertenecen resuelto.
+ * @returns {Array} el subconjunto de `teoricas` que falta crear (mismo orden).
+ */
+function teoricasFaltantes(teoricas, existentes) {
+  const clave = (x) => `${x.id_ascensor}|${x.numero_mes}`;
+  const ymd = (f) => String(f).substring(0, 10);
+
+  const ocupadasPorGrupo = new Map();
+  for (const e of existentes || []) {
+    const k = clave(e);
+    if (!ocupadasPorGrupo.has(k)) ocupadasPorGrupo.set(k, []);
+    ocupadasPorGrupo.get(k).push(ymd(e.fecha));
+  }
+
+  const gruposTeoricos = new Map();
+  for (const t of teoricas || []) {
+    const k = clave(t);
+    if (!gruposTeoricos.has(k)) gruposTeoricos.set(k, []);
+    gruposTeoricos.get(k).push(t);
+  }
+
+  const faltantes = new Set();
+  for (const [k, lista] of gruposTeoricos) {
+    const ocupadas = [...(ocupadasPorGrupo.get(k) || [])];
+    const sinCoincidencia = [];
+    for (const t of lista) {
+      const i = ocupadas.indexOf(ymd(t.fecha));
+      if (i >= 0) ocupadas.splice(i, 1);  // esa teórica ya existe tal cual
+      else sinCoincidencia.push(t);
+    }
+    // Las visitas del mes que quedaron en otro día cubren, una por una, las
+    // teóricas restantes de ese mismo mes.
+    for (const t of sinCoincidencia.slice(ocupadas.length)) faltantes.add(t);
+  }
+  return (teoricas || []).filter(t => faltantes.has(t));
+}
+
+/**
  * Genera la programación COMPLETA del plan: la serie de cada ascensor, con su
  * propia frecuencia, dentro del mismo horizonte de meses.
  *
@@ -190,5 +245,6 @@ module.exports = {
   ventanasDelPlan,
   mesDeFecha,
   programacionDeAscensor,
-  programacionDelPlan
+  programacionDelPlan,
+  teoricasFaltantes
 };

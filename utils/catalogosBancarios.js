@@ -37,6 +37,19 @@ function etiquetaMoneda(codigo) {
 
 const TIPOS_CUENTA_CODIGOS = TIPOS_CUENTA.map(t => t.codigo);
 const MONEDAS_CODIGOS = MONEDAS.map(m => m.codigo);
+
+/**
+ * Normaliza un código de moneda recibido de la UI: devuelve el código tal como
+ * está en el catálogo, o null si no pertenece a él.
+ *
+ * Lo usan los filtros por moneda (Contabilidad, Gestión de cobros y Facturas)
+ * para IGNORAR un valor desconocido en lugar de arrastrarlo al `where`, que
+ * devolvería una lista vacía sin explicar por qué.
+ */
+function normalizarMoneda(codigo) {
+  const cod = String(codigo || '').toUpperCase();
+  return MONEDAS_CODIGOS.includes(cod) ? cod : null;
+}
 // Moneda por defecto de todo el sistema: la primera del catálogo. Cualquier
 // fallback de moneda debe leerse de aquí y no escribirse literal, para que
 // cambiar el catálogo no deje códigos sueltos regados por los controladores.
@@ -48,6 +61,7 @@ module.exports = {
   TIPOS_CUENTA,
   MONEDAS,
   etiquetaMoneda,
+  normalizarMoneda,
   METODOS_PAGO,
   TIPOS_CUENTA_CODIGOS,
   MONEDAS_CODIGOS,

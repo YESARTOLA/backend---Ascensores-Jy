@@ -35,7 +35,7 @@ const {
   esPorFacturar,
   esFacturado
 } = require('../utils/estadoFactura');
-const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const {
@@ -160,6 +160,12 @@ function sanitizarPrecio(servicio, rolCodigo) {
   clon.precio_interno = null;
   if (Array.isArray(clon.ascensores)) {
     clon.ascensores = clon.ascensores.map(a => ({ ...a, monto: null }));
+  }
+  // Plan que cubre este mantenimiento: su monto mensual es el precio pactado
+  // (el servicio no tiene precio propio), así que se anula igual que el resto.
+  // Espejo de planMantenimientoSinFinanzas en utils/visibilidadFinanzas.js.
+  if (clon.mantenimiento_plan) {
+    clon.mantenimiento_plan = { ...clon.mantenimiento_plan, monto_mensual: null };
   }
   // Ítems de la cotización de origen: ocultar precios a roles sin permiso (técnicos).
   if (clon.cotizacion && Array.isArray(clon.cotizacion.versiones)) {
@@ -414,6 +420,14 @@ const obtener = async (req, res) => {
             cantidad_mantenimientos_gratuitos: true,
             fecha_inicio: true,
             estado_plan: true,
+            // Precio pactado del plan. El servicio de la visita nace con
+            // precio_interno = 0 a propósito (el importe del mes no depende de
+            // cuántas visitas caigan en él), así que sin esto el detalle del
+            // mantenimiento se leía como "S/ 0.00 = gratis". Lo anula
+            // sanitizarPrecio para los roles sin visibilidad financiera.
+            monto_mensual: true,
+            moneda: true,
+            duracion_meses: true,
             tipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } }
           }
         },
@@ -826,6 +840,28 @@ const actualizar = async (req, res) => {
     // Si se reciben ascensores, validar y sincronizar la junction
     let validacion = null;
     if (d.ascensores !== undefined) {
+      // UN SERVICIO DE PLAN = UN ASCENSOR. Cada visita del cronograma cubre un
+      // ascensor en una fecha, y de esa correspondencia cuelga todo lo que es
+      // "por ascensor": su técnico, su OT y su álbum de evidencias. Cambiar aquí
+      // la lista rompería esa correspondencia (el servicio pasaría a cubrir
+      // varios equipos con una sola OT y un solo álbum) y además dejaría
+      // `tbl_mantenimientos_programacion.id_ascensor` apuntando a otra cosa.
+      // El ascensor de un mantenimiento se cambia en el plan, no en la visita.
+      if (previo.id_mantenimiento_plan) {
+        const actuales = await prisma.tbl_servicios_ascensores.findMany({
+          where: { id_servicio: id, estado: 1 }, select: { id_ascensor: true }
+        });
+        const idsPedidos = [...new Set((d.ascensores || [])
+          .map(a => Number(a?.id_ascensor)).filter(Number.isFinite))].sort((x, y) => x - y);
+        const idsActuales = actuales.map(a => a.id_ascensor).sort((x, y) => x - y);
+        const iguales = idsPedidos.length === idsActuales.length
+          && idsPedidos.every((v, i) => v === idsActuales[i]);
+        if (!iguales) {
+          return res.status(400).json({
+            error: 'Este servicio pertenece a un plan de mantenimiento: cubre un solo ascensor y no se le pueden cambiar los ascensores desde aquí. Modifique los ascensores del plan.'
+          });
+        }
+      }
       validacion = await validarAscensores(d.ascensores, nuevoIdCliente, nuevoPrecio, nuevaMoneda);
       if (!validacion.ok) return res.status(400).json({ error: validacion.error });
     }
@@ -1605,7 +1641,7 @@ async function resumenFacturacion(where) {
 
 const realizados = async (req, res) => {
   try {
-    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion } = req.query;
+    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1646,6 +1682,12 @@ const realizados = async (req, res) => {
     // Los servicios marcados "Sin factura" (requiere_factura = 0) no son
     // "pendientes por facturar": se excluyen al filtrar por ese estado.
     if (estado_facturacion === ESTADO_FACTURACION_SIN) servicioWhere.requiere_factura = 1;
+    // Filtro por moneda: la del SERVICIO, que es la que rotula su total en la
+    // tabla y la que agrupa los importes del resumen. Así el recorte y los dos
+    // indicadores hablan siempre de la misma divisa. Un código fuera del
+    // catálogo se ignora (normalizarMoneda devuelve null).
+    const monedaFiltro = normalizarMoneda(moneda);
+    if (monedaFiltro) servicioWhere.moneda = monedaFiltro;
     // Filtro por situación de pago (columna "Situación"):
     //   sin_cobro → servicios gratuitos.
     //   cancelado → cobro pagado (Pagado/Cerrado), excluyendo gratuitos.
@@ -1684,6 +1726,10 @@ const realizados = async (req, res) => {
               asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
               guias: { where: { estado: 1 }, include: { archivo: true } },
               evidencias: { where: { estado: 1 } },
+              // Precio pactado del plan que cubre el mantenimiento: los
+              // servicios de plan no llevan precio propio, así que sin esto la
+              // columna "Total" mostraba S/ 0.00 en cada visita.
+              mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } },
                     cobro: { include: { facturas: true } }
             }
           }
