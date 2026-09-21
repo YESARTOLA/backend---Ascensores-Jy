@@ -1,23 +1,21 @@
 const prisma = require('../config/prisma');
-const { resolverTipo, construirKey } = require('../middleware/uploadMiddleware');
-const { subirObjeto, eliminarObjeto, keyDesdeRuta, rutaDesdeKey } = require('../utils/storage');
+const { eliminarObjeto, keyDesdeRuta } = require('../utils/storage');
 
+/**
+ * El archivo ya llegó al storage por streaming (middleware `recibirArchivo`):
+ * aquí solo se registra en tbl_archivos. Si el registro falla, se borra el
+ * objeto recién subido para no dejarlo huérfano en el bucket.
+ */
 const subir = async (req, res) => {
+  const subido = req.archivo;
+  if (!subido) return res.status(400).json({ error: 'No se envió archivo' });
   try {
-    if (!req.file) return res.status(400).json({ error: 'No se envió archivo' });
-    const tipo = resolverTipo(req);
-    const key = construirKey(tipo, req.file.originalname);
-    await subirObjeto({
-      key,
-      body: req.file.buffer,
-      contentType: req.file.mimetype
-    });
     const archivo = await prisma.tbl_archivos.create({
       data: {
-        nombre_original: req.file.originalname,
-        ruta_almacenamiento: rutaDesdeKey(key),
-        mime_type: req.file.mimetype,
-        tamano_bytes: req.file.size,
+        nombre_original: subido.originalname,
+        ruta_almacenamiento: subido.ruta,
+        mime_type: subido.mimetype,
+        tamano_bytes: subido.size,
         subido_por: req.user.id,
         user_id_registration: req.user.id
       }
@@ -25,6 +23,8 @@ const subir = async (req, res) => {
     res.status(201).json({ data: archivo });
   } catch (err) {
     console.error(err);
+    try { await eliminarObjeto(subido.key); }
+    catch (e) { console.warn('[archivos.subir] no se pudo limpiar el objeto huérfano:', e.message); }
     res.status(500).json({ error: 'Error al subir archivo' });
   }
 };

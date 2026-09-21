@@ -17,6 +17,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
 const {
   S3Client,
   PutObjectCommand,
@@ -25,7 +27,11 @@ const {
   GetObjectCommand,
   HeadBucketCommand,
   CreateBucketCommand,
-  ListObjectsV2Command
+  ListObjectsV2Command,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -52,6 +58,15 @@ if (LOCAL) {
 } else if (!WASABI_CONFIGURADO) {
   console.warn('[storage] Driver WASABI seleccionado pero faltan WASABI_* en env. Las operaciones de archivo fallarán (usa STORAGE_DRIVER=local para trabajar sin Wasabi).');
 }
+
+/**
+ * Tamaño de cada parte del multipart upload. S3/Wasabi exigen un mínimo de 5 MiB
+ * por parte (salvo la última) y admiten hasta 10 000 partes: con 16 MiB el techo
+ * por archivo queda en ~160 GB y el backend nunca retiene en memoria más de una
+ * parte a la vez, sea cual sea el peso del video que suba el técnico.
+ */
+const PARTE_MB = Math.max(5, Number(process.env.UPLOAD_PART_MB) || 16);
+const PARTE_BYTES = PARTE_MB * 1024 * 1024;
 
 const REGION = WASABI_REGION || 'us-east-1';
 const BUCKET = WASABI_BUCKET;
@@ -111,6 +126,69 @@ async function subirObjetoWasabi({ key, body, contentType }) {
     ContentType: contentType || 'application/octet-stream'
   }));
   return { key, ruta: rutaDesdeKey(key) };
+}
+
+/**
+ * Sube un stream a Wasabi con multipart upload, sin conocer de antemano el
+ * tamaño y sin acumular el archivo entero en memoria: se van cortando partes de
+ * PARTE_BYTES y subiéndolas una a una. El `await` dentro del `for await` aplica
+ * contrapresión sobre el stream de entrada, así que la petición HTTP avanza al
+ * ritmo al que Wasabi acepta los datos.
+ *
+ * Si algo falla se aborta el multipart para no dejar partes huérfanas facturando
+ * en el bucket.
+ */
+async function subirObjetoStreamWasabi({ key, stream, contentType, onProgress }) {
+  asegurarConfig();
+  const creado = await client.send(new CreateMultipartUploadCommand({
+    Bucket: BUCKET,
+    Key: key,
+    ContentType: contentType || 'application/octet-stream'
+  }));
+  const uploadId = creado.UploadId;
+  const partes = [];
+  let bytes = 0;
+  let acumulado = [];
+  let pendiente = 0;
+
+  const subirParte = async (body) => {
+    const PartNumber = partes.length + 1;
+    const r = await client.send(new UploadPartCommand({
+      Bucket: BUCKET, Key: key, UploadId: uploadId, PartNumber, Body: body
+    }));
+    partes.push({ ETag: r.ETag, PartNumber });
+  };
+
+  try {
+    for await (const chunk of stream) {
+      acumulado.push(chunk);
+      pendiente += chunk.length;
+      bytes += chunk.length;
+      if (pendiente >= PARTE_BYTES) {
+        const body = Buffer.concat(acumulado);
+        acumulado = [];
+        pendiente = 0;
+        await subirParte(body);
+      }
+      if (onProgress) onProgress(bytes);
+    }
+    // Última parte (o archivo más pequeño que una parte: igual necesita 1 parte).
+    if (pendiente > 0 || partes.length === 0) {
+      await subirParte(Buffer.concat(acumulado));
+    }
+    await client.send(new CompleteMultipartUploadCommand({
+      Bucket: BUCKET, Key: key, UploadId: uploadId,
+      MultipartUpload: { Parts: partes }
+    }));
+    return { key, ruta: rutaDesdeKey(key), bytes };
+  } catch (err) {
+    try {
+      await client.send(new AbortMultipartUploadCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId }));
+    } catch (e) {
+      console.warn('[storage] no se pudo abortar el multipart upload:', e.message);
+    }
+    throw err;
+  }
 }
 
 async function eliminarObjetoWasabi(key) {
@@ -188,6 +266,28 @@ async function subirObjetoLocal({ key, body }) {
   await fs.promises.mkdir(path.dirname(abs), { recursive: true });
   await fs.promises.writeFile(abs, body);
   return { key, ruta: rutaDesdeKey(key) };
+}
+
+/** Equivalente local: vuelca el stream a disco contando los bytes de paso. */
+async function subirObjetoStreamLocal({ key, stream, onProgress }) {
+  const abs = rutaAbsoluta(key);
+  await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+  let bytes = 0;
+  const contador = new Transform({
+    transform(chunk, _enc, cb) {
+      bytes += chunk.length;
+      if (onProgress) onProgress(bytes);
+      cb(null, chunk);
+    }
+  });
+  try {
+    await pipeline(stream, contador, fs.createWriteStream(abs));
+  } catch (err) {
+    // Un archivo a medias es peor que ninguno: se borra el parcial.
+    try { await fs.promises.unlink(abs); } catch { /* no existía */ }
+    throw err;
+  }
+  return { key, ruta: rutaDesdeKey(key), bytes };
 }
 
 async function eliminarObjetoLocal(key) {
@@ -274,6 +374,7 @@ module.exports = {
   keyDesdeRuta,
   rutaDesdeKey,
   subirObjeto:    LOCAL ? subirObjetoLocal    : subirObjetoWasabi,
+  subirObjetoStream: LOCAL ? subirObjetoStreamLocal : subirObjetoStreamWasabi,
   eliminarObjeto: LOCAL ? eliminarObjetoLocal : eliminarObjetoWasabi,
   existeObjeto:   LOCAL ? existeObjetoLocal   : existeObjetoWasabi,
   urlPresigned:   LOCAL ? urlPresignedLocal   : urlPresignedWasabi,

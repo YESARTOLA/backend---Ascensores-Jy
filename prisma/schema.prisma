@@ -1213,7 +1213,7 @@ model tbl_archivos {
   nombre_original             String                                 @db.VarChar(255)
   ruta_almacenamiento         String
   mime_type                   String?                                @db.VarChar(100)
-  tamano_bytes                Int?
+  tamano_bytes                BigInt?
   subido_por                  Int?
   fecha_subida                DateTime                               @default(now()) @db.Timestamptz(6)
   estado                      Int                                    @default(1)

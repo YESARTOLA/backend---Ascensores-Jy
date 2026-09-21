@@ -371,8 +371,13 @@ const agregarFotoItem = async (req, res) => {
     }
     const archivo = await prisma.tbl_archivos.findUnique({ where: { id: idArchivo }, select: { id: true, mime_type: true } });
     if (!archivo) return res.status(400).json({ error: 'Archivo no encontrado' });
-    if (!String(archivo.mime_type || '').startsWith('image/')) {
-      return res.status(400).json({ error: 'La evidencia del ítem debe ser una imagen' });
+    // Foto, video o PDF: el técnico documenta con lo que el caso pida (un ruido
+    // solo se prueba en video). En el informe PDF solo se incrustan las imágenes;
+    // el resto queda adjunto al servicio y se consulta desde la aplicación.
+    const mime = String(archivo.mime_type || '');
+    const mimeAdmitido = mime.startsWith('image/') || mime.startsWith('video/') || mime === 'application/pdf';
+    if (!mimeAdmitido) {
+      return res.status(400).json({ error: 'La evidencia del ítem debe ser una imagen, un video o un PDF' });
     }
 
     const ctx = await ensureChecklistFinalizacion(prisma, servicio, req.user.id);

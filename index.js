@@ -1,6 +1,11 @@
 require('dotenv').config();
 process.env.TZ = process.env.TZ || 'America/Lima';
 
+// `tbl_archivos.tamano_bytes` es BigInt (un video de evidencia puede pasar de los
+// 2 GB que aguanta un Int). Prisma lo entrega como BigInt y JSON.stringify no
+// sabe serializarlo, así que se le enseña una vez, aquí, para todas las rutas.
+BigInt.prototype.toJSON = function () { return Number(this); };
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -129,12 +134,18 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     .catch(err => console.warn('[configuracion] No se pudieron asegurar defaults:', err.message));
 });
 
-// Timeouts para soportar uploads grandes (videos de evidencia hasta cientos de MB
-// en conexiones lentas). Node 18+ trae requestTimeout=300s por defecto, que se
-// quedaba corto para subidas móviles. headersTimeout debe ser mayor que requestTimeout.
-const SERVER_REQUEST_TIMEOUT_MS = Number(process.env.SERVER_REQUEST_TIMEOUT_MS) || 15 * 60 * 1000;
+// Uploads sin límite de peso: un timeout de request es un tope de tamaño
+// encubierto (un video de 3 GB por una conexión móvil lenta tarda lo que tarda),
+// así que `requestTimeout = 0` lo desactiva. Se puede reponer un tope con
+// SERVER_REQUEST_TIMEOUT_MS si algún despliegue lo necesita.
+// headersTimeout sigue acotado: solo cubre hasta el final de las cabeceras —no
+// el cuerpo— y es lo que protege de conexiones que se abren y no envían nada.
+const SERVER_REQUEST_TIMEOUT_MS = Number(process.env.SERVER_REQUEST_TIMEOUT_MS) || 0;
 server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
-server.headersTimeout = SERVER_REQUEST_TIMEOUT_MS + 60 * 1000;
+server.headersTimeout = SERVER_REQUEST_TIMEOUT_MS
+  ? SERVER_REQUEST_TIMEOUT_MS + 60 * 1000
+  : 5 * 60 * 1000;
+server.timeout = 0;                  // sin timeout de socket inactivo durante la subida
 server.keepAliveTimeout = 65 * 1000; // > timeout de keep-alive del proxy de Railway
 
 // Graceful shutdown (Railway envía SIGTERM antes de reciclar el contenedor)
