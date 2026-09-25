@@ -17,7 +17,7 @@
  * Uso:
  *   node scripts/fusionarGardenias.js
  * Variables opcionales:
- *   API_BASE        (default http://localhost:4000)
+ *   API_BASE        (default http://localhost:4003)
  *   FECHA_INICIO    (YYYY-MM-DD; default: hoy en Lima)
  *
  * IMPORTANTE: el backend debe estar corriendo (usa la API para crear el plan).
@@ -36,7 +36,7 @@ const MONTO_POR_ASCENSOR = 400;  // total 800/periodo
 const MONEDA = 'PEN';
 const PLANES_VIEJOS = [2, 104];
 const MARCADOR = '[FUSION-GARDENIAS-v1]';
-const API_BASE = process.env.API_BASE || 'http://localhost:4000';
+const API_BASE = process.env.API_BASE || 'http://localhost:4003';
 
 function tokenSuperadmin() {
   if (!process.env.JWT_SECRET) throw new Error('Falta JWT_SECRET en el entorno');

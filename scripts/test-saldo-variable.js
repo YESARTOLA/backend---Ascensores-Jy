@@ -8,9 +8,9 @@
  *  4. Resto (700 en ejemplo) puede variar en monto y distribución de cuotas.
  *  5. Cuotas pagadas/facturadas quedan blindadas.
  *
- * Ejecuta directo contra el backend en http://localhost:4000 con admin/admin123.
+ * Ejecuta directo contra el backend en http://localhost:4003 con admin/admin123.
  */
-const BASE = 'http://localhost:4000/api';
+const BASE = 'http://localhost:4003/api';
 
 async function req(method, path, token, body) {
   const r = await fetch(BASE + path, {
@@ -195,9 +195,9 @@ async function main() {
   assert(bajaFalló, 'bajar el total por debajo de lo blindado es rechazado');
 
   console.log('\n▶ TEST IDs para revisión visual:');
-  console.log('   cotización:', cotId, '→ http://localhost:5173/cotizaciones/' + cotId);
-  console.log('   servicio:  ', idServ, '→ http://localhost:5173/servicios/' + idServ);
-  console.log('   cobro:     ', idCobro, '→ http://localhost:5173/cobros/' + idCobro);
+  console.log('   cotización:', cotId, '→ http://localhost:3003/cotizaciones/' + cotId);
+  console.log('   servicio:  ', idServ, '→ http://localhost:3003/servicios/' + idServ);
+  console.log('   cobro:     ', idCobro, '→ http://localhost:3003/cobros/' + idCobro);
 
   if (process.exitCode === 1) {
     console.error('\n❌ Hay assertions fallidas');

@@ -13,7 +13,7 @@ ERP operativo para empresa de instalación, reparación, mantenimiento y atenci�
 ## Variables de entorno
 
 ```
-PORT=4000
+PORT=4003
 DB_HOST=localhost
 DB_USER=postgres
 DB_PASSWORD=...

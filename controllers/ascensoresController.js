@@ -8,6 +8,7 @@ const { bajaAscensorCascadaEnTx } = require('../utils/bajaAscensorCascada');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { MONEDAS_CODIGOS, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { normalizarDatosSitio } = require('../utils/datosSitioAscensor');
+const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
 const {
   aplicaAlcance,
   aplicaAlcanceEdificio,
@@ -293,6 +294,12 @@ const historial = async (req, res) => {
           include: { archivo: true, tecnico: true, servicio: { select: { codigo: true } } }
         })
       ]);
+    // Evidencias y guías cargadas sin técnico asignado: se muestran a nombre de quien las subió.
+    await adjuntarAutorSinTecnico([
+      ...servicios.flatMap(s => [...(s.evidencias || []), ...(s.guias || [])]),
+      ...evidencias,
+      ...guias
+    ]);
 
     // Emergencias y mantenimientos son dominio de Servicios: se ocultan a un
     // usuario cuyo ámbito sea solo Proyectos.

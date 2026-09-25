@@ -3,6 +3,7 @@ const { registrarActividadTecnico } = require('../utils/actividadTecnico');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
 const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
+const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
 
 /**
  * ¿Está este técnico asignado al servicio?
@@ -92,13 +93,10 @@ const subirEvidencia = async (req, res) => {
       return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se puede subir evidencias` });
     }
     // La evidencia se atribuye al técnico que la tomó. Si la carga un rol de
-    // gestión, queda a nombre del técnico asignado (que es de quien es el trabajo).
-    const id_tecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
-    if (!id_tecnico) {
-      return res.status(400).json({
-        error: 'La evidencia se registra a nombre del técnico del servicio: asigne un técnico antes de subir fotos'
-      });
-    }
+    // gestión, queda a nombre del técnico asignado (que es de quien es el trabajo)
+    // y, si el servicio aún no tiene técnico, sin técnico: el autor es entonces
+    // el usuario que la registró (ver utils/autorRegistro.js).
+    const id_tecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico || null;
 
     // Día del servicio al que pertenece la evidencia (servicios multidía). Opcional;
     // si viene, debe ser un día activo de ESTE servicio.
@@ -151,6 +149,7 @@ const listarEvidencias = async (req, res) => {
       include: { archivo: true, tecnico: true },
       orderBy: { id: 'desc' }
     });
+    await adjuntarAutorSinTecnico(list);
     res.json({ data: list });
   } catch (err) {
     console.error(err);

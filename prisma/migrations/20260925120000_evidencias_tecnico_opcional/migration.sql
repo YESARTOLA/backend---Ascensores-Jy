@@ -1,0 +1,11 @@
+-- Evidencias sin técnico asignado.
+--
+-- Hasta ahora toda evidencia se guardaba a nombre de un técnico (id_tecnico
+-- NOT NULL), así que un rol de gestión no podía subir fotos, videos ni archivos
+-- a un servicio que todavía no tenía técnico: el backend lo rechazaba con
+-- "asigne un técnico antes de subir fotos". Ahora la columna admite NULL y, en
+-- ese caso, el autor de la evidencia es el usuario de `user_id_registration`.
+--
+-- La FK a tbl_tecnicos se mantiene tal cual (ON DELETE RESTRICT). Quitar el NOT
+-- NULL es un cambio de catálogo: no reescribe la tabla ni toca las filas.
+ALTER TABLE "tbl_servicios_evidencias" ALTER COLUMN "id_tecnico" DROP NOT NULL;

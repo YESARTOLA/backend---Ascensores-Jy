@@ -6,6 +6,7 @@ const {
   ROLES_ALTA_LEAD,
   ROLES_LECTURA_LEAD,
   ROLES_EDICION_LEAD,
+  ROLES_ESTADO_LEAD,
   ROLES_GESTION_LEAD,
   ROLES_CONVERSION_LEAD
 } = require('../utils/accesoLeads');
@@ -25,10 +26,10 @@ router.get('/duplicados', permitirRoles(...ROLES_EDICION_LEAD), c.verificarDupli
 router.post('/', permitirRoles(...ROLES_ALTA_LEAD), c.crear);
 router.put('/:id', permitirRoles(...ROLES_EDICION_LEAD), c.actualizar);
 router.get('/:id/historial', permitirRoles('super_admin'), c.historial);
-router.patch('/:id/estado', permitirRoles(...ROLES_GESTION_LEAD), c.cambiarEstado);
+router.patch('/:id/estado', permitirRoles(...ROLES_ESTADO_LEAD), c.cambiarEstado);
 router.post('/:id/convertir', permitirRoles(...ROLES_CONVERSION_LEAD), c.convertir);
 router.get('/:id/cotizaciones', permitirRoles(...ROLES_LECTURA_LEAD), c.listarCotizaciones);
-router.post('/:id/cotizaciones', permitirRoles(...ROLES_GESTION_LEAD), c.subirCotizacion);
+router.post('/:id/cotizaciones', permitirRoles(...ROLES_ESTADO_LEAD), c.subirCotizacion);
 // Documentos libres del lead: los sube la Central de ventas (ROLES_GESTION_LEAD)
 // y la Vendedora asignada solo los consulta (ROLES_LECTURA_LEAD).
 router.get('/:id/documentos', permitirRoles(...ROLES_LECTURA_LEAD), c.listarDocumentos);

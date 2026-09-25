@@ -408,8 +408,9 @@ const agregarFotoItem = async (req, res) => {
     const latOk = lat !== null && Number.isFinite(lat) && lat >= -90 && lat <= 90;
     const lngOk = lng !== null && Number.isFinite(lng) && lng >= -180 && lng <= 180;
 
-    const idTecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico;
-    if (!idTecnico) return res.status(400).json({ error: 'No hay técnico asignado' });
+    // Sin técnico asignado la foto queda sin técnico, a nombre de quien la subió
+    // (mismo criterio que evidenciasGuiasController.subirEvidencia).
+    const idTecnico = req.user.id_tecnico || servicio.asignaciones[0]?.id_tecnico || null;
 
     const foto = await prisma.tbl_servicios_evidencias.create({
       data: {

@@ -4,6 +4,7 @@ const { registrarAuditoria } = require('../utils/auditoria');
 // Roles con visibilidad de datos económicos (SSoT compartido con el resto del backend).
 const { ROLES_FINANZAS: ROLES_PRECIO } = require('../utils/visibilidadFinanzas');
 const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
+const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const {
   cambiarEstadoServicio,
@@ -474,6 +475,8 @@ const obtener = async (req, res) => {
       const asignado = (servicio.asignaciones || []).some(a => a.id_tecnico === req.user.id_tecnico);
       if (!asignado) return res.status(404).json({ error: 'Servicio no encontrado' });
     }
+    // Evidencias y guías cargadas sin técnico asignado: se muestran a nombre de quien las subió.
+    await adjuntarAutorSinTecnico([...(servicio.evidencias || []), ...(servicio.guias || [])]);
     const data = sanitizarEconomico(
       sanitizarPrecio(servicio, req.user.rol_codigo),
       req.user.rol_codigo
@@ -1302,22 +1305,21 @@ const finalizarServicio = async (req, res) => {
     }
 
     // Registrar evidencias del trabajo terminado. Cada id corresponde a un tbl_archivos
-    // subido previamente vía POST /archivos con tipo=evidencias.
+    // subido previamente vía POST /archivos con tipo=evidencias. Sin técnico
+    // asignado se registran igual, a nombre de quien cierra (id_tecnico NULL).
     if (evidenciasIds.length > 0) {
       const idTecnicoEvidencia = req.user.id_tecnico || (responsableDoc ? responsableDoc.id_tecnico : null);
-      if (idTecnicoEvidencia) {
-        for (const idArchivo of evidenciasIds) {
-          await prisma.tbl_servicios_evidencias.create({
-            data: {
-              id_servicio: id,
-              id_tecnico: idTecnicoEvidencia,
-              id_archivo: idArchivo,
-              tipo_evidencia: 'Foto',
-              descripcion: null,
-              user_id_registration: req.user.id
-            }
-          });
-        }
+      for (const idArchivo of evidenciasIds) {
+        await prisma.tbl_servicios_evidencias.create({
+          data: {
+            id_servicio: id,
+            id_tecnico: idTecnicoEvidencia,
+            id_archivo: idArchivo,
+            tipo_evidencia: 'Foto',
+            descripcion: null,
+            user_id_registration: req.user.id
+          }
+        });
       }
     }
 
@@ -1929,11 +1931,11 @@ const crearGuia = async (req, res) => {
       return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se pueden registrar guías de salida` });
     }
 
+    // La guía queda a nombre del técnico (el que la carga o el responsable
+    // documental). Sin técnico asignado se registra igual, sin técnico: el autor
+    // es entonces el usuario que la registró (ver utils/autorRegistro.js).
     const responsableDoc = servicio.asignaciones.find(a => a.responsable_documentacion === 1) || servicio.asignaciones[0];
     const id_tecnico = req.user.id_tecnico || responsableDoc?.id_tecnico || null;
-    if (!id_tecnico) {
-      return res.status(400).json({ error: 'No hay técnico asignado al servicio para asociar la guía' });
-    }
 
     const estadoNormalizado = esEstadoGuiaValido(estado_guia)
       ? estado_guia
@@ -1960,6 +1962,7 @@ const crearGuia = async (req, res) => {
       id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: guia.id,
       accion: 'CREATE', valor_nuevo: guia, ip: req.ip
     });
+    await adjuntarAutorSinTecnico([guia]);
     res.status(201).json({ data: guia });
   } catch (err) {
     console.error(err);
@@ -2026,6 +2029,7 @@ const actualizarGuia = async (req, res) => {
       id_usuario: req.user.id, entidad: 'tbl_servicios_guias', id_entidad: id_guia,
       accion: 'UPDATE', valor_anterior: guiaPrevia, valor_nuevo: guia, ip: req.ip
     });
+    await adjuntarAutorSinTecnico([guia]);
     res.json({ data: guia });
   } catch (err) {
     console.error(err);

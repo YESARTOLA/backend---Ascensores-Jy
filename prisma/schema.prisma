@@ -580,7 +580,10 @@ model tbl_servicios_asignaciones {
 model tbl_servicios_guias {
   id                     Int                     @id @default(autoincrement())
   id_servicio            Int
-  id_tecnico             Int
+  // Técnico a cuyo nombre queda la guía. NULL cuando la registra un rol de
+  // gestión en un servicio que aún no tiene técnico asignado: el autor es
+  // entonces el usuario de `user_id_registration`.
+  id_tecnico             Int?
   codigo_guia            String?                 @db.VarChar(50)
   id_archivo             Int?
   observaciones_tecnicas String?
@@ -592,14 +595,19 @@ model tbl_servicios_guias {
   user_id_modification   Int?
   date_time_modification DateTime?               @db.Timestamptz(6)
   servicio               tbl_servicios_proyectos @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
-  tecnico                tbl_tecnicos            @relation(fields: [id_tecnico], references: [id])
+  // onDelete explícito: al volverse opcional, Prisma asumiría SetNull, pero la
+  // FK de la base sigue siendo RESTRICT (no se borra un técnico con guías).
+  tecnico                tbl_tecnicos?           @relation(fields: [id_tecnico], references: [id], onDelete: Restrict)
   archivo                tbl_archivos?           @relation(fields: [id_archivo], references: [id])
 }
 
 model tbl_servicios_evidencias {
   id                     Int                                    @id @default(autoincrement())
   id_servicio            Int
-  id_tecnico             Int
+  // Técnico a cuyo nombre queda la evidencia. NULL cuando la carga un rol de
+  // gestión en un servicio que aún no tiene técnico asignado: el autor es
+  // entonces el usuario de `user_id_registration`.
+  id_tecnico             Int?
   id_dia                 Int?
   // Si está presente, esta evidencia es la FOTO de un ítem del checklist de
   // finalización (no una evidencia "general" del servicio). Las evidencias
@@ -625,7 +633,9 @@ model tbl_servicios_evidencias {
   user_id_modification   Int?
   date_time_modification DateTime?                              @db.Timestamptz(6)
   servicio               tbl_servicios_proyectos                @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
-  tecnico                tbl_tecnicos                           @relation(fields: [id_tecnico], references: [id])
+  // onDelete explícito: al volverse opcional, Prisma asumiría SetNull, pero la
+  // FK de la base sigue siendo RESTRICT (no se borra un técnico con evidencias).
+  tecnico                tbl_tecnicos?                          @relation(fields: [id_tecnico], references: [id], onDelete: Restrict)
   dia                    tbl_servicios_dias?                    @relation(fields: [id_dia], references: [id])
   archivo                tbl_archivos?                          @relation(fields: [id_archivo], references: [id])
   respuesta              tbl_servicios_finalizacion_respuestas? @relation(fields: [id_respuesta], references: [id], onDelete: SetNull)

@@ -6,7 +6,9 @@
  *      alta el lead y registra a qué Vendedora queda asignado. Solo tiene acceso
  *      a este módulo (ninguna otra ruta del sistema).
  *   2. La VENDEDORA ve ÚNICAMENTE sus leads (id_vendedor = su usuario), los
- *      edita y los convierte en cliente/servicio. También da de alta los que
+ *      edita, les cambia el estado (incluido descartarlos y adjuntar la
+ *      cotización que los pasa a "Cotizado") y los convierte en
+ *      cliente/servicio. También da de alta los que
  *      consigue por su cuenta, y esos nacen asignados a ella misma: es la única
  *      asignación con la que podría seguir viéndolos. Lo que no hace es asignar
  *      ni reasignar leads (eso es de la Central) ni ver la cartera de las demás.
@@ -36,7 +38,13 @@ const ROLES_LECTURA_LEAD = [...ROLES_LEADS_GLOBALES, ROL_VENDEDORA];
 // solo los suyos (el alcance por lead lo aplica `puedeVerLead`).
 const ROLES_EDICION_LEAD = [...ROLES_LEADS_GLOBALES, ROL_VENDEDORA];
 
-// Ciclo comercial del lead: cambio de estado, descarte y cotizaciones adjuntas.
+// Ciclo comercial del lead: cambio de estado, descarte y cotizaciones adjuntas
+// (pasar a "Cotizado" ES adjuntar el PDF, así que van juntos). La Vendedora lo
+// opera solo sobre SUS leads (el alcance por lead lo aplica `puedeVerLead`).
+const ROLES_ESTADO_LEAD = [...ROLES_LEADS_GLOBALES, ROL_VENDEDORA];
+
+// Documentos libres del lead (expediente comercial): los suben y eliminan la
+// Central de ventas y administración; la Vendedora solo los consulta.
 const ROLES_GESTION_LEAD = [...ROLES_LEADS_GLOBALES];
 
 // Conversión a cliente/servicio: la Vendedora responsable (más administración).
@@ -57,9 +65,6 @@ const leadAlcanceWhere = (user) => (soloSusLeads(user) ? { id_vendedor: user.id 
 /** ¿El usuario puede ver/operar este lead concreto? */
 const puedeVerLead = (user, lead) => !soloSusLeads(user) || (!!lead && lead.id_vendedor === user.id);
 
-/** ¿Puede gestionar el ciclo comercial (estado, descarte, cotizaciones)? */
-const puedeGestionarLead = (user) => ROLES_GESTION_LEAD.includes(user?.rol_codigo);
-
 module.exports = {
   ROL_VENDEDORA,
   ROL_CENTRAL_VENTAS,
@@ -67,11 +72,11 @@ module.exports = {
   ROLES_ALTA_LEAD,
   ROLES_LECTURA_LEAD,
   ROLES_EDICION_LEAD,
+  ROLES_ESTADO_LEAD,
   ROLES_GESTION_LEAD,
   ROLES_CONVERSION_LEAD,
   ROLES_ASIGNABLES_LEAD,
   soloSusLeads,
   leadAlcanceWhere,
-  puedeVerLead,
-  puedeGestionarLead
+  puedeVerLead
 };
