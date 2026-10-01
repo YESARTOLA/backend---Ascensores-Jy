@@ -22,6 +22,7 @@
 const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 const { keyDesdeRuta, eliminarObjeto } = require('./storage');
+const { bajaDocumentosDeFacturasEnTx } = require('./documentosFactura');
 
 const ESTADOS_EN_CAMPO = ['En curso'];
 
@@ -136,7 +137,10 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
     await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: idCobro, estado: 1 }, data: { estado: 0, ...stamp } });
     await tx.tbl_cobros.updateMany({ where: { id: idCobro, estado: 1 }, data: { estado: 0, ...stamp } });
   }
-  // Facturas del servicio (cubre las generales con id_cobro null y las por cuota).
+  // Facturas del servicio (cubre las generales con id_cobro null y las por cuota),
+  // con sus documentos adicionales.
+  const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, servicio.facturas.map(f => f.id), userId);
+  for (const idArchivo of idsArchivoDocumentos) archivoIds.add(idArchivo);
   await tx.tbl_facturas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
 
   // --- Calendario y recordatorios ---

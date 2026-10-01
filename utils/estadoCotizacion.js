@@ -4,6 +4,7 @@
 // sincronía. Antes estos valores vivían dentro de cotizacionesController y el
 // frontend los repetía a mano en un array literal, así que el filtro del
 // listado podía quedar desalineado con lo que el backend realmente escribe.
+// (`whereAprobadaEnRango` es solo de backend: arma un `where` de Prisma.)
 //
 // Hay DOS ejes independientes:
 //
@@ -16,6 +17,8 @@
 //    recalcula con `sincronizarEstadoGlobal`, nunca se setea a mano. La única
 //    excepción es 'Anulado', que es terminal y lo fija la eliminación.
 
+const { parseYMDLima, parseYMDFinDiaLima } = require('./tiempo');
+
 const ESTADOS_VERSION = {
   COTIZADO: 'Cotizado',
   APROBADO: 'Aprobado',
@@ -26,7 +29,10 @@ const ESTADO_GLOBAL = {
   COTIZADO: 'Cotizado',
   ACEPTADO: 'Aceptado',
   EJECUCION: 'Ejecución',
-  PENDIENTE: 'Pendiente',
+  // El técnico ya terminó y queda saldo por cobrar (en revisión, a gestión de
+  // cobro, en cobro, facturado…). Antes se llamaba 'Pendiente', que en la misma
+  // fila se leía como el 'Pendiente' del servicio (= aún sin asignar).
+  POR_COBRAR: 'Por cobrar',
   TERMINADO: 'Terminado',
   // Terminal: la cotización fue eliminada (baja lógica) pero se conserva visible
   // en el listado como historial; sus servicios generados quedan anulados.
@@ -39,7 +45,7 @@ const ESTADOS_GLOBALES = [
   ESTADO_GLOBAL.COTIZADO,
   ESTADO_GLOBAL.ACEPTADO,
   ESTADO_GLOBAL.EJECUCION,
-  ESTADO_GLOBAL.PENDIENTE,
+  ESTADO_GLOBAL.POR_COBRAR,
   ESTADO_GLOBAL.TERMINADO,
   ESTADO_GLOBAL.ANULADO
 ];
@@ -56,22 +62,22 @@ const ESTADOS_VERSION_LISTA = [
 // Por defecto el rango filtra por FECHA DE CREACIÓN de la cotización. Pero
 // cuando se está mirando el embudo ya aceptado, lo que interesa es CUÁNDO SE
 // ACEPTÓ, no cuándo se registró: "aceptadas de agosto" son las que el cliente
-// aprobó en agosto, sin importar que hoy estén en ejecución, pendientes o ya
+// aprobó en agosto, sin importar que hoy estén en ejecución, por cobrar o ya
 // terminadas (ni en qué mes se cotizaron). Para esos filtros el rango se aplica
 // sobre `fecha_aprobacion` de la versión aprobada.
 const ESTADOS_GLOBALES_POST_ACEPTACION = [
   ESTADO_GLOBAL.ACEPTADO,
   ESTADO_GLOBAL.EJECUCION,
-  ESTADO_GLOBAL.PENDIENTE,
+  ESTADO_GLOBAL.POR_COBRAR,
   ESTADO_GLOBAL.TERMINADO
 ];
 
 // Estados en los que el trabajo en campo YA TERMINÓ: el técnico cerró el
 // servicio y todo lo que queda es circuito administrativo/contable (revisión,
-// cobro, facturación) hasta el cierre. 'Pendiente' no es una etapa anterior a
+// cobro, facturación) hasta el cierre. 'Por cobrar' no es una etapa anterior a
 // 'Terminado' en el trabajo: es la misma obra terminada, esperando plata.
 const ESTADOS_GLOBALES_TRABAJO_TERMINADO = [
-  ESTADO_GLOBAL.PENDIENTE,
+  ESTADO_GLOBAL.POR_COBRAR,
   ESTADO_GLOBAL.TERMINADO
 ];
 
@@ -80,7 +86,7 @@ const ESTADOS_GLOBALES_TRABAJO_TERMINADO = [
 //
 // Un valor del selector no siempre significa `estado_global = <ese valor>`:
 // algunos agrupan varias etapas del ciclo bajo un solo `IN (...)`. Existen
-// porque `estado_global` AVANZA (Aceptado → Ejecución → Pendiente → Terminado)
+// porque `estado_global` AVANZA (Aceptado → Ejecución → Por cobrar → Terminado)
 // y con la igualdad estricta una cotización se cae del filtro apenas su
 // servicio da el siguiente paso, aunque el hecho que el filtro busca siga
 // siendo cierto.
@@ -96,7 +102,7 @@ const ESTADOS_GLOBALES_TRABAJO_TERMINADO = [
 //    cuya lectura natural abarca también las fases posteriores. 'Terminado' es
 //    el caso: al pedir los servicios/proyectos terminados se esperan también
 //    los que ya pasaron a una fase posterior — facturados, en cobro, en
-//    revisión — que hoy figuran como 'Pendiente'. Para esos se sobrescribe la
+//    revisión — que hoy figuran como 'Por cobrar'. Para esos se sobrescribe la
 //    etiqueta del selector (`ETIQUETAS_FILTRO_GLOBAL`) y así queda claro por
 //    qué la lista trae badges distintos del filtro elegido.
 const FILTRO_GLOBAL_APROBADAS = 'Aprobadas';
@@ -129,6 +135,29 @@ function resolverFiltroGlobal(valor) {
   return EXPANSION_FILTRO_GLOBAL[valor] || null;
 }
 
+// ----------------------------------------------------------------------------
+// "Aprobada dentro del rango": condición Prisma sobre tbl_cotizaciones.
+//
+// Es la FECHA DE ACEPTACIÓN de una cotización: alguna de sus versiones vigentes
+// quedó Aprobada con `fecha_aprobacion` entre `desde` y `hasta` (YYYY-MM-DD,
+// días calendario de Lima; ambos extremos opcionales e inclusivos).
+//
+// Definición ÚNICA: la usan el listado de Cotizaciones y los filtros
+// "Aprobación de cotización" de Gestión de cobros y de Contabilidad, para que
+// "aprobadas en agosto" traiga lo mismo en los tres módulos. Devuelve null si
+// no se pidió rango.
+function whereAprobadaEnRango({ desde, hasta }) {
+  if (!desde && !hasta) return null;
+  const fecha_aprobacion = {};
+  if (desde) fecha_aprobacion.gte = parseYMDLima(desde);
+  if (hasta) fecha_aprobacion.lte = parseYMDFinDiaLima(hasta);
+  return {
+    versiones: {
+      some: { estado: 1, estado_version: ESTADOS_VERSION.APROBADO, fecha_aprobacion }
+    }
+  };
+}
+
 function rangoEsPorFechaAceptacion(valorFiltroGlobal) {
   if (!valorFiltroGlobal) return false;
   return valorFiltroGlobal === FILTRO_GLOBAL_APROBADAS
@@ -155,6 +184,7 @@ module.exports = {
   ESTADOS_GLOBALES_TRABAJO_TERMINADO,
   resolverFiltroGlobal,
   rangoEsPorFechaAceptacion,
+  whereAprobadaEnRango,
   esEstadoGlobalValido,
   esEstadoVersionValido
 };

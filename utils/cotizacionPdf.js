@@ -262,7 +262,10 @@ async function generarPdfCotizacion(ctx) {
   const labelX = x0 + ancho - 200;
   const valueX = x0 + ancho - 90;
   doc.font('Helvetica').fontSize(10).fillColor(PALETA.texto);
-  doc.text('Subtotal', labelX, y, { width: 100, align: 'right' });
+  // IGV incluido: los precios de los ítems ya son finales, así que el subtotal
+  // (base sin IGV) es menor que la suma de importes; el rótulo lo aclara.
+  const igvIncluido = !ctx.version.sin_igv && ctx.version.igv_incluido;
+  doc.text(igvIncluido ? 'Subtotal sin IGV' : 'Subtotal', labelX - 20, y, { width: 120, align: 'right' });
   doc.text(formatearMonto(ctx.version.subtotal, ctx.version.moneda), valueX, y, { width: 80, align: 'right' });
   y += 14;
   if (ctx.version.sin_igv) {
@@ -278,6 +281,12 @@ async function generarPdfCotizacion(ctx) {
   doc.font('Helvetica-Bold').fontSize(11).fillColor(PALETA.acento);
   doc.text('TOTAL', labelX, y, { width: 100, align: 'right' });
   doc.text(formatearMonto(ctx.version.monto_total, ctx.version.moneda), valueX, y, { width: 80, align: 'right' });
+  if (igvIncluido) {
+    y += 16;
+    doc.font('Helvetica').fontSize(8).fillColor(PALETA.gris)
+      .text('Los precios incluyen IGV', labelX - 20, y, { width: 210, align: 'right' });
+    doc.fillColor(PALETA.texto);
+  }
 
   // Plan de cuotas (si aplica)
   const planCuotas = Array.isArray(ctx.version.plan_cuotas) ? ctx.version.plan_cuotas : [];

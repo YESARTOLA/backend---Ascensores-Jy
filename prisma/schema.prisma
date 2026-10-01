@@ -223,6 +223,25 @@ model tbl_ascensores_precios {
   @@index([id_ascensor])
 }
 
+// Catálogo gestionable de clasificaciones de cliente (Grande, Pequeño, Marca
+// JY…). tbl_clientes.clasificacion y tbl_ascensores.clasificacion guardan el
+// `codigo` (VarChar(20), por eso aquí también). `area` dice a qué clientes
+// aplica: 'servicio' | 'proyecto' | 'ambos'. `color` es una clave de la paleta
+// de utils/clasificacionesCliente.js.
+model tbl_clasificaciones_cliente {
+  id                     Int       @id @default(autoincrement())
+  codigo                 String    @unique @db.VarChar(20)
+  etiqueta               String    @db.VarChar(80)
+  area                   String    @default("ambos") @db.VarChar(20)
+  color                  String    @default("gris") @db.VarChar(20)
+  orden                  Int       @default(0)
+  estado                 Int       @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime? @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime? @db.Timestamptz(6)
+}
+
 // Adjuntos libres de un cliente (PDFs, imágenes, documentos varios), clasificados
 // por área (columna `area`). El contrato firmado se almacena aparte, por área, en
 // tbl_clientes.id_archivo_contrato_servicio / _proyecto (tiene semántica especial:
@@ -1209,9 +1228,34 @@ model tbl_facturas {
   cobro                  tbl_cobros?                @relation(fields: [id_cobro], references: [id])
   cuota                  tbl_cobros_cuotas?         @relation(fields: [id_cuota], references: [id])
   cliente                tbl_clientes               @relation(fields: [id_cliente], references: [id])
+  // `archivo` es el comprobante en sí (PDF de la factura/boleta). Los demás
+  // documentos de la factura (constancia de detracción, de pago, XML/CDR…)
+  // van en `documentos`.
   archivo                tbl_archivos?              @relation(fields: [id_archivo], references: [id])
+  documentos             tbl_facturas_archivos[]
 
   @@index([tipo_comprobante])
+}
+
+// Documentos de soporte de una factura, además del comprobante
+// (tbl_facturas.id_archivo). Catálogo de `tipo_documento` en
+// utils/documentosFactura.js.
+model tbl_facturas_archivos {
+  id                     Int          @id @default(autoincrement())
+  id_factura             Int
+  id_archivo             Int
+  tipo_documento         String       @default("Otro") @db.VarChar(40)
+  descripcion            String?      @db.VarChar(200)
+  orden                  Int          @default(0)
+  estado                 Int          @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?    @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?    @db.Timestamptz(6)
+  factura                tbl_facturas @relation(fields: [id_factura], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos @relation(fields: [id_archivo], references: [id])
+
+  @@index([id_factura])
 }
 
 // ---------------------------------------------------------------------
@@ -1235,6 +1279,7 @@ model tbl_archivos {
   evidencias                  tbl_servicios_evidencias[]
   entregas                    tbl_entregas[]
   facturas                    tbl_facturas[]
+  facturas_documentos         tbl_facturas_archivos[]
   pagos                       tbl_pagos[]
   cotizaciones_pdf            tbl_cotizaciones_versiones[]           @relation("CotizacionVersionPdf")
   cotizaciones_respaldo       tbl_cotizaciones_versiones[]           @relation("CotizacionVersionRespaldo")
@@ -1466,6 +1511,10 @@ model tbl_cotizaciones_versiones {
   plan_cuotas            Json?
   saldo_variable         Boolean                  @default(false)
   sin_igv                Boolean                  @default(false)
+  // Los precios registrados YA incluyen el IGV: el total es la suma de los
+  // importes y el IGV se desglosa hacia adentro (118 = 100 + 18). Con sin_igv
+  // no aplica (no hay IGV que desglosar).
+  igv_incluido           Boolean                  @default(false)
   cuentas_pdf            Json?
   estado                 Int                      @default(1)
   user_id_registration   Int?

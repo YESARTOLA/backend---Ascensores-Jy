@@ -9,12 +9,14 @@ const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
-const { CLASIFICACIONES } = require('./catalogosClientes');
+const prisma = require('../config/prisma');
+const { mapaEtiquetasClasificacion } = require('./clasificacionesCliente');
 
 // Máscara de los conteos: enteros, para que sumen y filtren como números.
 const FMT_ENTERO = '#,##0';
 
-const CLASIFICACION_MAP = Object.fromEntries(CLASIFICACIONES.map(c => [c.codigo, c.etiqueta]));
+// Las etiquetas de clasificación salen del catálogo gestionable
+// (tbl_clasificaciones_cliente): se cargan una vez por exportación.
 
 const PALETA = {
   acento: '#e8853a',
@@ -71,13 +73,13 @@ function formateaContacto(nombre, correo, telefono) {
   return partes.join(' · ');
 }
 
-function mapearFila(c, hoyISO) {
+function mapearFila(c, hoyISO, etiquetas = {}) {
   const edificios = Array.isArray(c.edificios) ? c.edificios : [];
   return {
     nombre: c.nombre || '',
     edificios: edificios.map(e => e.nombre).filter(Boolean).join(', '),
     distritos: [...new Set(edificios.map(e => e.distrito).filter(Boolean))].join(', '),
-    clasificacion: c.clasificacion ? (CLASIFICACION_MAP[c.clasificacion] || c.clasificacion) : '',
+    clasificacion: c.clasificacion ? (etiquetas[c.clasificacion] || c.clasificacion) : '',
     tipo_documento: c.tipo_documento || '',
     numero_documento: c.numero_documento || '',
     telefono: c.telefono || '',
@@ -105,6 +107,7 @@ function mapearFila(c, hoyISO) {
 async function generarExcelClientes(clientes) {
   const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
   const hoy = ymdLima();
+  const etiquetas = await mapaEtiquetasClasificacion(prisma);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = empresa.EMPRESA_RAZON_SOCIAL || 'ERP';
@@ -144,7 +147,7 @@ async function generarExcelClientes(clientes) {
 
   // Filas
   clientes.forEach((c, idx) => {
-    const fila = ws.addRow(mapearFila(c, hoy));
+    const fila = ws.addRow(mapearFila(c, hoy, etiquetas));
     fila.alignment = { vertical: 'middle', wrapText: true };
     fila.font = { size: 10 };
     if (idx % 2 === 1) {
@@ -168,6 +171,7 @@ async function generarPdfClientes(clientes) {
     'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION', 'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
   ]);
   const hoy = ymdLima();
+  const etiquetas = await mapaEtiquetasClasificacion(prisma);
 
   const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
   const chunks = [];
@@ -227,7 +231,7 @@ async function generarPdfClientes(clientes) {
   doc.font('Helvetica').fontSize(8).fillColor(PALETA.texto);
   let alterna = false;
   for (const cliente of clientes) {
-    const fila = mapearFila(cliente, hoy);
+    const fila = mapearFila(cliente, hoy, etiquetas);
     // calcular altura por descripción más larga
     const alturas = cols.map(c => doc.heightOfString(String(fila[c.key] ?? ''), { width: c.w - 8 }));
     const altura = Math.max(14, Math.max(...alturas) + 6);

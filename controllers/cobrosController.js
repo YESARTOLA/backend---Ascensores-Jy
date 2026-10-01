@@ -1,15 +1,18 @@
 const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
-const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado } = require('../utils/estadoServicio');
+const { cambiarEstadoServicio, estadoServicioDesdeCobro, estaServicioFinalizado, resincronizarServicioConCobro } = require('../utils/estadoServicio');
 const { diffDiasLima, parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
 const { sincronizarRecordatorioCobro } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
 const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA, MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { ESTADO_FACTURACION_SIN, esFacturaActiva } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
+const { INCLUDE_DOCUMENTOS, bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualPorCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { whereCobroConMonto, whereCuotaConMonto } = require('../utils/montoACobrar');
+const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -206,11 +209,13 @@ const listar = async (req, res) => {
       id_cliente, id_tipo_servicio, id_proyecto,
       tipo_categoria, situacion_cobro, por_cobrar, banco, id_cuenta_bancaria,
       moneda, monto_min, monto_max,
-      fecha_proximo_desde, fecha_proximo_hasta,
+      aprobacion_desde, aprobacion_hasta,
       orden, direccion
     } = req.query;
 
-    const where = { estado: 1 };
+    // Solo cobros con importe: los de S/ 0.00 (gratuitos, planes sin ningún mes
+    // aprobado) no son cartera. Ver utils/montoACobrar.js.
+    const where = { estado: 1, ...whereCobroConMonto() };
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_proyecto) where.id_servicio = Number(id_proyecto);
@@ -220,14 +225,16 @@ const listar = async (req, res) => {
     // catálogo se ignora (normalizarMoneda devuelve null).
     const monedaFiltro = normalizarMoneda(moneda);
     if (monedaFiltro) where.moneda = monedaFiltro;
-    if (fecha_proximo_desde || fecha_proximo_hasta) {
-      where.fecha_proximo_abono = {};
-      if (fecha_proximo_desde) where.fecha_proximo_abono.gte = parseYMDLima(fecha_proximo_desde);
-      if (fecha_proximo_hasta) where.fecha_proximo_abono.lte = parseYMDFinDiaLima(fecha_proximo_hasta);
-    }
 
     const filtroServicio = {};
     if (id_tipo_servicio) filtroServicio.id_tipo_servicio = Number(id_tipo_servicio);
+    // Rango por FECHA DE APROBACIÓN de la cotización que originó el cobro
+    // (servicio → cotización → versión Aprobada), con el mismo criterio que el
+    // listado de Cotizaciones. Los cobros sin cotización — planes de
+    // mantenimiento, servicios directos, atenciones rápidas — no tienen esa
+    // fecha y quedan fuera mientras el rango esté puesto.
+    const aprobadaEnRango = whereAprobadaEnRango({ desde: aprobacion_desde, hasta: aprobacion_hasta });
+    if (aprobadaEnRango) filtroServicio.cotizacion = { is: aprobadaEnRango };
     if (Object.keys(filtroServicio).length > 0) where.servicio = filtroServicio;
     // Alcance por tipo de edificio (Administrador): el cobro cuelga de un servicio
     // o de un plan de mantenimiento; se muestra si llega a un tipo permitido.
@@ -368,7 +375,7 @@ const obtener = async (req, res) => {
         pagos: { where: { estado: 1 }, include: { archivo: true, cuenta_bancaria: true }, orderBy: { id: 'desc' } },
         cuotas: { where: { estado: 1 }, orderBy: { numero_cuota: 'asc' }, include: { facturas: { where: { estado: 1 } } } },
         recordatorios: { orderBy: { id: 'desc' } },
-        facturas: { include: { archivo: true, cuota: true } }
+        facturas: { include: { archivo: true, documentos: INCLUDE_DOCUMENTOS, cuota: true } }
       }
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
@@ -621,6 +628,10 @@ const actualizarPlanCuotas = async (req, res) => {
         : [])
     ]);
     sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
+    // El saldo pudo cambiar sin pasar por un abono: realinear el estado del
+    // servicio y el estado global de su cotización.
+    resincronizarServicioConCobro(cobro.id_servicio, req.user.id, 'Plan de cuotas actualizado')
+      .catch(err => console.error('Sync servicio/estado_global tras plan de cuotas:', err));
 
     res.json({ ok: true });
   } catch (err) {
@@ -921,6 +932,9 @@ const marcarIncobrable = async (req, res) => {
       accion: 'STATUS_CHANGE', valor_nuevo: { estado: 'Incobrable', motivo }, ip: req.ip
     });
     sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
+    // Un saldo dado por perdido ya no queda "por cobrar": la cotización termina.
+    resincronizarServicioConCobro(cobro.id_servicio, req.user.id, 'Cobro marcado incobrable')
+      .catch(err => console.error('Sync servicio/estado_global tras incobrable:', err));
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -935,7 +949,8 @@ const marcarIncobrable = async (req, res) => {
 const cuotasCalendario = async (req, res) => {
   try {
     const { desde, hasta } = req.query;
-    const where = { estado: 1 };
+    // Las cuotas de importe 0 no tienen nada que cobrar: no ocupan el calendario.
+    const where = { estado: 1, ...whereCuotaConMonto() };
     if (desde || hasta) {
       where.fecha_vencimiento = {};
       if (desde) where.fecha_vencimiento.gte = new Date(desde);
@@ -997,7 +1012,7 @@ const cuotasNoFacturadas = async (req, res) => {
     // Una cuota de importe 0 no se factura: son los MESES GRATUITOS de un plan
     // de mantenimiento (se prestan pero no se cobran) y quedan saldados al
     // aprobarse. Listarlos aquí obligaría a emitir comprobantes por S/ 0.
-    const where = { estado: 1, monto: { gt: 0 }, cobro: { is: cobroWhere } };
+    const where = { estado: 1, ...whereCuotaConMonto(), cobro: { is: cobroWhere } };
     if (fecha_desde || fecha_hasta) {
       where.fecha_vencimiento = {};
       if (fecha_desde) where.fecha_vencimiento.gte = parseYMDLima(fecha_desde);
@@ -1150,11 +1165,13 @@ const cuotasNoFacturadas = async (req, res) => {
 /**
  * Devuelve la lista de proyectos (= servicios con cobro activo) para
  * alimentar el combobox de filtros. Solo IDs + datos visibles, sin metricas.
+ * Mismo recorte por importe que el listado: elegir un proyecto que la tabla no
+ * muestra solo la dejaría vacía.
  */
 const listarProyectos = async (_req, res) => {
   try {
     const cobros = await prisma.tbl_cobros.findMany({
-      where: { estado: 1 },
+      where: { estado: 1, ...whereCobroConMonto() },
       orderBy: { id: 'desc' },
       select: {
         servicio: {
@@ -1222,6 +1239,9 @@ const eliminar = async (req, res) => {
       await tx.tbl_pagos.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
+      // Documentos adicionales de las facturas: se purgan junto con su PDF.
+      const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, facturas.map(f => f.id), req.user.id);
+      for (const idArchivo of idsArchivoDocumentos) archivoIds.add(idArchivo);
       if (esCobroDePlan) {
         await tx.tbl_facturas.updateMany({ where: { id_mantenimiento_plan: cobro.id_mantenimiento_plan, estado: 1 }, data: { estado: 0, ...stamp } });
       } else {

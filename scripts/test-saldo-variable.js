@@ -90,7 +90,7 @@ async function main() {
   console.log('\n▶ verificar que la cotización ya no permite editar montos');
   const cotPost = (await req('GET', `/cotizaciones/${cotId}`, token)).data;
   assert(
-    ['Aceptado', 'Ejecución', 'Pendiente', 'Terminado'].includes(cotPost.estado_global),
+    ['Aceptado', 'Ejecución', 'Por cobrar', 'Terminado'].includes(cotPost.estado_global),
     `cotización pasó a un estado de ejecución (actual: ${cotPost.estado_global})`
   );
   assert(cotPost.versiones[0].estado_version === 'Aprobado', 'versión 1 Aprobado');

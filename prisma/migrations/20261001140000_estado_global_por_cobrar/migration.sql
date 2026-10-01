@@ -1,0 +1,11 @@
+-- Estado global de la cotización: 'Pendiente' pasa a llamarse 'Por cobrar'.
+--
+-- Es la etapa en la que el técnico ya terminó y el cobro todavía tiene saldo
+-- (en revisión, a gestión de cobro, en cobro, facturado…). En el listado
+-- convivía con el 'Pendiente' del servicio, que significa "aún sin asignar", y
+-- una obra facturada se leía como si no hubiera empezado.
+--
+-- Solo renombra el valor. Las cotizaciones cuyo estado quedó desalineado con su
+-- servicio o su cobro se recalculan con
+-- scripts/resincronizarEstadoGlobalCotizaciones.js.
+UPDATE "tbl_cotizaciones" SET "estado_global" = 'Por cobrar' WHERE "estado_global" = 'Pendiente';

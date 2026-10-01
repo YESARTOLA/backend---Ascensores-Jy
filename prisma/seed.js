@@ -19,6 +19,8 @@
  *   - tbl_tipos_servicio
  *   - tbl_cuentas_bancarias
  *   - tbl_checklist_plantillas / tbl_checklist_plantilla_items
+ *   - tbl_clasificaciones_cliente (con `migrate deploy` la migración siembra las
+ *     5 históricas; con `db push` queda vacía)
  *
  * Variables de entorno opcionales:
  *   - SEED_ADMIN_EMAIL     (default: superadmin@ascensoresjy.com)

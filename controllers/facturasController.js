@@ -27,6 +27,13 @@ const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBanc
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const {
+  MAX_DOCUMENTOS_FACTURA,
+  SELECT_ARCHIVO,
+  INCLUDE_DOCUMENTOS,
+  vincularDocumentosEnTx,
+  bajaDocumentosDeFacturasEnTx
+} = require('../utils/documentosFactura');
 
 /**
  * Añade a la factura la fecha en que se inició el servicio facturado:
@@ -316,6 +323,7 @@ const listar = async (req, res) => {
             }
           },
           archivo: true,
+          documentos: INCLUDE_DOCUMENTOS,
           cobro: true,
           cuota: true
         }
@@ -354,6 +362,7 @@ const obtener = async (req, res) => {
         },
         mantenimiento_plan: { include: { tipo_servicio: true } },
         archivo: true,
+        documentos: INCLUDE_DOCUMENTOS,
         cobro: true,
         cuota: true
       }
@@ -442,22 +451,28 @@ async function _crearFacturaPlan(req, res, d, tipoComprobante) {
 
   const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
     ? d.estado_factura : ESTADO_FACTURA_EMITIDA;
-  const factura = await prisma.tbl_facturas.create({
-    data: {
-      tipo_comprobante: tipoComprobante,
-      id_servicio: null,
-      id_mantenimiento_plan: idPlan,
-      id_cobro: cobro.id,
-      id_cuota: idCuota,
-      id_cliente: plan.id_cliente,
-      numero_factura: d.numero_factura,
-      fecha_emision: parseYMDLima(d.fecha_emision),
-      monto: d.monto,
-      id_archivo: d.id_archivo || null,
-      estado_factura: estadoFacturaInicial,
-      registrado_por: req.user.id,
-      user_id_registration: req.user.id
-    }
+  // La factura y sus documentos adicionales se registran juntos: si un
+  // documento no es válido, no queda una factura a medias.
+  const factura = await prisma.$transaction(async (tx) => {
+    const creada = await tx.tbl_facturas.create({
+      data: {
+        tipo_comprobante: tipoComprobante,
+        id_servicio: null,
+        id_mantenimiento_plan: idPlan,
+        id_cobro: cobro.id,
+        id_cuota: idCuota,
+        id_cliente: plan.id_cliente,
+        numero_factura: d.numero_factura,
+        fecha_emision: parseYMDLima(d.fecha_emision),
+        monto: d.monto,
+        id_archivo: d.id_archivo || null,
+        estado_factura: estadoFacturaInicial,
+        registrado_por: req.user.id,
+        user_id_registration: req.user.id
+      }
+    });
+    await vincularDocumentosEnTx(tx, creada.id, d.documentos, req.user.id);
+    return creada;
   });
   await registrarAuditoria({
     id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'CREATE', valor_nuevo: factura, ip: req.ip
@@ -581,21 +596,27 @@ const crear = async (req, res) => {
       ? d.estado_factura
       : ESTADO_FACTURA_EMITIDA;
 
-    const factura = await prisma.tbl_facturas.create({
-      data: {
-        tipo_comprobante: tipoComprobante,
-        id_servicio: Number(d.id_servicio),
-        id_cobro: servicio.cobro?.id || null,
-        id_cuota: idCuota,
-        id_cliente: servicio.id_cliente,
-        numero_factura: d.numero_factura,
-        fecha_emision: parseYMDLima(d.fecha_emision),
-        monto: d.monto,
-        id_archivo: d.id_archivo || null,
-        estado_factura: estadoFacturaInicial,
-        registrado_por: req.user.id,
-        user_id_registration: req.user.id
-      }
+    // La factura y sus documentos adicionales se registran juntos: si un
+    // documento no es válido, no queda una factura a medias.
+    const factura = await prisma.$transaction(async (tx) => {
+      const creada = await tx.tbl_facturas.create({
+        data: {
+          tipo_comprobante: tipoComprobante,
+          id_servicio: Number(d.id_servicio),
+          id_cobro: servicio.cobro?.id || null,
+          id_cuota: idCuota,
+          id_cliente: servicio.id_cliente,
+          numero_factura: d.numero_factura,
+          fecha_emision: parseYMDLima(d.fecha_emision),
+          monto: d.monto,
+          id_archivo: d.id_archivo || null,
+          estado_factura: estadoFacturaInicial,
+          registrado_por: req.user.id,
+          user_id_registration: req.user.id
+        }
+      });
+      await vincularDocumentosEnTx(tx, creada.id, d.documentos, req.user.id);
+      return creada;
     });
 
     // Recalcular estado_facturacion agregado vía helper centralizado.
@@ -630,6 +651,7 @@ const crear = async (req, res) => {
 
     res.status(201).json({ data: factura });
   } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al crear factura: ' + err.message });
   }
@@ -703,7 +725,7 @@ const cambiarEstado = async (req, res) => {
 
 /**
  * Soft-delete de una factura (estado = 0). Solo Super Admin. Da de baja el PDF
- * en Wasabi, recalcula el estado_facturacion agregado del servicio (puede
+ * y los documentos adicionales en Wasabi, recalcula el estado_facturacion agregado del servicio (puede
  * volver a "Sin factura") y retransiciona el estado del servicio si ya está en
  * post-ejecución. Se permite borrar incluso facturas "Enviada" (override SA
  * para corregir errores de emisión); queda auditado y es recuperable.
@@ -721,8 +743,15 @@ const eliminar = async (req, res) => {
         where: { id },
         data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
-      const key = await bajaArchivoEnTx(tx, previo.id_archivo, req.user.id);
-      if (key) wasabiKeys.push(key);
+      // El comprobante y los documentos adicionales corren la misma suerte.
+      const idsArchivo = [
+        previo.id_archivo,
+        ...await bajaDocumentosDeFacturasEnTx(tx, [id], req.user.id)
+      ];
+      for (const idArchivo of idsArchivo) {
+        const key = await bajaArchivoEnTx(tx, idArchivo, req.user.id);
+        if (key) wasabiKeys.push(key);
+      }
       await registrarAuditoria({
         id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: id,
         accion: 'DELETE', valor_anterior: previo, ip: req.ip
@@ -757,4 +786,144 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, crear, cambiarEstado, eliminar };
+// ---------------------------------------------------------------------
+// DOCUMENTOS DE LA FACTURA
+//
+// El comprobante (tbl_facturas.id_archivo) más los documentos de soporte que lo
+// acompañan: constancia de detracción, de retención, de pago, XML/CDR… Suelen
+// llegar DESPUÉS de emitir la factura, por eso se gestionan sobre la factura ya
+// registrada. También sobre una anulada: lo que respalda la anulación (la nota
+// de crédito, por ejemplo) es un documento que se archiva con ella.
+// ---------------------------------------------------------------------
+
+/** Factura viva (estado = 1) con su comprobante, o null. */
+async function facturaVigente(id) {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const f = await prisma.tbl_facturas.findUnique({
+    where: { id },
+    select: { id: true, estado: true, id_archivo: true, archivo: { select: SELECT_ARCHIVO } }
+  });
+  return f && f.estado === 1 ? f : null;
+}
+
+/** Respuesta común de los endpoints de documentos: comprobante + adicionales. */
+async function respuestaDocumentos(factura) {
+  const documentos = await prisma.tbl_facturas_archivos.findMany({
+    ...INCLUDE_DOCUMENTOS,
+    where: { ...INCLUDE_DOCUMENTOS.where, id_factura: factura.id }
+  });
+  return {
+    data: { comprobante: factura.archivo || null, documentos },
+    meta: { max: MAX_DOCUMENTOS_FACTURA }
+  };
+}
+
+const listarDocumentos = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    res.json(await respuestaDocumentos(factura));
+  } catch (err) {
+    console.error('[facturas.listarDocumentos]', err);
+    res.status(500).json({ error: 'Error al listar los documentos de la factura' });
+  }
+};
+
+const agregarDocumentos = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    const creados = await prisma.$transaction(tx =>
+      vincularDocumentosEnTx(tx, factura.id, req.body?.documentos, req.user.id));
+    if (creados.length === 0) return res.status(400).json({ error: 'No se recibió ningún documento válido' });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas_archivos', id_entidad: factura.id,
+      accion: 'CREATE',
+      valor_nuevo: {
+        id_factura: factura.id,
+        documentos: creados.map(c => ({ id: c.id, id_archivo: c.id_archivo, tipo_documento: c.tipo_documento }))
+      },
+      ip: req.ip
+    });
+    res.status(201).json(await respuestaDocumentos(factura));
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[facturas.agregarDocumentos]', err);
+    res.status(500).json({ error: 'Error al agregar los documentos' });
+  }
+};
+
+const eliminarDocumento = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    const idDocumento = Number(req.params.idDocumento);
+    const documento = Number.isInteger(idDocumento) && idDocumento > 0
+      ? await prisma.tbl_facturas_archivos.findFirst({ where: { id: idDocumento, id_factura: factura.id, estado: 1 } })
+      : null;
+    if (!documento) return res.status(404).json({ error: 'Documento no encontrado' });
+
+    let key = null;
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_facturas_archivos.update({
+        where: { id: documento.id },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      key = await bajaArchivoEnTx(tx, documento.id_archivo, req.user.id);
+    });
+    // Purga del bucket tras el commit: si falla, el registro ya quedó dado de
+    // baja y el objeto se limpia después — nunca al revés.
+    await purgarObjetosWasabi([key]);
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas_archivos', id_entidad: documento.id,
+      accion: 'DELETE', valor_anterior: documento, ip: req.ip
+    });
+    res.json(await respuestaDocumentos(factura));
+  } catch (err) {
+    console.error('[facturas.eliminarDocumento]', err);
+    res.status(500).json({ error: 'Error al eliminar el documento' });
+  }
+};
+
+/**
+ * Adjunta el comprobante a una factura registrada SIN él. No reemplaza uno ya
+ * adjunto: la factura pudo enviarse al cliente con ese archivo, y pisarlo
+ * borraría lo que se le entregó. Cualquier otro archivo va como documento
+ * adicional.
+ */
+const adjuntarComprobante = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    const idArchivo = Number(req.body?.id_archivo);
+    const archivo = Number.isInteger(idArchivo) && idArchivo > 0
+      ? await prisma.tbl_archivos.findFirst({ where: { id: idArchivo, estado: 1 }, select: { id: true } })
+      : null;
+    if (!archivo) return res.status(400).json({ error: 'Archivo no válido' });
+
+    // Condición en el propio UPDATE: dos adjuntos simultáneos no pueden pisarse.
+    const r = await prisma.tbl_facturas.updateMany({
+      where: { id: factura.id, estado: 1, id_archivo: null },
+      data: { id_archivo: archivo.id, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+    if (r.count === 0) {
+      return res.status(400).json({ error: 'La factura ya tiene su comprobante. Agrega los demás archivos como documentos adicionales.' });
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id,
+      accion: 'UPDATE', valor_anterior: { id_archivo: null }, valor_nuevo: { id_archivo: archivo.id }, ip: req.ip
+    });
+    res.json(await respuestaDocumentos(await facturaVigente(factura.id)));
+  } catch (err) {
+    console.error('[facturas.adjuntarComprobante]', err);
+    res.status(500).json({ error: 'Error al adjuntar el comprobante' });
+  }
+};
+
+module.exports = {
+  listar, obtener, crear, cambiarEstado, eliminar,
+  listarDocumentos, agregarDocumentos, eliminarDocumento, adjuntarComprobante
+};

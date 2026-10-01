@@ -3,12 +3,13 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { puedeVerFinanzasReq, ascensorSinFinanzas, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, ymdLima } = require('../utils/tiempo');
-const { CLASIFICACIONES_CODIGOS, normalizarClasificacion } = require('../utils/catalogosClientes');
+const { resolverClasificacion } = require('../utils/clasificacionesCliente');
 const { bajaAscensorCascadaEnTx } = require('../utils/bajaAscensorCascada');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { MONEDAS_CODIGOS, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { normalizarDatosSitio } = require('../utils/datosSitioAscensor');
 const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
+const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
 const {
   aplicaAlcance,
   aplicaAlcanceEdificio,
@@ -116,7 +117,8 @@ function construirWhereAscensores(query, user) {
   else if (id_cliente) where.edificio = { is: { id_cliente: Number(id_cliente) } };
   if (estado_operativo) where.estado_operativo = estado_operativo;
   if (tipo) where.tipo = tipo;
-  if (clasificacion && CLASIFICACIONES_CODIGOS.includes(clasificacion)) where.clasificacion = clasificacion;
+  // Catálogo gestionable: se filtra por el código tal cual.
+  if (clasificacion) where.clasificacion = String(clasificacion).slice(0, 20);
 
   // Ámbito del usuario: solo ascensores de clientes dentro del ámbito. Se aplica
   // vía AND para no pisar el filtro por edificio/cliente de arriba.
@@ -281,7 +283,7 @@ const historial = async (req, res) => {
         prisma.tbl_facturas.findMany({
           where: { id_servicio: { in: idsServicios }, estado: 1 },
           orderBy: { id: 'desc' },
-          include: { archivo: true, servicio: { select: { codigo: true } } }
+          include: { archivo: true, documentos: INCLUDE_DOCUMENTOS, servicio: { select: { codigo: true } } }
         }),
         prisma.tbl_servicios_guias.findMany({
           where: { id_servicio: { in: idsServicios }, estado: 1 },
@@ -341,6 +343,8 @@ const crear = async (req, res) => {
     // que se creen sobre este ascensor. Ver utils/datosSitioAscensor.js.
     const sitio = normalizarDatosSitio(data);
     if (sitio.error) return res.status(400).json({ error: sitio.error });
+    const clasif = await resolverClasificacion(prisma, data.clasificacion);
+    if (!clasif.ok) return res.status(400).json({ error: clasif.error });
 
     const ascensor = await prisma.$transaction(async (tx) => {
       const creado = await tx.tbl_ascensores.create({
@@ -354,7 +358,7 @@ const crear = async (req, res) => {
           capacidad: data.capacidad || null,
           pisos: data.pisos ? Number(data.pisos) : null,
           anio_aproximado: data.anio_aproximado ? Number(data.anio_aproximado) : null,
-          clasificacion: normalizarClasificacion(data.clasificacion),
+          clasificacion: clasif.codigo,
           estado_operativo: data.estado_operativo || 'Operativo',
           // 'Inactivo' es baja lógica: nace con estado = 0.
           estado: (data.estado_operativo || 'Operativo') === 'Inactivo' ? 0 : 1,
@@ -424,6 +428,11 @@ const actualizar = async (req, res) => {
     // Datos de sitio: edición parcial (lo que no viene en el payload se conserva).
     const sitio = normalizarDatosSitio(data, previo);
     if (sitio.error) return res.status(400).json({ error: sitio.error });
+    // Solo se valida si cambia: conservar la actual nunca falla.
+    const clasif = Object.prototype.hasOwnProperty.call(data, 'clasificacion')
+      ? await resolverClasificacion(prisma, data.clasificacion, { previo: previo.clasificacion })
+      : { ok: true, codigo: previo.clasificacion };
+    if (!clasif.ok) return res.status(400).json({ error: clasif.error });
 
     const wasabiKeys = [];
     const tecnicoIds = [];
@@ -440,9 +449,7 @@ const actualizar = async (req, res) => {
           capacidad: data.capacidad ?? previo.capacidad,
           pisos: data.pisos !== undefined ? Number(data.pisos) : previo.pisos,
           anio_aproximado: data.anio_aproximado !== undefined ? Number(data.anio_aproximado) : previo.anio_aproximado,
-          clasificacion: Object.prototype.hasOwnProperty.call(data, 'clasificacion')
-            ? normalizarClasificacion(data.clasificacion)
-            : previo.clasificacion,
+          clasificacion: clasif.codigo,
           estado_operativo: estadoOperativoFinal,
           // Si pasa a inactivo, la baja (estado = 0) y la cascada de planes las
           // hace bajaAscensorCascadaEnTx, que necesita ver estado = 1 para actuar;

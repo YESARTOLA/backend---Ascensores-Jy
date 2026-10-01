@@ -46,7 +46,8 @@ const {
   servicioEsHistorial,
   INCLUDE_SERVICIO_DESAFECTACION
 } = require('./bajaAscensorCascada');
-const { bajaArchivoEnTx } = require('./reversionEliminacion');
+const { bajaArchivoEnTx, bajaServicioCascadaEnTx } = require('./reversionEliminacion');
+const { bajaDocumentosDeFacturasEnTx } = require('./documentosFactura');
 const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 
 // Al eliminar un edificio se arrastra también lo ya ejecutado o cobrado.
@@ -66,6 +67,22 @@ async function seleccionarImpactoEdificio(db, idEdificio) {
     where: { id_edificio: idEdificio, estado: 1 },
     select: { id: true, codigo: true }
   });
+  const impacto = await seleccionarImpactoAscensores(db, ascensores);
+  return {
+    ...impacto,
+    ingresos: await contarIngresos(db, impacto.servicios.aBaja, impacto.planes.aBaja)
+  };
+}
+
+/**
+ * Selección para un CONJUNTO de ascensores que se dan de baja juntos: los de un
+ * edificio, o todos los de un cliente (bajaClienteCascada.js). Aplicar la regla
+ * sobre el conjunto completo —y no edificio por edificio— es lo que hace que un
+ * servicio que cubre dos edificios del mismo cliente se vaya entero en vez de
+ * quedar como "compartido" en cada uno. No cuenta ingresos: cada llamador los
+ * cuenta sobre su selección final con `contarIngresos`.
+ */
+async function seleccionarImpactoAscensores(db, ascensores) {
   const idsAsc = ascensores.map(a => a.id);
 
   if (idsAsc.length === 0) {
@@ -75,8 +92,7 @@ async function seleccionarImpactoEdificio(db, idEdificio) {
       servicios: { aBaja: [], recalculados: [], intactos: [] },
       emergencias: { aBaja: [] },
       correctivos: { aBaja: [] },
-      atenciones: { aBaja: [] },
-      ingresos: { cobros: 0, pagos: 0, facturas: 0, montoAbonado: 0 }
+      atenciones: { aBaja: [] }
     };
   }
 
@@ -126,8 +142,7 @@ async function seleccionarImpactoEdificio(db, idEdificio) {
     servicios: { aBaja: serviciosABaja, recalculados: serviciosRecalculados, intactos: serviciosIntactos },
     emergencias: { aBaja: emergencias },
     correctivos: { aBaja: correctivos },
-    atenciones: { aBaja: atenciones },
-    ingresos: await contarIngresos(db, serviciosABaja, planesABaja)
+    atenciones: { aBaja: atenciones }
   };
 }
 
@@ -137,11 +152,13 @@ async function seleccionarImpactoEdificio(db, idEdificio) {
  * pagado por el cliente que desaparecerá de los reportes — el dato que hace que
  * el usuario se lo piense dos veces antes de confirmar.
  */
-async function contarIngresos(db, serviciosABaja, planesABaja) {
+async function contarIngresos(db, serviciosABaja, planesABaja, { idCliente = null } = {}) {
   const idsServicio = serviciosABaja.map(s => s.id);
   const filtroCobro = { estado: 1, OR: [] };
   if (idsServicio.length > 0) filtroCobro.OR.push({ id_servicio: { in: idsServicio } });
   if (planesABaja.length > 0) filtroCobro.OR.push({ id_mantenimiento_plan: { in: planesABaja } });
+  // Baja de un cliente: también sus cobros sueltos (sin servicio ni plan).
+  if (idCliente) filtroCobro.OR.push({ id_cliente: idCliente });
   if (filtroCobro.OR.length === 0) return { cobros: 0, pagos: 0, facturas: 0, montoAbonado: 0 };
 
   const cobros = await db.tbl_cobros.findMany({
@@ -159,7 +176,8 @@ async function contarIngresos(db, serviciosABaja, planesABaja) {
         OR: [
           ...(idsCobro.length > 0 ? [{ id_cobro: { in: idsCobro } }] : []),
           ...(idsServicio.length > 0 ? [{ id_servicio: { in: idsServicio } }] : []),
-          ...(planesABaja.length > 0 ? [{ id_mantenimiento_plan: { in: planesABaja } }] : [])
+          ...(planesABaja.length > 0 ? [{ id_mantenimiento_plan: { in: planesABaja } }] : []),
+          ...(idCliente ? [{ id_cliente: idCliente }] : [])
         ]
       }
     })
@@ -204,20 +222,18 @@ async function calcularImpactoEdificio(db, idEdificio) {
 }
 
 /**
- * Da de baja el cobro de un plan de mantenimiento y todo lo que cuelga de él.
- *
- * Los planes facturan en un cobro único (`tbl_cobros.id_mantenimiento_plan`, con
- * id_servicio nulo), así que la cascada por servicio nunca lo alcanza: sin esto
- * el cobro y sus pagos sobrevivirían a un plan ya eliminado.
+ * Da de baja los cobros y facturas activos que cumplen `filtro` (se aplica igual
+ * a tbl_cobros y a tbl_facturas) y todo lo que cuelga de ellos: cuotas, pagos,
+ * recordatorios de cobro, documentos de factura y archivos.
  */
-async function bajaIngresosDePlanEnTx(tx, idPlan, userId, stamp, wasabiKeys) {
-  const cobro = await tx.tbl_cobros.findFirst({
-    where: { id_mantenimiento_plan: idPlan, estado: 1 },
+async function bajaIngresosEnTx(tx, filtro, userId, stamp, wasabiKeys) {
+  const cobros = await tx.tbl_cobros.findMany({
+    where: { ...filtro, estado: 1 },
     include: { pagos: { where: { estado: 1 } } }
   });
 
   const archivoIds = new Set();
-  if (cobro) {
+  for (const cobro of cobros) {
     for (const p of cobro.pagos) if (p.id_archivo_comprobante) archivoIds.add(p.id_archivo_comprobante);
     await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: cobro.id, estado: 1 }, data: { estado: 0, ...stamp } });
     await tx.tbl_pagos.updateMany({ where: { id_cobro: cobro.id, estado: 1 }, data: { estado: 0, ...stamp } });
@@ -226,18 +242,31 @@ async function bajaIngresosDePlanEnTx(tx, idPlan, userId, stamp, wasabiKeys) {
   }
 
   const facturas = await tx.tbl_facturas.findMany({
-    where: { id_mantenimiento_plan: idPlan, estado: 1 },
+    where: { ...filtro, estado: 1 },
     select: { id: true, id_archivo: true }
   });
   for (const f of facturas) if (f.id_archivo) archivoIds.add(f.id_archivo);
   if (facturas.length > 0) {
-    await tx.tbl_facturas.updateMany({ where: { id_mantenimiento_plan: idPlan, estado: 1 }, data: { estado: 0, ...stamp } });
+    const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, facturas.map(f => f.id), userId);
+    for (const idArchivo of idsArchivoDocumentos) archivoIds.add(idArchivo);
+    await tx.tbl_facturas.updateMany({ where: { ...filtro, estado: 1 }, data: { estado: 0, ...stamp } });
   }
 
   for (const idArchivo of archivoIds) {
     const key = await bajaArchivoEnTx(tx, idArchivo, userId);
     if (key) wasabiKeys.push(key);
   }
+}
+
+/**
+ * Da de baja el cobro de un plan de mantenimiento y todo lo que cuelga de él.
+ *
+ * Los planes facturan en un cobro único (`tbl_cobros.id_mantenimiento_plan`, con
+ * id_servicio nulo), así que la cascada por servicio nunca lo alcanza: sin esto
+ * el cobro y sus pagos sobrevivirían a un plan ya eliminado.
+ */
+async function bajaIngresosDePlanEnTx(tx, idPlan, userId, stamp, wasabiKeys) {
+  await bajaIngresosEnTx(tx, { id_mantenimiento_plan: idPlan }, userId, stamp, wasabiKeys);
 }
 
 // Da de baja los registros operativos junto con sus eventos de calendario y
@@ -276,29 +305,24 @@ async function bajaRegistrosOperativosEnTx(tx, impacto, stamp) {
 }
 
 /**
- * Ejecuta la baja lógica en cascada del edificio dentro de una transacción.
- *
- * Idempotente: si el edificio ya está inactivo no hace nada.
- *
- * @returns {{ wasabiKeys: string[], tecnicoIds: number[], resumen: object|null }}
+ * Ejecuta una selección (de edificio o de cliente) dentro de la transacción:
+ * servicios, registros operativos, ingresos de plan y ascensores, en ese orden.
+ * No toca el edificio ni el cliente: eso lo cierra cada llamador.
  */
-async function bajaEdificioCascadaEnTx(tx, idEdificio, userId, ip) {
-  const wasabiKeys = [];
-  const tecnicoIds = [];
-  const stamp = { user_id_modification: userId, date_time_modification: new Date() };
-
-  const edificio = await tx.tbl_edificios.findUnique({ where: { id: idEdificio } });
-  if (!edificio || edificio.estado === 0) return { wasabiKeys, tecnicoIds, resumen: null };
-
-  const impacto = await seleccionarImpactoEdificio(tx, idEdificio);
+async function bajaImpactoEnTx(tx, impacto, userId, ip, stamp, wasabiKeys, tecnicoIds) {
   const idsAsc = impacto.ascensores.map(a => a.id);
-  const resumen = resumirImpacto(impacto);
 
-  // 1) Servicios, con la regla única compartida con la baja de ascensor. Va
-  //    ANTES de la cascada por ascensor: ésta solo mira filas con estado = 1, así
-  //    que encuentra ya resuelto lo que aquí se dio de baja o se recalculó y no
-  //    lo procesa dos veces.
-  for (const s of [...impacto.servicios.aBaja, ...impacto.servicios.recalculados]) {
+  // 1) Servicios. Va ANTES de la cascada por ascensor: ésta solo mira filas con
+  //    estado = 1, así que encuentra ya resuelto lo que aquí se dio de baja o se
+  //    recalculó y no lo procesa dos veces. Los de `aBaja` se van enteros con su
+  //    cadena de cobro; a los compartidos se les aplica la regla única de la
+  //    baja de ascensor (se les quitan estos ascensores y se recalculan).
+  for (const s of impacto.servicios.aBaja) {
+    const r = await bajaServicioCascadaEnTx(tx, s.id, userId);
+    wasabiKeys.push(...r.wasabiKeys);
+    tecnicoIds.push(...r.tecnicoIds);
+  }
+  for (const s of impacto.servicios.recalculados) {
     await desafectarAscensoresDeServicioEnTx(
       tx, s, idsAsc, userId, stamp, wasabiKeys, tecnicoIds, OPCIONES_DESAFECTACION
     );
@@ -319,6 +343,28 @@ async function bajaEdificioCascadaEnTx(tx, idEdificio, userId, ip) {
     wasabiKeys.push(...r.wasabiKeys);
     tecnicoIds.push(...r.tecnicoIds);
   }
+}
+
+/**
+ * Ejecuta la baja lógica en cascada del edificio dentro de una transacción.
+ *
+ * Idempotente: si el edificio ya está inactivo no hace nada.
+ *
+ * @returns {{ wasabiKeys: string[], tecnicoIds: number[], resumen: object|null }}
+ */
+async function bajaEdificioCascadaEnTx(tx, idEdificio, userId, ip) {
+  const wasabiKeys = [];
+  const tecnicoIds = [];
+  const stamp = { user_id_modification: userId, date_time_modification: new Date() };
+
+  const edificio = await tx.tbl_edificios.findUnique({ where: { id: idEdificio } });
+  if (!edificio || edificio.estado === 0) return { wasabiKeys, tecnicoIds, resumen: null };
+
+  const impacto = await seleccionarImpactoEdificio(tx, idEdificio);
+  const resumen = resumirImpacto(impacto);
+
+  // 1-4) Servicios, registros operativos, ingresos de plan y ascensores.
+  await bajaImpactoEnTx(tx, impacto, userId, ip, stamp, wasabiKeys, tecnicoIds);
 
   // 5) El edificio en sí.
   await tx.tbl_edificios.update({ where: { id: idEdificio }, data: { estado: 0, ...stamp } });
@@ -329,5 +375,11 @@ async function bajaEdificioCascadaEnTx(tx, idEdificio, userId, ip) {
 module.exports = {
   bajaEdificioCascadaEnTx,
   calcularImpactoEdificio,
-  seleccionarImpactoEdificio
+  seleccionarImpactoEdificio,
+  // Piezas que reutiliza la baja de un cliente completo (bajaClienteCascada.js).
+  seleccionarImpactoAscensores,
+  contarIngresos,
+  resumirImpacto,
+  bajaImpactoEnTx,
+  bajaIngresosEnTx
 };

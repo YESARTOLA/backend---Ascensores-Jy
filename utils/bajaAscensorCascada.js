@@ -215,6 +215,7 @@ async function bajaAscensorCascadaEnTx(tx, idAscensor, userId, ip) {
 module.exports = {
   bajaAscensorCascadaEnTx,
   desafectarAscensoresDeServicioEnTx,
+  eliminarPlanSinAscensores,
   servicioEsHistorial,
   INCLUDE_SERVICIO_DESAFECTACION
 };

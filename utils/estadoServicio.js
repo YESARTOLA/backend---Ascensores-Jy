@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const { sincronizarRecordatorioServicio } = require('./recordatoriosAuto');
+const { esFacturado } = require('./estadoFactura');
 // Tramos de ejecución en campo (arranque y cierre del trabajo del técnico). Se
 // reutilizan aquí para derivar el estado de la emergencia sin repetir la lista.
 const {
@@ -184,7 +185,7 @@ function esAtencionRapidaConvertida(estado) {
  * Cambia estado_servicio dejando rastro en historial.
  *
  * Si el servicio nació de una cotización, también sincroniza el estado_global
- * de la cotización (Cotizado/Aceptado/Ejecución/Pendiente/Terminado). El
+ * de la cotización (Cotizado/Aceptado/Ejecución/Por cobrar/Terminado). El
  * require es lazy para evitar ciclos con cotizacionesController.
  */
 async function cambiarEstadoServicio(id_servicio, nuevoEstado, idUsuario, observaciones = null) {
@@ -320,10 +321,83 @@ function estadoServicioDesdeCobro({ estado_cobro, total_abonado, saldo_pendiente
   return 'A gestión de cobro';
 }
 
+/**
+ * Estados del circuito de cobro: el servicio ya pasó la revisión administrativa
+ * y su estado lo dicta el cobro (estadoServicioDesdeCobro). 'Cerrado' queda
+ * fuera: es terminal.
+ */
+const ESTADOS_SERVICIO_EN_COBRO = [
+  'A gestión de cobro',
+  'En cobro',
+  'Cobrado parcial',
+  'Cobrado total',
+  'Facturado'
+];
+
+/**
+ * Estado que dicta el cobro de un servicio SI ese cobro ya tuvo movimiento
+ * (algún abono o la facturación completa); null si no lo tuvo.
+ *
+ * Un servicio de cotización es cobrable desde que se aprueba, así que el
+ * adelanto puede estar pagado y facturado antes de que el técnico termine. Al
+ * aprobarse la revisión el servicio iba siempre a 'A gestión de cobro' y, como
+ * ya no llegaba ningún abono que lo moviera, se quedaba ahí para siempre. Sin
+ * movimiento, en cambio, quien llama decide (normalmente 'A gestión de cobro').
+ */
+function estadoServicioPorMovimientoDeCobro({ cobro, estadoFacturacion }) {
+  if (!cobro || cobro.estado === 0) return null;
+  const facturado = esFacturado(estadoFacturacion);
+  const abonado = Math.round(Number(cobro.total_abonado || 0) * 100) > 0;
+  if (!abonado && !facturado) return null;
+  return estadoServicioDesdeCobro({
+    estado_cobro: cobro.estado_cobro,
+    total_abonado: cobro.total_abonado,
+    saldo_pendiente: cobro.saldo_pendiente,
+    facturado
+  });
+}
+
+/**
+ * Realinea un servicio que ya está en cobro con su cobro, cuando el saldo cambió
+ * sin pasar por un abono ni una factura (p.ej. se reestructuró el plan de cuotas
+ * o se ajustó el monto variable), y recalcula el estado_global de su
+ * cotización, que depende del saldo. No toca servicios que aún no llegaron a
+ * cobros: esos los mueve su flujo operativo.
+ */
+async function resincronizarServicioConCobro(idServicio, idUsuario, observaciones = null) {
+  if (!idServicio) return;
+  const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+    where: { id: idServicio },
+    select: {
+      estado_servicio: true,
+      id_cotizacion: true,
+      cobro: { select: { estado: true, estado_cobro: true, total_abonado: true, saldo_pendiente: true } },
+      servicio_realizado: { select: { estado_facturacion: true } }
+    }
+  });
+  if (!servicio) return;
+  if (ESTADOS_SERVICIO_EN_COBRO.includes(servicio.estado_servicio)) {
+    const destino = estadoServicioPorMovimientoDeCobro({
+      cobro: servicio.cobro,
+      estadoFacturacion: servicio.servicio_realizado?.estado_facturacion
+    });
+    if (destino && destino !== servicio.estado_servicio) {
+      await cambiarEstadoServicio(idServicio, destino, idUsuario, observaciones);
+    }
+  }
+  if (servicio.id_cotizacion) {
+    const { sincronizarEstadoGlobal } = require('../controllers/cotizacionesController');
+    await sincronizarEstadoGlobal(servicio.id_cotizacion);
+  }
+}
+
 module.exports = {
   cambiarEstadoServicio,
   cambiarEstadoServicioSiEstaEn,
   estadoServicioDesdeCobro,
+  estadoServicioPorMovimientoDeCobro,
+  resincronizarServicioConCobro,
+  ESTADOS_SERVICIO_EN_COBRO,
   estaServicioFinalizado,
   estaServicioRealizado,
   esServicioEditable,

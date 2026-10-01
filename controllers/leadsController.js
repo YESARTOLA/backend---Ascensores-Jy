@@ -126,12 +126,13 @@ async function cargarLeadPermitido(req, id, include = undefined) {
 
 // Valida y normaliza los campos comerciales del lead (ubicación por ubigeo,
 // tipo de ascensor, correo, empresa del prospecto y nombre del proyecto).
-// El lead es el punto de captura: solo exige contacto (nombre, teléfono,
-// correo) y tipo de ascensor. La ubicación y el resto de datos comerciales son
-// opcionales aquí y se piden como obligatorios recién al convertirlo a cliente
-// (wizard cliente → edificio → ascensor → servicio).
-// Con `requeridos: true` (alta) exige tipo de ascensor y correo; en la
-// actualización solo valida lo que viene en el payload (update parcial).
+// El lead es el punto de captura: solo exige nombre del contacto y teléfono
+// (se validan en `crear`). Todos los campos de aquí son opcionales: si llegan
+// se validan (formato del correo, catálogos) y si llegan vacíos se guardan en
+// null. Los datos comerciales se piden como obligatorios recién al convertirlo
+// a cliente (wizard cliente → edificio → ascensor → servicio).
+// Con `requeridos: true` (alta) se normalizan todos los campos; en la
+// actualización solo lo que viene en el payload (update parcial).
 async function resolverCamposComerciales(d, { requeridos }) {
   const data = {};
 
@@ -146,21 +147,24 @@ async function resolverCamposComerciales(d, { requeridos }) {
     data.codigo_ubigeo = codigo || null;
   }
 
+  // Tipo de ascensor opcional: al convertir, el ascensor nuevo lo toma como
+  // valor sugerido si el lead lo trae.
   if (requeridos || d.id_tipo_ascensor !== undefined) {
-    const idTipo = Number(d.id_tipo_ascensor);
-    if (!idTipo) return { error: 'El tipo de ascensor es obligatorio' };
-    const tipo = await prisma.tbl_tipos_ascensor.findFirst({ where: { id: idTipo, estado: 1 } });
-    if (!tipo) return { error: 'El tipo de ascensor seleccionado no es válido' };
+    const idTipo = Number(d.id_tipo_ascensor) || null;
+    if (idTipo) {
+      const tipo = await prisma.tbl_tipos_ascensor.findFirst({ where: { id: idTipo, estado: 1 } });
+      if (!tipo) return { error: 'El tipo de ascensor seleccionado no es válido' };
+    }
     data.id_tipo_ascensor = idTipo;
   }
 
+  // Correo opcional, pero si se escribe debe tener un formato válido.
   if (requeridos || d.correo !== undefined) {
     const correo = String(d.correo || '').trim();
-    if (!correo) return { error: 'El correo es obligatorio' };
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    if (correo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
       return { error: 'El correo no tiene un formato válido' };
     }
-    data.correo = correo;
+    data.correo = correo || null;
   }
 
   // La empresa (razón social + documento) solo aplica a prospectos: si el lead

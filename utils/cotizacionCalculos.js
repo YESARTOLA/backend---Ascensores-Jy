@@ -3,9 +3,19 @@
  *
  * Reglas:
  *   importe_linea = cantidad * precio_unitario * (1 - descuento_porcentaje/100)
- *   subtotal      = Σ importes
- *   igv           = subtotal * igv_tasa   (0 si la cotización es sin IGV)
- *   total         = subtotal + igv
+ *
+ *   Más IGV (por defecto): los precios registrados NO incluyen IGV.
+ *     subtotal = Σ importes
+ *     igv      = subtotal * igv_tasa
+ *     total    = subtotal + igv
+ *
+ *   IGV incluido: los precios registrados YA son finales; el IGV se desglosa
+ *   sin aumentar el precio (118 → 100 + 18).
+ *     total    = Σ importes
+ *     subtotal = total / (1 + igv_tasa)
+ *     igv      = total - subtotal          (así subtotal + igv = total exacto)
+ *
+ *   Sin IGV: tasa 0 → subtotal = total = Σ importes, igv = 0.
  *
  * Todos los cálculos usan Number (suficiente para montos < 10^9 con 2 decimales).
  * Se redondea a 2 decimales en cada paso para que coincida con lo que ve el cliente.
@@ -23,15 +33,18 @@ function calcularImporteLinea(item) {
   return round2(importe);
 }
 
-function calcularTotalesVersion(items, igvTasa, sinIgv = false) {
+function calcularTotalesVersion(items, igvTasa, sinIgv = false, igvIncluido = false) {
   // Sin IGV: la tasa efectiva es 0 (no se afecta el subtotal).
   const tasa = sinIgv ? 0 : (Number(igvTasa) || 0);
-  let subtotal = 0;
-  for (const it of items) subtotal += calcularImporteLinea(it);
-  subtotal = round2(subtotal);
-  const igv = round2(subtotal * tasa);
-  const monto_total = round2(subtotal + igv);
-  return { subtotal, igv, igv_tasa: tasa, monto_total };
+  let suma = 0;
+  for (const it of items) suma += calcularImporteLinea(it);
+  suma = round2(suma);
+  if (igvIncluido && tasa > 0) {
+    const subtotal = round2(suma / (1 + tasa));
+    return { subtotal, igv: round2(suma - subtotal), igv_tasa: tasa, monto_total: suma };
+  }
+  const igv = round2(suma * tasa);
+  return { subtotal: suma, igv, igv_tasa: tasa, monto_total: round2(suma + igv) };
 }
 
 /**

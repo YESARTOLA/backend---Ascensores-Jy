@@ -5,14 +5,19 @@ const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const {
-  CLASIFICACIONES, CLASIFICACIONES_CODIGOS, normalizarClasificacion,
-  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, AREA_AMBAS
+  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, AREA_AMBAS, areasPorContrato
 } = require('../utils/catalogosClientes');
+const { resolverClasificacion } = require('../utils/clasificacionesCliente');
 const {
   tiposRegistroPermitidos,
   puedeVerTipoRegistro,
   clienteAlcanceWhere,
 } = require('../utils/alcanceUsuario');
+const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
+const { bajaClienteCascadaEnTx, calcularImpactoCliente } = require('../utils/bajaClienteCascada');
+const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { whereEstadoDesdeFiltro } = require('../utils/filtroEstadoRegistro');
+const { veTodoPorEdificio } = require('../utils/visibilidadEdificio');
 
 const parseFechaContrato = (valor) => {
   if (valor === undefined || valor === null || valor === '') return null;
@@ -180,7 +185,9 @@ const matchEdificioBusqueda = (q) => ({
  */
 async function construirWhereClientes(query, user) {
   const { q, distrito, tipo_ascensor, clasificacion, estado, estado_contrato, con_contrato, area_contrato } = query;
-  const where = { estado: 1 };
+  // Los clientes eliminados (baja lógica) solo los ve el Super Admin, con el
+  // mismo filtro de estado que el listado de edificios. El resto, solo activos.
+  const where = whereEstadoDesdeFiltro(veTodoPorEdificio(user) ? estado : undefined);
   if (q) {
     where.OR = [
       { nombre: { contains: q, mode: 'insensitive' } },
@@ -196,10 +203,11 @@ async function construirWhereClientes(query, user) {
   if (Object.keys(edificioFilter).length > 0) {
     where.edificios = { some: { estado: 1, ...edificioFilter } };
   }
-  if (clasificacion && CLASIFICACIONES_CODIGOS.includes(clasificacion)) {
-    where.clasificacion = clasificacion;
+  // El catálogo es gestionable (tbl_clasificaciones_cliente): se filtra por el
+  // código tal cual; uno inexistente simplemente no coincide con nadie.
+  if (clasificacion) {
+    where.clasificacion = String(clasificacion).slice(0, 20);
   }
-  if (estado === '0' || estado === '1') where.estado = Number(estado);
 
   // Estado de contrato POR ÁREA: se evalúa sobre las áreas que el usuario puede
   // ver (según su ámbito). Si ve ambas, un cliente coincide si CUALQUIERA cumple.
@@ -242,13 +250,6 @@ async function construirWhereClientes(query, user) {
 
   return where;
 }
-
-/**
- * Catálogo de clasificaciones de cliente (Grande / Pequeño / Marca JY).
- */
-const listarClasificaciones = (_req, res) => {
-  res.json({ data: CLASIFICACIONES });
-};
 
 /**
  * Busca un cliente ACTIVO por su número de documento (RUC/DNI). Lo usa el
@@ -470,7 +471,7 @@ const vista360 = async (req, res) => {
         cobros: { where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' } },
         facturas: {
           where: { estado: 1, ...filtroServicioRel }, orderBy: { id: 'desc' }, take: 50,
-          include: { archivo: true, servicio: { select: { codigo: true } } }
+          include: { archivo: true, documentos: INCLUDE_DOCUMENTOS, servicio: { select: { codigo: true } } }
         },
         cotizaciones: {
           where: { estado: 1, ...(tipos ? { tipo_servicio: filtroCategoria } : {}) }, orderBy: { id: 'desc' }, take: 50,
@@ -604,6 +605,12 @@ const crear = async (req, res) => {
     }
     const contratos = resolverContratosPorArea(data, {}, req.user);
     if (!contratos.ok) return res.status(400).json({ error: contratos.error });
+    // La clasificación debe aplicar al área (o áreas) con que se registra el
+    // cliente: hay clasificaciones solo de Servicios y otras solo de Proyectos.
+    const clasif = await resolverClasificacion(prisma, data.clasificacion, {
+      areasCliente: areasPorContrato(contratos.valores)
+    });
+    if (!clasif.ok) return res.status(400).json({ error: clasif.error });
     if (data.numero_documento) {
       const duplicado = await prisma.tbl_clientes.findFirst({
         where: {
@@ -629,7 +636,7 @@ const crear = async (req, res) => {
           ...contactos,
           observaciones: data.observaciones || null,
           ...contratos.valores,
-          clasificacion: normalizarClasificacion(data.clasificacion),
+          clasificacion: clasif.codigo,
           user_id_registration: req.user.id
         }
       });
@@ -682,6 +689,16 @@ const actualizar = async (req, res) => {
     const contratos = resolverContratosPorArea(data, previo, req.user);
     if (!contratos.ok) return res.status(400).json({ error: contratos.error });
 
+    // Solo se valida si cambia: conservar la clasificación actual nunca falla,
+    // aunque hoy esté desactivada.
+    const clasif = Object.prototype.hasOwnProperty.call(data, 'clasificacion')
+      ? await resolverClasificacion(prisma, data.clasificacion, {
+        previo: previo.clasificacion,
+        areasCliente: areasPorContrato(contratos.valores)
+      })
+      : { ok: true, codigo: previo.clasificacion };
+    if (!clasif.ok) return res.status(400).json({ error: clasif.error });
+
     const dataContactos = {};
     for (const k of CAMPOS_CONTACTOS) {
       if (Object.prototype.hasOwnProperty.call(data, k)) dataContactos[k] = trimOrNull(data[k]);
@@ -699,9 +716,7 @@ const actualizar = async (req, res) => {
           ...dataContactos,
           observaciones: data.observaciones ?? previo.observaciones,
           ...contratos.valores,
-          clasificacion: Object.prototype.hasOwnProperty.call(data, 'clasificacion')
-            ? normalizarClasificacion(data.clasificacion)
-            : previo.clasificacion,
+          clasificacion: clasif.codigo,
           user_id_modification: req.user.id,
           date_time_modification: new Date()
         }
@@ -827,24 +842,73 @@ const registrarContrato = async (req, res) => {
 const cambiarEstado = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { estado } = req.body;
+    const estado = Number(req.body.estado);
+    // Baja/alta lógica: el registro nunca se borra, solo alterna `estado`.
+    if (estado !== 0 && estado !== 1) {
+      return res.status(400).json({ error: 'Estado inválido: use 0 (eliminar) o 1 (reactivar)' });
+    }
     const enAmbito = await prisma.tbl_clientes.findFirst({
       where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true }
     });
     if (!enAmbito) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    // Eliminar arrastra en cascada edificios, ascensores, planes, servicios,
+    // registros operativos, cobros, facturas y cotizaciones del cliente. La
+    // regla completa vive en utils/bajaClienteCascada.js. Todo en una transacción.
+    if (estado === 0) {
+      const { wasabiKeys, tecnicoIds, resumen, edificios } = await prisma.$transaction(
+        tx => bajaClienteCascadaEnTx(tx, id, req.user.id, req.ip),
+        { timeout: 120000 }
+      );
+      await registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_clientes', id_entidad: id,
+        accion: 'DELETE', valor_nuevo: { estado, impacto: resumen }, ip: req.ip
+      });
+      await Promise.all(edificios.map(idEdificio => registrarAuditoria({
+        id_usuario: req.user.id, entidad: 'tbl_edificios', id_entidad: idEdificio,
+        accion: 'DELETE', valor_nuevo: { estado, motivo: `Eliminación del cliente #${id}` }, ip: req.ip
+      })));
+      await purgarObjetosWasabi(wasabiKeys);
+      await liberarTecnicos(tecnicoIds, -1);
+      const cliente = await prisma.tbl_clientes.findUnique({ where: { id } });
+      return res.json({ data: cliente, impacto: resumen });
+    }
+
+    // Reactivar solo reabre el cliente: sus edificios, ascensores, servicios y
+    // cotizaciones dados de baja no se resucitan automáticamente (misma regla
+    // que al reactivar un edificio), porque no hay garantía de su estado real.
     const cliente = await prisma.tbl_clientes.update({
       where: { id },
-      data: { estado: Number(estado), user_id_modification: req.user.id, date_time_modification: new Date() }
+      data: { estado, user_id_modification: req.user.id, date_time_modification: new Date() }
     });
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_clientes', id_entidad: id,
-      accion: 'STATUS_CHANGE', valor_nuevo: { estado: Number(estado) }, ip: req.ip
+      accion: 'STATUS_CHANGE', valor_nuevo: { estado }, ip: req.ip
     });
     res.json({ data: cliente });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error al cambiar estado' });
+    console.error('[clientes.cambiarEstado]', err);
+    res.status(500).json({ error: 'Error al cambiar el estado del cliente' });
   }
 };
 
-module.exports = { listar, listarTiposAscensor, listarClasificaciones, buscarPorDocumento, exportar, obtener, vista360, crear, actualizar, registrarContrato, cambiarEstado };
+// Vista previa del impacto de eliminar un cliente: alimenta el modal de doble
+// confirmación para que el usuario vea exactamente qué se da de baja ANTES de
+// escribir la palabra clave. Solo lee, no muta nada, y usa la misma selección
+// que ejecuta la cascada.
+const impactoEliminacion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const cliente = await prisma.tbl_clientes.findFirst({
+      where: { id, ...clienteAlcanceWhere(req.user) }, select: { id: true, nombre: true, estado: true }
+    });
+    if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
+    const impacto = await calcularImpactoCliente(prisma, id);
+    res.json({ data: { cliente, ...impacto } });
+  } catch (err) {
+    console.error('[clientes.impactoEliminacion]', err);
+    res.status(500).json({ error: 'Error al calcular el impacto de la eliminación' });
+  }
+};
+
+module.exports = { listar, listarTiposAscensor, buscarPorDocumento, exportar, obtener, vista360, crear, actualizar, registrarContrato, cambiarEstado, impactoEliminacion };

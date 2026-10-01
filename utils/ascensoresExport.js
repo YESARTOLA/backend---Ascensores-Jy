@@ -12,14 +12,16 @@ const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
 const { ymdLima } = require('./tiempo');
-const { CLASIFICACIONES } = require('./catalogosClientes');
+const prisma = require('../config/prisma');
+const { mapaEtiquetasClasificacion } = require('./clasificacionesCliente');
 const { etiquetaMoneda } = require('./catalogosBancarios');
 
 // Máscara del año: sin separador de miles (2026, no "2,026").
 const FMT_ANIO = '0';
 const FMT_ENTERO = '#,##0';
 
-const CLASIFICACION_MAP = Object.fromEntries(CLASIFICACIONES.map(c => [c.codigo, c.etiqueta]));
+// Las etiquetas de clasificación salen del catálogo gestionable
+// (tbl_clasificaciones_cliente): se cargan una vez por exportación.
 
 const PALETA = {
   acento: '#e8853a',
@@ -57,7 +59,7 @@ const COLUMNAS = [
   { header: 'Registrado',          key: 'registrado',            width: 12 }
 ];
 
-function mapearFila(a) {
+function mapearFila(a, etiquetas = {}) {
   const precios = Array.isArray(a.precios) ? a.precios : [];
   return {
     codigo: a.codigo || '',
@@ -65,7 +67,7 @@ function mapearFila(a) {
     cliente: a.edificio?.cliente?.nombre || '',
     distrito: a.edificio?.distrito || '',
     tipo: a.tipo || '',
-    clasificacion: a.clasificacion ? (CLASIFICACION_MAP[a.clasificacion] || a.clasificacion) : '',
+    clasificacion: a.clasificacion ? (etiquetas[a.clasificacion] || a.clasificacion) : '',
     marca: a.marca || '',
     modelo: a.modelo || '',
     capacidad: a.capacidad || '',
@@ -91,6 +93,7 @@ function mapearFila(a) {
 async function generarExcelAscensores(ascensores) {
   const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
   const hoy = ymdLima();
+  const etiquetas = await mapaEtiquetasClasificacion(prisma);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = empresa.EMPRESA_RAZON_SOCIAL || 'ERP';
@@ -130,7 +133,7 @@ async function generarExcelAscensores(ascensores) {
 
   // Filas
   ascensores.forEach((a, idx) => {
-    const fila = ws.addRow(mapearFila(a));
+    const fila = ws.addRow(mapearFila(a, etiquetas));
     fila.alignment = { vertical: 'middle', wrapText: true };
     fila.font = { size: 10 };
     if (idx % 2 === 1) {
@@ -154,6 +157,7 @@ async function generarPdfAscensores(ascensores) {
     'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION', 'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
   ]);
   const hoy = ymdLima();
+  const etiquetas = await mapaEtiquetasClasificacion(prisma);
 
   const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
   const chunks = [];
@@ -213,7 +217,7 @@ async function generarPdfAscensores(ascensores) {
   doc.font('Helvetica').fontSize(8).fillColor(PALETA.texto);
   let alterna = false;
   for (const ascensor of ascensores) {
-    const fila = mapearFila(ascensor);
+    const fila = mapearFila(ascensor, etiquetas);
     // calcular altura por el texto más largo de la fila
     const alturas = cols.map(c => doc.heightOfString(String(fila[c.key] ?? ''), { width: c.w - 8 }));
     const altura = Math.max(14, Math.max(...alturas) + 6);

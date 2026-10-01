@@ -73,7 +73,13 @@ function mapearFila(cot) {
   };
 }
 
-async function generarExcelCotizaciones(cotizaciones) {
+/**
+ * @param {Array} cotizaciones - filas ya filtradas (mismo where que el listado)
+ * @param {object} [opts]
+ * @param {string[]} [opts.filtros] - filtros activos en palabras; van en la
+ *   fila 3 para que el archivo diga qué recorte del listado contiene.
+ */
+async function generarExcelCotizaciones(cotizaciones, { filtros = [] } = {}) {
   const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
   const hoy = ymdLima();
 
@@ -94,6 +100,12 @@ async function generarExcelCotizaciones(cotizaciones) {
   const subtitulo = [`RUC: ${empresa.EMPRESA_RUC || '—'}`, `Exportado: ${hoy}`, `${cotizaciones.length} cotización(es)`].join('   •   ');
   ws.getCell('A2').value = subtitulo;
   ws.getCell('A2').font = { size: 9, color: { argb: 'FF6B7280' } };
+
+  ws.mergeCells('A3', String.fromCharCode(64 + COLUMNAS.length) + '3');
+  ws.getCell('A3').value = filtros.length
+    ? `Filtros: ${filtros.join('   •   ')}`
+    : 'Filtros: ninguno (todas las cotizaciones vigentes)';
+  ws.getCell('A3').font = { size: 9, italic: true, color: { argb: 'FF6B7280' } };
 
   // Encabezados de tabla en fila 4
   ws.columns = COLUMNAS.map(c => ({ key: c.key, width: c.width, style: c.numFmt ? { numFmt: c.numFmt } : undefined }));

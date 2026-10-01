@@ -21,6 +21,7 @@ const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPla
 const { estaServicioRealizado, esServicioEditable, ESTADO_SERVICIO_CANCELADO } = require('../utils/estadoServicio');
 const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
 const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
+const { bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
 const { sincronizarDiasYEventos } = require('../utils/diasServicio');
 const { normalizarProgramacion } = require('../utils/programacionDias');
 
@@ -1812,8 +1813,9 @@ const eliminar = async (req, res) => {
       // se desvinculan (fila de archivo a estado 0) pero NO se purgan del bucket.
       if (cobroPlan) {
         const facturasPlan = await tx.tbl_facturas.findMany({ where: { id_mantenimiento_plan: id, estado: 1 } });
-        for (const f of facturasPlan) {
-          await bajaArchivoEnTx(tx, f.id_archivo, req.user.id);
+        const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, facturasPlan.map(f => f.id), req.user.id);
+        for (const idArchivo of [...facturasPlan.map(f => f.id_archivo), ...idsArchivoDocumentos]) {
+          await bajaArchivoEnTx(tx, idArchivo, req.user.id);
         }
         await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });
         await tx.tbl_pagos.updateMany({ where: { id_cobro: cobroPlan.id, estado: 1 }, data: { estado: 0, ...stamp } });

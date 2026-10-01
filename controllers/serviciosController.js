@@ -12,6 +12,7 @@ const {
   esServicioEditable,
   esServicioPostRevision,
   estaServicioFinalizado,
+  estadoServicioPorMovimientoDeCobro,
   ESTADO_SERVICIO_PENDIENTE,
   ESTADO_SERVICIO_ASIGNADO,
   ESTADO_SERVICIO_EN_CURSO,
@@ -37,6 +38,8 @@ const {
   esFacturado
 } = require('../utils/estadoFactura');
 const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
+const { whereRealizadoConMonto } = require('../utils/montoACobrar');
+const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const {
@@ -735,7 +738,8 @@ const promoverBorrador = async (req, res) => {
  *
  * Resultado posible (body.resultado): 'aprobado' | 'observado' | 'rechazado'.
  *  - APROBADO  → estado_administrativo = 'Revisado'; HABILITA gestión contable
- *                (transición a 'A gestión de cobro' / 'Cobrado total'). Es la
+ *                (transición a 'A gestión de cobro' / 'Cobrado total', o al
+ *                estado que ya dicte su cobro si tuvo abonos o factura). Es la
  *                única vía por la que un servicio operativo llega a Contabilidad.
  *  - OBSERVADO → estado_administrativo = 'Observado'; devuelve el servicio a
  *                'En curso' para que el técnico corrija y vuelva a finalizar.
@@ -799,8 +803,15 @@ const revisarServicio = async (req, res) => {
       where: { id_servicio: id },
       data: { estado_administrativo: ESTADO_ADMIN_REVISADO, ...trazaRevision }
     });
+    // Con importe entra a cobros, salvo que su cobro ya se haya movido antes de
+    // la revisión (adelanto abonado o facturado): entonces hereda ese estado.
     const monto = Number(servicio.cobro?.monto_total || servicio.precio_interno || 0);
-    const destino = (monto > 0 && servicio.sin_cobro !== 1) ? 'A gestión de cobro' : 'Cobrado total';
+    const destino = (monto > 0 && servicio.sin_cobro !== 1)
+      ? (estadoServicioPorMovimientoDeCobro({
+          cobro: servicio.cobro,
+          estadoFacturacion: servicio.servicio_realizado?.estado_facturacion
+        }) || 'A gestión de cobro')
+      : 'Cobrado total';
     await cambiarEstadoServicio(id, destino, req.user.id, observaciones || 'Revisión administrativa aprobada');
 
     await registrarAuditoria({
@@ -1641,9 +1652,19 @@ async function resumenFacturacion(where) {
   return { por_facturar: aSalida(grupos.por_facturar), facturado: aSalida(grupos.facturado) };
 }
 
+// Mantenimiento con fecha programada: servicio de un plan o de un subtipo del
+// módulo de mantenimiento (mismo criterio que el filtro "Preventivo"). Para
+// Contabilidad su "fecha de servicio" es la PROGRAMADA, no la de ejecución.
+const WHERE_MANTENIMIENTO_PROGRAMADO = {
+  AND: [
+    { OR: [{ id_mantenimiento_plan: { not: null } }, { tipo_servicio: { modulo_asociado: 'mantenimiento' } }] },
+    { fecha_programada: { not: null } }
+  ]
+};
+
 const realizados = async (req, res) => {
   try {
-    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda } = req.query;
+    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda, rango_fecha, aprobacion_desde, aprobacion_hasta } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1654,9 +1675,26 @@ const realizados = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (estado_facturacion) where.estado_facturacion = estado_facturacion;
     if (desde || hasta) {
-      where.fecha_realizacion = {};
-      if (desde) where.fecha_realizacion.gte = parseYMDLima(desde);
-      if (hasta) where.fecha_realizacion.lte = parseYMDFinDiaLima(hasta);
+      const rangoRealizacion = {};
+      if (desde) rangoRealizacion.gte = parseYMDLima(desde);
+      if (hasta) rangoRealizacion.lte = parseYMDFinDiaLima(hasta);
+      if (rango_fecha === 'servicio') {
+        // Contabilidad filtra por "Fecha servicio": los mantenimientos caen en
+        // su fecha programada (la visita de agosto es de agosto aunque se haya
+        // ejecutado en septiembre); el resto, en su fecha de realización.
+        // fecha_programada es @db.Date: límites a medianoche UTC (parseYMDUTC).
+        const rangoProgramada = {};
+        if (desde) rangoProgramada.gte = parseYMDUTC(desde);
+        if (hasta) rangoProgramada.lte = parseYMDUTC(hasta);
+        where.AND = [...(where.AND || []), {
+          OR: [
+            { servicio: { AND: [WHERE_MANTENIMIENTO_PROGRAMADO, { fecha_programada: rangoProgramada }] } },
+            { fecha_realizacion: rangoRealizacion, servicio: { NOT: WHERE_MANTENIMIENTO_PROGRAMADO } }
+          ]
+        }];
+      } else {
+        where.fecha_realizacion = rangoRealizacion;
+      }
     }
     // Filtros sobre el servicio relacionado (cliente y búsqueda por código/cliente).
     const servicioWhere = {};
@@ -1690,13 +1728,17 @@ const realizados = async (req, res) => {
     // catálogo se ignora (normalizarMoneda devuelve null).
     const monedaFiltro = normalizarMoneda(moneda);
     if (monedaFiltro) servicioWhere.moneda = monedaFiltro;
-    // Filtro por situación de pago (columna "Situación"):
-    //   sin_cobro → servicios gratuitos.
-    //   cancelado → cobro pagado (Pagado/Cerrado), excluyendo gratuitos.
-    //   pendiente → cobro no pagado, excluyendo gratuitos.
-    if (situacion === 'sin_cobro') {
-      servicioWhere.sin_cobro = 1;
-    } else if (situacion === 'cancelado') {
+    // Rango por FECHA DE APROBACIÓN de la cotización del servicio, con el mismo
+    // criterio que el listado de Cotizaciones y que Gestión de cobros. Es
+    // independiente del rango de fecha de servicio (desde/hasta): se combinan.
+    // Los servicios sin cotización (visitas de plan, directos) no tienen esa
+    // fecha y quedan fuera mientras el rango esté puesto.
+    const aprobadaEnRango = whereAprobadaEnRango({ desde: aprobacion_desde, hasta: aprobacion_hasta });
+    if (aprobadaEnRango) servicioWhere.cotizacion = { is: aprobadaEnRango };
+    // Filtro por situación de pago (columna "Situación"), excluyendo gratuitos:
+    //   cancelado → cobro pagado (Pagado/Cerrado).
+    //   pendiente → cobro no pagado.
+    if (situacion === 'cancelado') {
       servicioWhere.sin_cobro = { not: 1 };
       where.estado_cobro = { in: ['Pagado', 'Cerrado'] };
     } else if (situacion === 'pendiente') {
@@ -1709,6 +1751,10 @@ const realizados = async (req, res) => {
     // Va dentro de AND para no pisar los filtros ya construidos.
     const whereGrupo = whereGrupoFacturacion(grupo_facturacion);
     if (whereGrupo) where.AND = [...(where.AND || []), whereGrupo];
+    // Contabilidad (con_monto=1) no lista lo que no tiene importe: gratuitos y
+    // servicios en S/ 0.00. Ver utils/montoACobrar.js. Entra en el mismo `where`
+    // que el resumen, así que las tarjetas tampoco los cuentan.
+    if (req.query.con_monto === '1') where.AND = [...(where.AND || []), whereRealizadoConMonto()];
     // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
     const tiposRealizados = tiposRegistroPermitidos(req.user);
     if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };

@@ -10,12 +10,12 @@ const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
-const { estaServicioFinalizado } = require('../utils/estadoServicio');
+const { estaServicioFinalizado, ESTADO_SERVICIO_CANCELADO } = require('../utils/estadoServicio');
 const configuracion = require('../utils/configuracion');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
 const { bajaArchivoEnTx, purgarObjetosWasabi, bajaServicioCascadaEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
-const { tiposRegistroPermitidos, cotizacionAlcanceWhere, puedeVerTipoRegistro, conAlcance } = require('../utils/alcanceUsuario');
+const { tiposRegistroPermitidos, puedeVerTipoRegistro } = require('../utils/alcanceUsuario');
 const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
 const { puedeVerFinanzasReq, cotizacionSinFinanzas } = require('../utils/visibilidadFinanzas');
 
@@ -48,7 +48,8 @@ const {
   FILTROS_GLOBALES,
   ETIQUETAS_FILTRO_GLOBAL,
   resolverFiltroGlobal,
-  rangoEsPorFechaAceptacion
+  rangoEsPorFechaAceptacion,
+  whereAprobadaEnRango
 } = require('../utils/estadoCotizacion');
 
 function puedeVer(req) {
@@ -118,38 +119,52 @@ function transicionPermitida(actual, destino) {
   return destino === ESTADOS_VERSION.APROBADO || destino === ESTADOS_VERSION.RECHAZADO;
 }
 
-// Conjuntos de estados de servicio que mapean a cada estado_global de la
-// cotización. Se mantienen aquí para que el cálculo sea una sola fuente de
-// verdad — no se duplican en frontend.
+// Antes de que el técnico finalice, la etapa la da el estado del servicio; a
+// partir de ahí (estaServicioFinalizado) la da el saldo del cobro. Se mantiene
+// aquí para que el cálculo sea una sola fuente de verdad — no se duplica en
+// frontend.
 const ESTADOS_SERVICIO_EJECUCION = [
   'Asignado', 'En curso'
 ];
-const ESTADOS_SERVICIO_PENDIENTE = [
-  'Finalizado',
-  'En revisión administrativa', 'A gestión de cobro', 'En cobro',
-  'Cobrado parcial', 'Facturado'
-];
-const ESTADOS_SERVICIO_TERMINADO = ['Cobrado total', 'Cerrado'];
+// Cobros en los que ya no se gestiona nada más: cerrado, o el saldo se dio por
+// perdido. Con saldo o sin él, no queda nada "por cobrar".
+const ESTADOS_COBRO_SIN_GESTION = ['Cerrado', 'Incobrable'];
+
+/**
+ * ¿Queda dinero por cobrar de este servicio?
+ *
+ * Manda el SALDO del cobro (lo que mueven los abonos), no `estado_servicio`:
+ * ese estado puede quedarse atrás. P.ej. un adelanto pagado al 100 % antes de
+ * ejecutar deja el cobro en saldo 0 sin mover el servicio, y al aprobarse la
+ * revisión el servicio aparecía "A gestión de cobro" para siempre. Un servicio
+ * gratuito o sin cobro activo no tiene nada que cobrar.
+ */
+function quedaSaldoPorCobrar(servicio, cobro) {
+  if (servicio.sin_cobro === 1 || !cobro) return false;
+  if (ESTADOS_COBRO_SIN_GESTION.includes(cobro.estado_cobro)) return false;
+  return Math.round(Number(cobro.saldo_pendiente || 0) * 100) > 0;
+}
 
 /**
  * Calcula el estado_global derivado del servicio asociado a la cotización.
  *
- *  - Cotizado  → no hay servicio (ninguna versión Aprobada todavía)
- *  - Aceptado  → servicio creado, aún en Pendiente
- *  - Ejecución → servicio asignado / en curso
- *  - Pendiente → servicio finalizado pero con cobro/facturación abierta
- *  - Terminado → servicio cerrado o cobro totalmente liquidado
+ *  - Cotizado   → no hay servicio (ninguna versión Aprobada todavía) o se canceló
+ *  - Aceptado   → servicio creado, aún sin asignar (Borrador / Pendiente)
+ *  - Ejecución  → servicio asignado / en curso
+ *  - Por cobrar → el técnico ya finalizó y el cobro todavía tiene saldo
+ *  - Terminado  → el técnico ya finalizó y no queda nada por cobrar
+ *
+ * Mientras el trabajo no termina manda el servicio aunque el cobro ya esté
+ * pagado o cerrado: una obra pagada por adelantado todavía no está terminada.
  */
 function calcularEstadoGlobal(servicio, cobro) {
   if (!servicio) return ESTADO_GLOBAL.COTIZADO;
   const es = servicio.estado_servicio;
-  if (es === 'Cancelado') return ESTADO_GLOBAL.COTIZADO;
-  if (ESTADOS_SERVICIO_TERMINADO.includes(es)) return ESTADO_GLOBAL.TERMINADO;
-  if (cobro && cobro.estado_cobro === 'Cerrado') return ESTADO_GLOBAL.TERMINADO;
-  if (es === 'Pendiente') return ESTADO_GLOBAL.ACEPTADO;
-  if (ESTADOS_SERVICIO_EJECUCION.includes(es)) return ESTADO_GLOBAL.EJECUCION;
-  if (ESTADOS_SERVICIO_PENDIENTE.includes(es)) return ESTADO_GLOBAL.PENDIENTE;
-  return ESTADO_GLOBAL.ACEPTADO;
+  if (es === ESTADO_SERVICIO_CANCELADO) return ESTADO_GLOBAL.COTIZADO;
+  if (!estaServicioFinalizado(es)) {
+    return ESTADOS_SERVICIO_EJECUCION.includes(es) ? ESTADO_GLOBAL.EJECUCION : ESTADO_GLOBAL.ACEPTADO;
+  }
+  return quedaSaldoPorCobrar(servicio, cobro) ? ESTADO_GLOBAL.POR_COBRAR : ESTADO_GLOBAL.TERMINADO;
 }
 
 /**
@@ -170,12 +185,12 @@ async function sincronizarEstadoGlobal(idCotizacion, tx = prisma) {
   if (cot.estado_global === ESTADO_GLOBAL.ANULADO) return cot.estado_global;
   const servicio = await tx.tbl_servicios_proyectos.findFirst({
     where: { id_cotizacion: Number(idCotizacion), estado: 1 },
-    select: { id: true, estado_servicio: true }
+    select: { id: true, estado_servicio: true, sin_cobro: true }
   });
   const cobro = servicio
     ? await tx.tbl_cobros.findFirst({
         where: { id_servicio: servicio.id, estado: 1 },
-        select: { estado_cobro: true }
+        select: { estado_cobro: true, saldo_pendiente: true }
       })
     : null;
   const destino = calcularEstadoGlobal(servicio, cobro);
@@ -200,105 +215,108 @@ async function cargarVersionActiva(idCotizacion) {
 //
 // Devuelve null si no se pidió rango. Sobre qué fecha se aplica depende del
 // filtro de estado (ver `rangoEsPorFechaAceptacion`):
-//   - filtros del embudo aceptado ('Aceptado', 'Ejecución', 'Pendiente',
+//   - filtros del embudo aceptado ('Aceptado', 'Ejecución', 'Por cobrar',
 //     'Terminado' y el virtual 'Aprobadas') → FECHA DE ACEPTACIÓN, es decir
 //     `fecha_aprobacion` de la versión aprobada. Un rango 01/08–31/08 devuelve
 //     todas las que se aceptaron en agosto, sin importar cuándo se cotizaron ni
 //     en qué etapa estén hoy.
+//     (whereAprobadaEnRango: el mismo criterio que filtran Gestión de cobros
+//     y Contabilidad).
 //   - resto de filtros (o sin filtro) → fecha de creación de la cotización.
 function condicionRangoFechas({ estado_global, desde, hasta }) {
   if (!desde && !hasta) return null;
+  if (rangoEsPorFechaAceptacion(estado_global)) return whereAprobadaEnRango({ desde, hasta });
   const rango = {};
   if (desde) rango.gte = parseYMDLima(desde);
   if (hasta) rango.lte = parseYMDFinDiaLima(hasta);
-  if (!rangoEsPorFechaAceptacion(estado_global)) return { date_time_registration: rango };
-  return {
-    versiones: {
-      some: {
-        estado: 1,
-        estado_version: ESTADOS_VERSION.APROBADO,
-        fecha_aprobacion: rango
-      }
-    }
-  };
+  return { date_time_registration: rango };
 }
+
+// Filtros del listado de cotizaciones. Punto ÚNICO: lo usan el listado y la
+// exportación, para que el Excel traiga exactamente lo que se ve en pantalla con
+// los mismos filtros activos (incluidos "Mostrar anuladas" y el ámbito del
+// usuario). Antes la exportación tenía su propia copia y se había desalineado.
+function construirWhereCotizaciones(query, user) {
+  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
+  const mostrarAnuladas = incluir_anuladas === '1' || incluir_anuladas === 'true';
+
+  const and = [];
+  // Visibilidad: activas (estado=1) siempre; anuladas (estado=0 + 'Anulado')
+  // solo si se pide explícitamente. Otros estado=0 (legacy) nunca se muestran.
+  and.push(mostrarAnuladas
+    ? { OR: [{ estado: 1 }, { estado: 0, estado_global: ESTADO_GLOBAL.ANULADO }] }
+    : { estado: 1 });
+  if (q) and.push({ OR: [
+    // Código de la cotización
+    { codigo: { contains: q, mode: 'insensitive' } },
+    // Nombre del cliente
+    { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
+    // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
+    // los ascensores existentes vinculados a la cotización
+    { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
+    // Nombre del edificio / obra donde están los ascensores de la cotización
+    { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
+    // Código de servicio generado por la cotización (cuando ya fue aprobada)
+    { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
+  ] });
+  // El filtro de estado no siempre es una igualdad: algunos valores arrastran
+  // las fases posteriores del ciclo (ver EXPANSION_FILTRO_GLOBAL). Sin esto
+  // una cotización aceptada desaparecía del filtro 'Aceptado' apenas su
+  // servicio pasaba a ejecución, y 'Terminado' dejaba fuera los servicios ya
+  // terminados que están en cobro o facturación (estado_global 'Por cobrar').
+  if (estado_global) {
+    const estadosFiltro = resolverFiltroGlobal(estado_global);
+    and.push(estadosFiltro ? { estado_global: { in: estadosFiltro } } : { estado_global });
+  }
+  if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
+  // Filtro por ascensor: cotizaciones que incluyen ese ascensor existente.
+  // (Los ascensores "nuevos a instalar" no tienen id y quedan fuera del filtro.)
+  if (id_ascensor) and.push({ ascensores: { some: { estado: 1, id_ascensor: Number(id_ascensor) } } });
+  if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
+  const rangoFechas = condicionRangoFechas({ estado_global, desde, hasta });
+  if (rangoFechas) and.push(rangoFechas);
+  // Ámbito: un usuario de área (servicios/proyectos) solo ve las cotizaciones
+  // cuyo tipo de servicio pertenece a su categoría funcional.
+  const catsAmbito = categoriasFuncionalesDeAmbito(user);
+  if (catsAmbito) and.push({ tipo_servicio: { categoria_funcional: { in: catsAmbito.length ? catsAmbito : ['__sin_ambito__'] } } });
+  return { AND: and };
+}
+
+// Forma de cada fila del listado (y de la exportación, que la reutiliza).
+const INCLUDE_LISTA = {
+  cliente: { select: { id: true, nombre: true, telefono: true } },
+  ascensores: {
+    where: { estado: 1 },
+    orderBy: { orden: 'asc' },
+    include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
+  },
+  tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
+  subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
+  versiones: {
+    where: { estado: 1 },
+    orderBy: { numero_version: 'desc' },
+    take: 1,
+    select: {
+      id: true, numero_version: true, estado_version: true,
+      monto_total: true, moneda: true
+    }
+  },
+  servicios: {
+    where: { estado: 1 },
+    orderBy: { id: 'asc' },
+    select: { id: true, codigo: true, estado_servicio: true }
+  }
+};
 
 const listar = async (req, res) => {
   try {
     if (!puedeVer(req)) return res.status(403).json({ error: 'No autorizado' });
-    const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = req.query;
-    const mostrarAnuladas = incluir_anuladas === '1' || incluir_anuladas === 'true';
-
-    const and = [];
-    // Visibilidad: activas (estado=1) siempre; anuladas (estado=0 + 'Anulado')
-    // solo si se pide explícitamente. Otros estado=0 (legacy) nunca se muestran.
-    and.push(mostrarAnuladas
-      ? { OR: [{ estado: 1 }, { estado: 0, estado_global: ESTADO_GLOBAL.ANULADO }] }
-      : { estado: 1 });
-    if (q) and.push({ OR: [
-      // Código de la cotización
-      { codigo: { contains: q, mode: 'insensitive' } },
-      // Nombre del cliente
-      { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
-      // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
-      // los ascensores existentes vinculados a la cotización
-      { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
-      // Nombre del edificio / obra donde están los ascensores de la cotización
-      { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
-      // Código de servicio generado por la cotización (cuando ya fue aprobada)
-      { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
-    ] });
-    // El filtro de estado no siempre es una igualdad: algunos valores arrastran
-    // las fases posteriores del ciclo (ver EXPANSION_FILTRO_GLOBAL). Sin esto
-    // una cotización aceptada desaparecía del filtro 'Aceptado' apenas su
-    // servicio pasaba a ejecución, y 'Terminado' dejaba fuera los servicios ya
-    // terminados que están en cobro o facturación (estado_global 'Pendiente').
-    if (estado_global) {
-      const estadosFiltro = resolverFiltroGlobal(estado_global);
-      and.push(estadosFiltro ? { estado_global: { in: estadosFiltro } } : { estado_global });
-    }
-    if (id_cliente) and.push({ id_cliente: Number(id_cliente) });
-    // Filtro por ascensor: cotizaciones que incluyen ese ascensor existente.
-    // (Los ascensores "nuevos a instalar" no tienen id y quedan fuera del filtro.)
-    if (id_ascensor) and.push({ ascensores: { some: { estado: 1, id_ascensor: Number(id_ascensor) } } });
-    if (id_tipo_servicio) and.push({ id_tipo_servicio: Number(id_tipo_servicio) });
-    const rangoFechas = condicionRangoFechas({ estado_global, desde, hasta });
-    if (rangoFechas) and.push(rangoFechas);
-    // Ámbito: un usuario de área (servicios/proyectos) solo ve las cotizaciones
-    // cuyo tipo de servicio pertenece a su categoría funcional.
-    const catsAmbito = categoriasFuncionalesDeAmbito(req.user);
-    if (catsAmbito) and.push({ tipo_servicio: { categoria_funcional: { in: catsAmbito.length ? catsAmbito : ['__sin_ambito__'] } } });
-    const where = { AND: and };
-
     const result = await paginar(
       prisma.tbl_cotizaciones,
       {
-        where,
+        where: construirWhereCotizaciones(req.query, req.user),
         orderBy: { id: 'desc' },
-        include: {
-          cliente: { select: { id: true, nombre: true, telefono: true } },
-          ascensores: {
-            where: { estado: 1 },
-            orderBy: { orden: 'asc' },
-            include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
-          },
-          tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
-          subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
-          versiones: {
-            where: { estado: 1 },
-            orderBy: { numero_version: 'desc' },
-            take: 1,
-            select: {
-              id: true, numero_version: true, estado_version: true,
-              monto_total: true, moneda: true
-            }
-          },
-          servicios: {
-            where: { estado: 1 },
-            orderBy: { id: 'asc' },
-            select: { id: true, codigo: true, estado_servicio: true }
-          }
-        }
+        include: INCLUDE_LISTA
       },
       req.query
     );
@@ -646,7 +664,9 @@ const crear = async (req, res) => {
 
     const igvTasa = await configuracion.obtener('IGV_RATE');
     const sinIgv = Boolean(d.sin_igv);
-    const totales = calcularTotalesVersion(items, igvTasa, sinIgv);
+    // Precio final con IGV adentro. Sin IGV no hay nada que desglosar.
+    const igvIncluido = !sinIgv && Boolean(d.igv_incluido);
+    const totales = calcularTotalesVersion(items, igvTasa, sinIgv, igvIncluido);
     const cuentasPdf = await normalizarCuentasPdf(d.cuentas_pdf);
 
     const tieneCuotas = Boolean(d.tiene_cuotas);
@@ -740,6 +760,7 @@ const crear = async (req, res) => {
           plan_cuotas: planCuotas,
           saldo_variable: saldoVariable,
           sin_igv: sinIgv,
+          igv_incluido: igvIncluido,
           cuentas_pdf: cuentasPdf,
           user_id_registration: req.user.id
         }
@@ -916,16 +937,19 @@ const actualizarVersion = async (req, res) => {
 
     const nuevoSinIgv = Object.prototype.hasOwnProperty.call(d, 'sin_igv')
       ? Boolean(d.sin_igv) : version.sin_igv;
+    const nuevoIgvIncluido = !nuevoSinIgv && (Object.prototype.hasOwnProperty.call(d, 'igv_incluido')
+      ? Boolean(d.igv_incluido) : version.igv_incluido);
     // Los totales se recalculan si cambian los items o si cambia la condición de
-    // IGV (afecto/sin IGV). Si solo cambia el IGV, se recomputan sobre los items
-    // vigentes en la BD.
-    const recalcTotales = !!items || (nuevoSinIgv !== version.sin_igv);
+    // IGV (más IGV / IGV incluido / sin IGV). Si solo cambia el IGV, se
+    // recomputan sobre los items vigentes en la BD.
+    const recalcTotales = !!items || (nuevoSinIgv !== version.sin_igv)
+      || (nuevoIgvIncluido !== version.igv_incluido);
     let totalesNuevos = null;
     if (recalcTotales) {
       const itemsParaCalc = items || (await prisma.tbl_cotizaciones_items.findMany({
         where: { id_version: version.id, estado: 1 }
       }));
-      totalesNuevos = calcularTotalesVersion(itemsParaCalc, igvTasa, nuevoSinIgv);
+      totalesNuevos = calcularTotalesVersion(itemsParaCalc, igvTasa, nuevoSinIgv, nuevoIgvIncluido);
     }
     // Total efectivo después de la actualización (recalculado o el vigente).
     const totalNuevo = totalesNuevos ? totalesNuevos.monto_total : Number(version.monto_total);
@@ -951,8 +975,9 @@ const actualizarVersion = async (req, res) => {
       } else {
         nuevoPlanCuotas = null;
       }
-    } else if (items && version.tiene_cuotas) {
-      // Si cambiaron los items pero no se reenvió el plan, hay que revalidar contra el nuevo total.
+    } else if (totalesNuevos && version.tiene_cuotas) {
+      // Si cambió el total (items o IGV) pero no se reenvió el plan, hay que
+      // revalidarlo contra el nuevo total.
       try {
         nuevoPlanCuotas = normalizarPlanCuotas(version.plan_cuotas, totalNuevo);
       } catch (e) {
@@ -976,6 +1001,7 @@ const actualizarVersion = async (req, res) => {
         plan_cuotas: nuevoPlanCuotas,
         saldo_variable: nuevoSaldoVariable,
         sin_igv: nuevoSinIgv,
+        igv_incluido: nuevoIgvIncluido,
         ...(enviaCuentas ? { cuentas_pdf: nuevasCuentasPdf } : {}),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
@@ -1081,6 +1107,10 @@ const crearNuevaVersion = async (req, res) => {
           tiene_cuotas: ultima.tiene_cuotas,
           plan_cuotas: ultima.plan_cuotas,
           saldo_variable: ultima.saldo_variable,
+          // La condición de IGV viaja con los totales copiados: sin ella, al
+          // editar la nueva versión se recalcularía con otra regla.
+          sin_igv: ultima.sin_igv,
+          igv_incluido: ultima.igv_incluido,
           user_id_registration: req.user.id
         }
       });
@@ -1154,7 +1184,7 @@ const rechazar = async (req, res) => {
 /**
  * Reabre una cotización aprobada para renegociar términos.
  * Validaciones:
- *   - estado_global en Aceptado/Ejecución/Pendiente (hay servicio en marcha)
+ *   - estado_global en Aceptado/Ejecución/Por cobrar (hay servicio en marcha)
  *   - existe servicio asociado, no en estado terminal (Cerrado/Cancelado)
  *   - existe cobro asociado, no en estado terminal (Cerrado/Incobrable)
  *   - cobro tiene saldo_pendiente > 0 (al menos una cuota sin cobrar completa)
@@ -2158,67 +2188,50 @@ const eliminarArchivo = async (req, res) => {
 
 
 // ===================================================================
-// [MERGE] Infraestructura de listado + endpoints exportar/historial
-// traídos del repo remoto (exportación XLSX/PDF e historial de
-// cotizaciones). Aditivo: no altera los endpoints locales existentes.
+// [MERGE] Endpoints exportar/historial traídos del repo remoto
+// (exportación XLSX/PDF e historial de cotizaciones). Los filtros y la
+// forma de las filas son los del listado (construirWhereCotizaciones,
+// INCLUDE_LISTA): se exporta exactamente lo que se ve en pantalla.
 // ===================================================================
-const INCLUDE_LISTA = {
-  cliente: { select: { id: true, nombre: true, telefono: true } },
-  ascensores: {
-    where: { estado: 1 },
-    orderBy: { orden: 'asc' },
-    include: { ascensor: { select: { id: true, codigo: true, ubicacion: true, edificio: { select: { id: true, nombre: true, tipo: true } } } } }
-  },
-  tipo_servicio: { select: { id: true, nombre: true, categoria_funcional: true } },
-  subtipo_servicio: { select: { id: true, nombre: true, modulo_asociado: true } },
-  versiones: {
-    where: { estado: 1 },
-    orderBy: { numero_version: 'desc' },
-    take: 1,
-    select: {
-      id: true, numero_version: true, estado_version: true,
-      monto_total: true, moneda: true
-    }
-  },
-  servicios: {
-    where: { estado: 1 },
-    orderBy: { id: 'asc' },
-    select: { id: true, codigo: true, estado_servicio: true }
-  }
-};
 
-function construirWhereCotizaciones(query) {
-  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta } = query;
-  const where = { estado: 1 };
-  if (q) where.OR = [
-    // Código de la cotización
-    { codigo: { contains: q, mode: 'insensitive' } },
-    // Nombre del cliente
-    { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
-    // Tipo de ascensor (Pasajeros / Camillero / Carga / …) en cualquiera de
-    // los ascensores existentes vinculados a la cotización
-    { ascensores: { some: { estado: 1, ascensor: { tipo: { contains: q, mode: 'insensitive' } } } } },
-    // Nombre del edificio / obra donde están los ascensores de la cotización
-    { ascensores: { some: { estado: 1, ascensor: { edificio: { nombre: { contains: q, mode: 'insensitive' } } } } } },
-    // Código de servicio generado por la cotización (cuando ya fue aprobada)
-    { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
-  ];
-  // Igual que el listado: el valor puede ser un estado exacto o un filtro que
-  // arrastra fases posteriores ('Aprobadas', 'Terminado'). La traducción vive
-  // en utils/estadoCotizacion.js para no duplicarla aquí.
-  if (estado_global) {
-    const estadosFiltro = resolverFiltroGlobal(estado_global);
-    where.estado_global = estadosFiltro ? { in: estadosFiltro } : estado_global;
+// Nombre visible de un registro por id, para describir un filtro. null si el id
+// no es válido o no existe (el filtro se describe entonces con el id crudo).
+async function nombrePorId(modelo, id, campo) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || n <= 0) return null;
+  const fila = await prisma[modelo].findUnique({ where: { id: n }, select: { [campo]: true } });
+  return fila?.[campo] || null;
+}
+
+const ymdADmy = (ymd) => (ymd ? String(ymd).split('-').reverse().join('/') : '…');
+
+// Filtros activos en palabras, para la cabecera del Excel: quien abra el archivo
+// sabe qué recorte del listado contiene. Mismos parámetros que
+// construirWhereCotizaciones; los ids se traducen a nombres.
+async function describirFiltrosCotizaciones(query) {
+  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
+  const partes = [];
+  if (id_tipo_servicio) {
+    partes.push(`Tipo de servicio: ${await nombrePorId('tbl_tipos_servicio', id_tipo_servicio, 'nombre') || id_tipo_servicio}`);
   }
-  if (id_cliente) where.id_cliente = Number(id_cliente);
-  // Mismo filtro por ascensor que el listado (para exportar lo que se ve).
-  if (id_ascensor) where.ascensores = { some: { estado: 1, id_ascensor: Number(id_ascensor) } };
-  if (id_tipo_servicio) where.id_tipo_servicio = Number(id_tipo_servicio);
-  // Mismo criterio de rango que el listado (creación vs. aceptación según el
-  // filtro de estado), para exportar exactamente lo que se ve en pantalla.
-  const rangoFechas = condicionRangoFechas({ estado_global, desde, hasta });
-  if (rangoFechas) Object.assign(where, rangoFechas);
-  return where;
+  if (q) partes.push(`Búsqueda: «${q}»`);
+  if (estado_global) {
+    const virtual = FILTROS_GLOBALES.find(f => f.valor === estado_global);
+    partes.push(`Estado: ${virtual?.etiqueta || ETIQUETAS_FILTRO_GLOBAL[estado_global] || estado_global}`);
+  }
+  if (id_cliente) {
+    partes.push(`Cliente: ${await nombrePorId('tbl_clientes', id_cliente, 'nombre') || id_cliente}`);
+  }
+  if (id_ascensor) {
+    partes.push(`Ascensor: ${await nombrePorId('tbl_ascensores', id_ascensor, 'codigo') || id_ascensor}`);
+  }
+  if (desde || hasta) {
+    // Misma fecha sobre la que filtra condicionRangoFechas.
+    const fecha = rangoEsPorFechaAceptacion(estado_global) ? 'Aceptación' : 'Creación';
+    partes.push(`${fecha}: ${ymdADmy(desde)} – ${ymdADmy(hasta)}`);
+  }
+  if (incluir_anuladas === '1' || incluir_anuladas === 'true') partes.push('Incluye anuladas');
+  return partes;
 }
 
 // Hidrata cada cotización con `creado_por` (usuario que la registró). La columna
@@ -2241,20 +2254,23 @@ const exportar = async (req, res) => {
       return res.status(400).json({ error: 'Formato debe ser "excel" o "pdf"' });
     }
 
-    const where = construirWhereCotizaciones(req.query);
-    conAlcance(where, cotizacionAlcanceWhere(req.user));
-    const cotizaciones = await prisma.tbl_cotizaciones.findMany({
-      where,
-      orderBy: { id: 'desc' },
-      include: INCLUDE_LISTA
-    });
+    // Mismo where que el listado (incluye el ámbito del usuario y "Mostrar
+    // anuladas"): el archivo trae el conjunto filtrado completo, sin paginar.
+    const [cotizaciones, filtros] = await Promise.all([
+      prisma.tbl_cotizaciones.findMany({
+        where: construirWhereCotizaciones(req.query, req.user),
+        orderBy: { id: 'desc' },
+        include: INCLUDE_LISTA
+      }),
+      describirFiltrosCotizaciones(req.query)
+    ]);
     await adjuntarCreador(cotizaciones);
 
     const { generarExcelCotizaciones, generarPdfCotizaciones } = require('../utils/cotizacionesExport');
     const stamp = ymdLima();
 
     if (formato === 'excel') {
-      const buffer = await generarExcelCotizaciones(cotizaciones);
+      const buffer = await generarExcelCotizaciones(cotizaciones, { filtros });
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="cotizaciones-${stamp}.xlsx"`);
       return res.end(buffer);
@@ -2352,6 +2368,7 @@ module.exports = {
   agregarArchivo,
   eliminarArchivo,
   sincronizarEstadoGlobal,
+  calcularEstadoGlobal,
   ESTADOS_VERSION,
   ESTADO_GLOBAL
 };
