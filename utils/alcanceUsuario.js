@@ -87,14 +87,16 @@ function servicioAlcanceWhere(user) {
  *
  *   1. Tiene contrato de esa área (inicio y fin registrados). Es la marca
  *      explícita y la que existe desde el minuto uno: al crear un cliente es
- *      obligatorio registrar el contrato de al menos un área, y un usuario
- *      acotado solo puede llenar la suya. Así un cliente recién creado no
- *      desaparece de la lista de quien lo creó.
+ *      obligatorio registrar el contrato de su área (una sola: Servicios o
+ *      Proyectos), y un usuario acotado solo puede llenar la suya. Así un
+ *      cliente recién creado no desaparece de la lista de quien lo creó.
  *   2. Tiene al menos un servicio/proyecto de esa área. Cubre a los clientes con
  *      historial cuyo contrato quedó registrado solo en la otra área.
  *
- * Un cliente con contrato (o actividad) en ambas áreas lo ven los dos ámbitos,
- * que es lo correcto: es cliente de las dos.
+ * Así, el usuario de Servicios no ve a los clientes de Proyectos ni al revés.
+ * Solo un cliente con actividad en la otra área (o uno antiguo, de cuando
+ * existía la opción «Ambas») lo ven los dos ámbitos; dentro de él, cada uno ve
+ * únicamente los registros del suyo.
  */
 function clienteAlcanceWhere(user) {
   const tipos = tiposRegistroPermitidos(user);

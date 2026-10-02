@@ -5,7 +5,7 @@ const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const {
-  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, AREA_AMBAS, areasPorContrato
+  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, areasPorContrato
 } = require('../utils/catalogosClientes');
 const { resolverClasificacion } = require('../utils/clasificacionesCliente');
 const {
@@ -175,10 +175,10 @@ const matchEdificioBusqueda = (q) => ({
  *   tipo_ascensor    — clientes con algún edificio que tenga un ascensor de ese tipo
  *   clasificacion    — match exacto
  *   estado           — 0 | 1 (activo/inactivo)
- *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato
+ *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato (sin fechas
+ *                      ni documento de contrato en ninguna área visible)
  *   con_contrato     — '1' | '0' filtra si tiene archivo de contrato adjunto
- *   area_contrato    — servicio | proyecto | ambos: área cuyos datos de contrato
- *                      y documentación registra el cliente (inclusivo)
+ *   area_contrato    — servicio | proyecto: área del cliente (la de su contrato)
  *
  * `user` aplica el ámbito (Servicios/Proyectos): si el rol está acotado, solo
  * devuelve los clientes de su(s) área(s) (ver clienteAlcanceWhere).
@@ -219,7 +219,14 @@ async function construirWhereClientes(query, user) {
   const colArch = (a) => CAMPOS_CONTRATO_AREA[a].archivo;
   const pushAnd = (cond) => { (where.AND = where.AND || []).push(cond); };
 
-  if (estado_contrato) {
+  if (estado_contrato === 'sin_contrato') {
+    // «Sin contrato» = el cliente no registra contrato en NINGUNA de las áreas
+    // visibles: ni fechas ni documento adjunto. A diferencia de los demás
+    // estados (basta con que una área cumpla), aquí deben cumplir todas: un
+    // cliente con contrato de Servicios no es «sin contrato» por no tener el de
+    // Proyectos.
+    pushAnd({ AND: areasContrato.map(a => ({ [colInicio(a)]: null, [colFin(a)]: null, [colArch(a)]: null })) });
+  } else if (estado_contrato) {
     const diasAviso = await configuracion.obtener('CLIENTES_DIAS_AVISO_VENCIMIENTO_CONTRATO');
     const hoy = inicioDelDiaLima();
     const proximo = new Date(hoy.getTime() + Number(diasAviso || 30) * 86400000);
@@ -227,7 +234,6 @@ async function construirWhereClientes(query, user) {
       if (estado_contrato === 'vigente') return { [colInicio(a)]: { lte: hoy }, [colFin(a)]: { gte: hoy } };
       if (estado_contrato === 'por_vencer') return { [colFin(a)]: { gte: hoy, lte: proximo } };
       if (estado_contrato === 'vencido') return { [colFin(a)]: { lt: hoy } };
-      if (estado_contrato === 'sin_contrato') return { OR: [{ [colInicio(a)]: null }, { [colFin(a)]: null }] };
       return {};
     };
     pushAnd({ OR: areasContrato.map(condArea) });
@@ -235,13 +241,12 @@ async function construirWhereClientes(query, user) {
   if (con_contrato === '1') pushAnd({ OR: areasContrato.map(a => ({ [colArch(a)]: { not: null } })) });
   else if (con_contrato === '0') pushAnd({ AND: areasContrato.map(a => ({ [colArch(a)]: null })) });
 
-  // Área cuyos datos de contrato y documentación registra el cliente. Un área
-  // cuenta cuando tiene contrato registrado (inicio y fin), el mismo criterio
-  // que exige el alta y que usa el ámbito. Es inclusivo: pedir un área devuelve
-  // también a los clientes que registran las dos.
-  const conContratoDe = (a) => ({ [colInicio(a)]: { not: null }, [colFin(a)]: { not: null } });
-  if (area_contrato === AREA_AMBAS) pushAnd({ AND: AREAS_CLIENTE.map(conContratoDe) });
-  else if (AREAS_CLIENTE.includes(area_contrato)) pushAnd(conContratoDe(area_contrato));
+  // Área del cliente: la que tiene contrato registrado (inicio y fin), el mismo
+  // criterio que exige el alta y que usa el ámbito. Un cliente es de una sola
+  // área; los antiguos que registraban las dos aparecen en ambos filtros.
+  if (AREAS_CLIENTE.includes(area_contrato)) {
+    pushAnd({ [colInicio(area_contrato)]: { not: null }, [colFin(area_contrato)]: { not: null } });
+  }
 
   // Ámbito del usuario: limita a clientes de su(s) área(s). Se agrega como una
   // cláusula AND (no con Object.assign) para no pisar el where.OR del buscador `q`.
@@ -550,10 +555,11 @@ const INCLUDE_CONTRATOS = {
 
 /**
  * Resuelve y valida el contrato de servicio POR ÁREA (Servicios / Proyectos).
- * Reglas: si un área trae una fecha, debe traer ambas (y fin >= inicio); debe
- * existir contrato completo en AL MENOS un área. Respeta el ámbito: un usuario
- * acotado solo modifica sus áreas (las demás conservan lo previo). `previo` = el
- * cliente actual (o {} al crear). Devuelve { ok, error?, valores }.
+ * Reglas: si un área trae una fecha, debe traer ambas (y fin >= inicio); el
+ * cliente debe quedar con contrato completo en UNA sola área: es de Servicios o
+ * de Proyectos, no de ambas. Respeta el ámbito: un usuario acotado solo
+ * modifica sus áreas (las demás conservan lo previo). `previo` = el cliente
+ * actual (o {} al crear). Devuelve { ok, error?, valores }.
  */
 function resolverContratosPorArea(data, previo, user) {
   const valores = {};
@@ -591,8 +597,21 @@ function resolverContratosPorArea(data, previo, user) {
     valores[c.archivo] = archivo;
     completos[area] = !!(inicio && fin);
   }
-  if (!completos.servicio && !completos.proyecto) {
-    return { ok: false, error: 'Registre el contrato (inicio y fin) de al menos un área: Servicios o Proyectos' };
+  const areas = AREAS_CLIENTE.filter(a => completos[a]);
+  if (areas.length === 0) {
+    return { ok: false, error: 'Registre el contrato (inicio y fin) del área del cliente: Servicios o Proyectos' };
+  }
+  // Las dos áreas solo se toleran en un cliente que YA las tenía (de cuando
+  // existía la opción «Ambas»): un usuario acotado a una no puede quitar la otra
+  // y debe poder seguir editándolo. Nunca se llega a ese estado desde una sola.
+  const areasPrevias = areasPorContrato(previo);
+  if (areas.length > 1 && areasPrevias.length < AREAS_CLIENTE.length) {
+    return {
+      ok: false,
+      error: areasPrevias.length
+        ? `Este cliente ya es del Área de ${ETIQUETA_AREA[areasPrevias[0]]}: un cliente pertenece a una sola área (Servicios o Proyectos)`
+        : 'Un cliente se registra en una sola área: Servicios o Proyectos'
+    };
   }
   return { ok: true, valores };
 }
@@ -703,7 +722,18 @@ const actualizar = async (req, res) => {
     for (const k of CAMPOS_CONTACTOS) {
       if (Object.prototype.hasOwnProperty.call(data, k)) dataContactos[k] = trimOrNull(data[k]);
     }
+    // Cambio de área (p. ej. de Servicios a Proyectos): el formulario mueve el
+    // contrato y los adjuntos a la nueva área, y aquí la acompaña el historial de
+    // contratos anteriores, que sigue siendo del mismo cliente.
+    const areasNuevas = areasPorContrato(contratos.valores);
+    const areasQueDeja = areasPorContrato(previo).filter(a => !areasNuevas.includes(a));
     const cliente = await prisma.$transaction(async (tx) => {
+      if (areasNuevas.length === 1 && areasQueDeja.length > 0) {
+        await tx.tbl_clientes_contratos_historial.updateMany({
+          where: { id_cliente: id, area: { in: areasQueDeja } },
+          data: { area: areasNuevas[0], user_id_modification: req.user.id, date_time_modification: new Date() }
+        });
+      }
       await tx.tbl_clientes.update({
         where: { id },
         data: {
@@ -770,6 +800,13 @@ const registrarContrato = async (req, res) => {
       where: { id, ...clienteAlcanceWhere(req.user) }
     });
     if (!previo) return res.status(404).json({ error: 'Cliente no encontrado' });
+    // Un cliente es de una sola área: el contrato nuevo se registra en la suya.
+    const areasPrevias = areasPorContrato(previo);
+    if (areasPrevias.length > 0 && !areasPrevias.includes(area)) {
+      return res.status(400).json({
+        error: `Este cliente es del Área de ${ETIQUETA_AREA[areasPrevias[0]]}: el contrato nuevo se registra en esa área`
+      });
+    }
 
     const inicio = parseFechaContrato(fecha_inicio);
     const fin = parseFechaContrato(fecha_fin);

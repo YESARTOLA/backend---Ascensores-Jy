@@ -17,8 +17,8 @@
  * Es la SSoT del mapeo área → columnas: la usan el controlador (validar y
  * guardar los contratos) y utils/alcanceUsuario.js (decidir qué clientes ve
  * cada usuario según su ámbito). Como al crear un cliente es obligatorio
- * registrar el contrato de al menos un área, estas columnas son la marca
- * explícita de a qué área pertenece cada cliente.
+ * registrar el contrato de su área (una sola: Servicios o Proyectos), estas
+ * columnas son la marca explícita de a qué área pertenece cada cliente.
  */
 const CAMPOS_CONTRATO_AREA = {
   servicio: { inicio: 'contrato_servicio_inicio', fin: 'contrato_servicio_fin', archivo: 'id_archivo_contrato_servicio' },
@@ -31,7 +31,8 @@ const ETIQUETA_AREA = { servicio: 'Servicios', proyecto: 'Proyectos' };
 // usuario y que el `tipo_registro` del servicio/proyecto.
 const AREAS_CLIENTE = Object.keys(CAMPOS_CONTRATO_AREA);
 
-// Valor extra del filtro por área: el cliente registra las dos.
+// Área de una CLASIFICACIÓN que aplica a clientes de las dos áreas. No es un área
+// de cliente: el cliente es de Servicios o de Proyectos, nunca de ambas.
 const AREA_AMBAS = 'ambos';
 
 /**
