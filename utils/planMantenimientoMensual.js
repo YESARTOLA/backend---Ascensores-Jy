@@ -8,9 +8,10 @@
  *      por visita, respetando la frecuencia PROPIA de cada ascensor.
  *
  *   2. QUÉ se cobra     → `mesesDelPlan` agrupa ese cronograma por MES DEL PLAN
- *      y devuelve, para cada mes, el detalle de visitas y el importe. El importe
- *      es SIEMPRE `plan.monto_mensual`: no depende de cuántas visitas caigan en
- *      el mes ni de que alguna se omita.
+ *      y devuelve, para cada mes, el detalle de visitas y el importe. Un mes
+ *      con mantenimiento se cobra `plan.monto_mensual` —no depende de cuántas
+ *      visitas caigan en él ni de que alguna se omita—; un mes sin ningún
+ *      mantenimiento programado no se cobra (ver `totalesDelPlan`).
  *
  * Contabilidad, Gestión de cobros y Facturas leen de aquí (vía el cobro único
  * del plan y sus cuotas, una por mes) — no recalculan nada por su cuenta.
@@ -40,14 +41,25 @@ function etiquetaMes(numeroMes, desdeYMD) {
 /**
  * ECONOMÍA DEL PLAN — SSoT del importe total.
  *
- * Los MESES GRATUITOS son meses que se prestan pero no se cobran: sus visitas
- * se ejecutan igual y su servicio se cierra, pero no generan cuota con importe
- * ni entran a Gestión de cobros. Por eso el total del contrato NO es
- * `monto_mensual × duración`, sino solo los meses facturables:
+ * El `monto_mensual` es el precio de UN MES CON MANTENIMIENTO, tomando la
+ * frecuencia mensual como referencia. Solo se cobran los meses del plan en que
+ * cae al menos un mantenimiento:
  *
- *     total = monto_mensual × (duración − meses gratuitos)
+ *     mensual       × 12 meses → 12 meses con mantenimiento → 12 × monto
+ *     trimestral    × 12 meses → meses 1, 4, 7 y 10          →  4 × monto
+ *     cuatrimestral × 12 meses → meses 1, 5 y 9              →  3 × monto
  *
- * Ej.: 24 meses a S/ 3.000 con 2 gratuitos → 22 × 3.000 = S/ 66.000.
+ * Un mes con varias visitas (quincenal, o varios ascensores) se cobra una sola
+ * vez: el cobro sigue siendo único por mes.
+ *
+ * Los MESES GRATUITOS son los primeros N meses del plan: sus visitas se
+ * ejecutan igual y su servicio se cierra, pero no generan cuota con importe ni
+ * entran a Gestión de cobros. Así:
+ *
+ *     total = monto_mensual × (meses con mantenimiento fuera del cupo gratuito)
+ *
+ * Ej.: 24 meses mensual a S/ 3.000 con 2 gratuitos → 22 × 3.000 = S/ 66.000.
+ *      12 meses trimestral a S/ 200                 →  4 ×   200 = S/    800.
  *
  * Toda la aplicación (formulario, detalle del plan, reportes y export) debe
  * calcular el total por aquí; el espejo en cliente vive en
@@ -55,22 +67,66 @@ function etiquetaMes(numeroMes, desdeYMD) {
  *
  * @param {object} plan  Con monto_mensual, duracion_meses,
  *                       cantidad_mantenimientos_gratuitos y tipo_plan.
+ * @param {Iterable<number>} mesesConMant  Números de mes (1-based) en que cae al
+ *        menos una visita; ver `mesesConMantenimiento`.
  */
-function totalesDelPlan(plan) {
+function totalesDelPlan(plan, mesesConMant) {
   const meses = plan?.tipo_plan === 'eventual' ? 1 : Number(plan?.duracion_meses || 0);
   // El cupo nunca puede exceder la duración (el formulario ya lo acota, pero un
   // plan acortado después podría dejarlo por encima).
   const gratuitos = Math.min(Math.max(0, Number(plan?.cantidad_mantenimientos_gratuitos || 0)), meses);
-  const facturables = Math.max(0, meses - gratuitos);
+  const conMantenimiento = new Set([...(mesesConMant || [])].map(Number));
+  let conteoConMant = 0;
+  let facturables = 0;
+  for (let m = 1; m <= meses; m++) {
+    if (!conMantenimiento.has(m)) continue;
+    conteoConMant += 1;
+    if (m > gratuitos) facturables += 1;
+  }
   const mensual = round2(plan?.monto_mensual || 0);
   return {
     meses,
+    meses_con_mantenimiento: conteoConMant,
     meses_gratuitos: gratuitos,
     meses_facturables: facturables,
     monto_mensual: mensual,
     total: round2(mensual * facturables),
     moneda: plan?.moneda || null
   };
+}
+
+/**
+ * Meses del plan (1-based) en que cae al menos un mantenimiento: los que se
+ * cobran. Salen del cronograma real; si el plan todavía no lo tiene (planes
+ * antiguos sin backfill), de la serie teórica de sus ascensores, para que su
+ * total no quede en cero.
+ *
+ * @param {object} plan  Con fecha_inicio, duracion_meses, tipo_plan, frecuencia
+ *                       y frecuencia_dias_custom (la del plan, por defecto).
+ * @param {Array<{numero_mes:number}>} visitas  Filas de su cronograma.
+ * @param {Array} filasJunction  Ascensores del plan con su frecuencia; solo se
+ *                               usan si no hay cronograma.
+ * @returns {Set<number>}
+ */
+function mesesConMantenimiento(plan, visitas, filasJunction) {
+  if (visitas && visitas.length > 0) {
+    return new Set(visitas.map(v => Number(v.numero_mes)).filter(Number.isInteger));
+  }
+  if (plan?.tipo_plan === 'eventual') return new Set([1]);
+  const ascensores = (filasJunction || [])
+    .map(f => ({ id_ascensor: f.id_ascensor, ...frecuenciaDeAscensor(f, plan) }))
+    .filter(a => a.frecuencia);
+  try {
+    const serie = programacionDelPlan({
+      fechaInicioYMD: ymdDeFecha(plan.fecha_inicio),
+      duracionMeses: Number(plan.duracion_meses || 0),
+      ascensores
+    });
+    return new Set(serie.map(v => v.numero_mes));
+  } catch {
+    // Frecuencia inválida en datos antiguos: sin serie no hay meses que cobrar.
+    return new Set();
+  }
 }
 
 /**
@@ -231,8 +287,10 @@ async function liberarVisitasDeServicio(client, idServicio, userId) {
  *
  * Por cada mes devuelve el detalle de visitas (qué ascensor, cuántas veces y en
  * qué fechas), el avance de ejecución, la cuota asociada del cobro único del
- * plan y el estado del periodo. El importe del mes es `plan.monto_mensual`,
- * invariable: omitir visitas o ejecutar de menos NO lo cambia.
+ * plan y el estado del periodo. El importe de un mes con mantenimiento es
+ * `plan.monto_mensual`: omitir visitas o ejecutar de menos NO lo cambia. Un mes
+ * sin mantenimiento programado (p. ej. los intermedios de un plan trimestral)
+ * va en 0 y no se aprueba.
  *
  * Estados: pendiente → completo → aprobado → facturado → pagado.
  *
@@ -244,6 +302,7 @@ async function mesesDelPlan(client, idPlan) {
     where: { id: Number(idPlan) },
     select: {
       id: true, fecha_inicio: true, duracion_meses: true, tipo_plan: true,
+      frecuencia: true, frecuencia_dias_custom: true,
       monto_mensual: true, moneda: true, cantidad_mantenimientos_gratuitos: true,
       cobro: { select: { id: true } }
     }
@@ -285,9 +344,17 @@ async function mesesDelPlan(client, idPlan) {
   const montoMensual = round2(plan.monto_mensual || 0);
   const cupoGratuito = Number(plan.cantidad_mantenimientos_gratuitos || 0);
 
+  // Meses que se cobran: los que tienen algún mantenimiento programado. Sin
+  // cronograma (plan antiguo), los de la serie teórica de sus ascensores.
+  const filasJunction = visitas.length > 0 ? [] : await client.tbl_mantenimientos_planes_ascensores.findMany({
+    where: { id_plan: Number(idPlan), estado: 1 },
+    select: { id_ascensor: true, frecuencia: true, frecuencia_dias_custom: true }
+  });
+  const mesesCobrables = mesesConMantenimiento(plan, visitas, filasJunction);
+
   // Meses con visitas + los declarados por la duración: un mes sin visitas
-  // (todas omitidas, o frecuencias que no caen ahí) sigue siendo un mes del
-  // contrato y se factura igual.
+  // sigue siendo un mes del contrato y se lista, pero solo se cobra si tiene
+  // algún mantenimiento programado (una visita omitida no le quita el cobro).
   const numerosMes = new Set(visitas.map(v => v.numero_mes));
   for (let m = 1; m <= duracion; m++) numerosMes.add(m);
 
@@ -336,6 +403,7 @@ async function mesesDelPlan(client, idPlan) {
     const realizadas = detalle.reduce((a, d) => a + d.realizadas, 0);
     const completo = total_visitas > 0 && realizadas === total_visitas;
     const es_gratuito = numeroMes <= cupoGratuito;
+    const con_mantenimiento = mesesCobrables.has(numeroMes);
 
     const cuota = cuotas.find(c => c.numero_mes === numeroMes) || null;
     let estado_periodo = completo ? 'completo' : 'pendiente';
@@ -359,7 +427,8 @@ async function mesesDelPlan(client, idPlan) {
       realizadas,
       completo,
       es_gratuito,
-      monto: es_gratuito ? 0 : montoMensual,
+      con_mantenimiento,
+      monto: es_gratuito || !con_mantenimiento ? 0 : montoMensual,
       moneda: plan.moneda,
       cuota: cuota
         ? {
@@ -388,7 +457,7 @@ async function mesesDelPlan(client, idPlan) {
       cantidad_mantenimientos_gratuitos: cupoGratuito,
       tipo_plan: plan.tipo_plan,
       moneda: plan.moneda
-    }),
+    }, mesesCobrables),
     meses
   };
 }
@@ -466,6 +535,7 @@ module.exports = {
   round2,
   etiquetaMes,
   totalesDelPlan,
+  mesesConMantenimiento,
   frecuenciaDeAscensor,
   tituloBasePlan,
   eventoDeVisita,

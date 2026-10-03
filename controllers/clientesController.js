@@ -5,7 +5,7 @@ const { paginar } = require('../utils/paginacion');
 const configuracion = require('../utils/configuracion');
 const { parseYMDLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
 const {
-  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, areasPorContrato
+  CAMPOS_CONTRATO_AREA, ETIQUETA_AREA, AREAS_CLIENTE, areasPorContrato, areasDelCliente
 } = require('../utils/catalogosClientes');
 const { resolverClasificacion } = require('../utils/clasificacionesCliente');
 const {
@@ -15,6 +15,7 @@ const {
 } = require('../utils/alcanceUsuario');
 const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
 const { bajaClienteCascadaEnTx, calcularImpactoCliente } = require('../utils/bajaClienteCascada');
+const { whereAscensorVisible } = require('../utils/eliminacionAscensor');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { whereEstadoDesdeFiltro } = require('../utils/filtroEstadoRegistro');
 const { veTodoPorEdificio } = require('../utils/visibilidadEdificio');
@@ -122,14 +123,15 @@ const INCLUDE_EDIFICIOS = {
 
 // Igual que INCLUDE_EDIFICIOS pero sin filtrar por estado: la vista 360 es el
 // único lugar donde se ven los edificios y ascensores dados de baja, para poder
-// reactivarlos. Los activos van primero (tanto edificios como ascensores).
-const INCLUDE_EDIFICIOS_360 = {
+// reactivarlos. Los activos van primero (tanto edificios como ascensores). Los
+// ascensores ELIMINADOS solo los ve el Super Admin.
+const includeEdificios360 = (user) => ({
   orderBy: [{ estado: 'desc' }, { id: 'desc' }],
   include: {
-    ascensores: { orderBy: [{ estado: 'desc' }, { id: 'asc' }] },
+    ascensores: { where: whereAscensorVisible(user), orderBy: [{ estado: 'desc' }, { id: 'asc' }] },
     _count: { select: { ascensores: true } }
   }
-};
+});
 
 /**
  * Condición Prisma sobre tbl_ascensores para el buscador libre de clientes.
@@ -178,7 +180,7 @@ const matchEdificioBusqueda = (q) => ({
  *   estado_contrato  — vigente | por_vencer | vencido | sin_contrato (sin fechas
  *                      ni documento de contrato en ninguna área visible)
  *   con_contrato     — '1' | '0' filtra si tiene archivo de contrato adjunto
- *   area_contrato    — servicio | proyecto: área del cliente (la de su contrato)
+ *   area_contrato    — servicio | proyecto: área del cliente (la elegida al registrarlo)
  *
  * `user` aplica el ámbito (Servicios/Proyectos): si el rol está acotado, solo
  * devuelve los clientes de su(s) área(s) (ver clienteAlcanceWhere).
@@ -241,11 +243,16 @@ async function construirWhereClientes(query, user) {
   if (con_contrato === '1') pushAnd({ OR: areasContrato.map(a => ({ [colArch(a)]: { not: null } })) });
   else if (con_contrato === '0') pushAnd({ AND: areasContrato.map(a => ({ [colArch(a)]: null })) });
 
-  // Área del cliente: la que tiene contrato registrado (inicio y fin), el mismo
-  // criterio que exige el alta y que usa el ámbito. Un cliente es de una sola
-  // área; los antiguos que registraban las dos aparecen en ambos filtros.
+  // Área del cliente: la elegida al registrarlo, tenga o no contrato (mismo
+  // criterio que el ámbito). Un cliente es de una sola área; los antiguos con
+  // contrato en las dos aparecen en ambos filtros.
   if (AREAS_CLIENTE.includes(area_contrato)) {
-    pushAnd({ [colInicio(area_contrato)]: { not: null }, [colFin(area_contrato)]: { not: null } });
+    pushAnd({
+      OR: [
+        { area: area_contrato },
+        { [colInicio(area_contrato)]: { not: null }, [colFin(area_contrato)]: { not: null } }
+      ]
+    });
   }
 
   // Ámbito del usuario: limita a clientes de su(s) área(s). Se agrega como una
@@ -449,7 +456,7 @@ const vista360 = async (req, res) => {
     const cliente = await prisma.tbl_clientes.findFirst({
       where: { id, ...clienteAlcanceWhere(req.user) },
       include: {
-        edificios: INCLUDE_EDIFICIOS_360,
+        edificios: includeEdificios360(req.user),
         archivos: includeArchivos(req.user),
         ...INCLUDE_CONTRATOS,
         contratos_historial: includeContratosHistorial(req.user),
@@ -554,16 +561,22 @@ const INCLUDE_CONTRATOS = {
 };
 
 /**
- * Resuelve y valida el contrato de servicio POR ÁREA (Servicios / Proyectos).
- * Reglas: si un área trae una fecha, debe traer ambas (y fin >= inicio); el
- * cliente debe quedar con contrato completo en UNA sola área: es de Servicios o
- * de Proyectos, no de ambas. Respeta el ámbito: un usuario acotado solo
- * modifica sus áreas (las demás conservan lo previo). `previo` = el cliente
- * actual (o {} al crear). Devuelve { ok, error?, valores }.
+ * Resuelve y valida el ÁREA del cliente y su contrato POR ÁREA.
+ *
+ * Área: la elegida al inicio del formulario (`data.area`): Servicios o
+ * Proyectos, nunca las dos. Obligatoria al crear; al editar, si no llega se
+ * conserva la actual. Un usuario acotado solo puede elegir la suya, y no decide
+ * el área de un cliente que también es de la otra.
+ *
+ * Contrato: OPCIONAL, el cliente puede registrarse sin fechas ni documento. Si
+ * un área trae una fecha, debe traer ambas (y fin >= inicio), y el contrato va
+ * en el área del cliente. Respeta el ámbito: un usuario acotado solo modifica
+ * sus áreas (las demás conservan lo previo).
+ *
+ * `previo` = el cliente actual (o {} al crear). Devuelve { ok, error?, area, valores }.
  */
-function resolverContratosPorArea(data, previo, user) {
+function resolverAreaYContratos(data, previo, user) {
   const valores = {};
-  const completos = {};
   for (const area of AREAS_CLIENTE) {
     const c = CAMPOS_CONTRATO_AREA[area];
     const gestiona = !user || puedeVerTipoRegistro(user, area);
@@ -595,25 +608,39 @@ function resolverContratosPorArea(data, previo, user) {
     valores[c.inicio] = inicio;
     valores[c.fin] = fin;
     valores[c.archivo] = archivo;
-    completos[area] = !!(inicio && fin);
   }
-  const areas = AREAS_CLIENTE.filter(a => completos[a]);
-  if (areas.length === 0) {
-    return { ok: false, error: 'Registre el contrato (inicio y fin) del área del cliente: Servicios o Proyectos' };
+
+  let area = previo.area ?? null;
+  if (data.area !== undefined && data.area !== null && data.area !== '') {
+    const elegida = String(data.area);
+    if (!AREAS_CLIENTE.includes(elegida)) return { ok: false, error: 'Área del cliente inválida' };
+    if (user && !puedeVerTipoRegistro(user, elegida)) {
+      return { ok: false, error: `No tiene acceso al Área de ${ETIQUETA_AREA[elegida]}` };
+    }
+    // Un usuario acotado no cambia el área de un cliente que también es de la
+    // otra (lo ve por su actividad, o es antiguo con contrato en las dos): esa
+    // decisión no le corresponde, pero sí puede seguir editando sus datos.
+    const decide = !user || areasDelCliente(previo).every(a => puedeVerTipoRegistro(user, a));
+    if (decide) area = elegida;
   }
-  // Las dos áreas solo se toleran en un cliente que YA las tenía (de cuando
-  // existía la opción «Ambas»): un usuario acotado a una no puede quitar la otra
-  // y debe poder seguir editándolo. Nunca se llega a ese estado desde una sola.
-  const areasPrevias = areasPorContrato(previo);
-  if (areas.length > 1 && areasPrevias.length < AREAS_CLIENTE.length) {
-    return {
-      ok: false,
-      error: areasPrevias.length
-        ? `Este cliente ya es del Área de ${ETIQUETA_AREA[areasPrevias[0]]}: un cliente pertenece a una sola área (Servicios o Proyectos)`
-        : 'Un cliente se registra en una sola área: Servicios o Proyectos'
-    };
+
+  const conContrato = areasPorContrato(valores);
+  const conContratoPrevio = areasPorContrato(previo);
+  if (!area) {
+    // Compatibilidad: sin área elegida, la de su contrato si es una sola. Sin
+    // área solo se tolera un cliente antiguo que ya tenía contrato en las dos.
+    if (conContrato.length === 1) area = conContrato[0];
+    else if (!(conContrato.length > 1 && conContratoPrevio.length > 1)) {
+      return { ok: false, error: 'Elige el área del cliente: Servicios o Proyectos' };
+    }
   }
-  return { ok: true, valores };
+  // El contrato va en el área del cliente. Uno en la otra área solo se tolera
+  // si YA estaba (cliente antiguo, de cuando existía la opción «Ambas»): un
+  // usuario acotado a una no puede quitar el de la otra.
+  if (area && conContrato.some(a => a !== area && !conContratoPrevio.includes(a))) {
+    return { ok: false, error: `El contrato se registra en el área del cliente: Área de ${ETIQUETA_AREA[area]}` };
+  }
+  return { ok: true, area, valores };
 }
 
 const crear = async (req, res) => {
@@ -622,12 +649,12 @@ const crear = async (req, res) => {
     if (!data.nombre) {
       return res.status(400).json({ error: 'La razón social / nombre es obligatorio' });
     }
-    const contratos = resolverContratosPorArea(data, {}, req.user);
+    const contratos = resolverAreaYContratos(data, {}, req.user);
     if (!contratos.ok) return res.status(400).json({ error: contratos.error });
-    // La clasificación debe aplicar al área (o áreas) con que se registra el
-    // cliente: hay clasificaciones solo de Servicios y otras solo de Proyectos.
+    // La clasificación debe aplicar al área con que se registra el cliente: hay
+    // clasificaciones solo de Servicios y otras solo de Proyectos.
     const clasif = await resolverClasificacion(prisma, data.clasificacion, {
-      areasCliente: areasPorContrato(contratos.valores)
+      areasCliente: [contratos.area]
     });
     if (!clasif.ok) return res.status(400).json({ error: clasif.error });
     if (data.numero_documento) {
@@ -654,6 +681,7 @@ const crear = async (req, res) => {
           correo: trimOrNull(data.correo),
           ...contactos,
           observaciones: data.observaciones || null,
+          area: contratos.area,
           ...contratos.valores,
           clasificacion: clasif.codigo,
           user_id_registration: req.user.id
@@ -705,7 +733,7 @@ const actualizar = async (req, res) => {
       }
     }
 
-    const contratos = resolverContratosPorArea(data, previo, req.user);
+    const contratos = resolverAreaYContratos(data, previo, req.user);
     if (!contratos.ok) return res.status(400).json({ error: contratos.error });
 
     // Solo se valida si cambia: conservar la clasificación actual nunca falla,
@@ -713,7 +741,7 @@ const actualizar = async (req, res) => {
     const clasif = Object.prototype.hasOwnProperty.call(data, 'clasificacion')
       ? await resolverClasificacion(prisma, data.clasificacion, {
         previo: previo.clasificacion,
-        areasCliente: areasPorContrato(contratos.valores)
+        areasCliente: areasDelCliente({ ...contratos.valores, area: contratos.area })
       })
       : { ok: true, codigo: previo.clasificacion };
     if (!clasif.ok) return res.status(400).json({ error: clasif.error });
@@ -726,12 +754,13 @@ const actualizar = async (req, res) => {
     // contrato y los adjuntos a la nueva área, y aquí la acompaña el historial de
     // contratos anteriores, que sigue siendo del mismo cliente.
     const areasNuevas = areasPorContrato(contratos.valores);
-    const areasQueDeja = areasPorContrato(previo).filter(a => !areasNuevas.includes(a));
+    const areasQueDeja = areasPorContrato(previo)
+      .filter(a => a !== contratos.area && !areasNuevas.includes(a));
     const cliente = await prisma.$transaction(async (tx) => {
-      if (areasNuevas.length === 1 && areasQueDeja.length > 0) {
+      if (contratos.area && areasQueDeja.length > 0) {
         await tx.tbl_clientes_contratos_historial.updateMany({
           where: { id_cliente: id, area: { in: areasQueDeja } },
-          data: { area: areasNuevas[0], user_id_modification: req.user.id, date_time_modification: new Date() }
+          data: { area: contratos.area, user_id_modification: req.user.id, date_time_modification: new Date() }
         });
       }
       await tx.tbl_clientes.update({
@@ -745,6 +774,7 @@ const actualizar = async (req, res) => {
           correo: data.correo ?? previo.correo,
           ...dataContactos,
           observaciones: data.observaciones ?? previo.observaciones,
+          area: contratos.area,
           ...contratos.valores,
           clasificacion: clasif.codigo,
           user_id_modification: req.user.id,
@@ -801,7 +831,7 @@ const registrarContrato = async (req, res) => {
     });
     if (!previo) return res.status(404).json({ error: 'Cliente no encontrado' });
     // Un cliente es de una sola área: el contrato nuevo se registra en la suya.
-    const areasPrevias = areasPorContrato(previo);
+    const areasPrevias = areasDelCliente(previo);
     if (areasPrevias.length > 0 && !areasPrevias.includes(area)) {
       return res.status(400).json({
         error: `Este cliente es del Área de ${ETIQUETA_AREA[areasPrevias[0]]}: el contrato nuevo se registra en esa área`
@@ -843,6 +873,8 @@ const registrarContrato = async (req, res) => {
       await tx.tbl_clientes.update({
         where: { id },
         data: {
+          // Un cliente antiguo sin área queda en la de su contrato.
+          ...(previo.area ? {} : { area }),
           [campos.inicio]: inicio,
           [campos.fin]: fin,
           [campos.archivo]: archivoNuevo,

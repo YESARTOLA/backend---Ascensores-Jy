@@ -10,16 +10,15 @@ const { paginar } = require('../utils/paginacion');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { esServicioEditable, esEmergenciaCerrada } = require('../utils/estadoServicio');
+const { ESTADO_EMERGENCIA_INICIAL } = require('../utils/estadoAtencion');
+const { whereFiltrosAtencion } = require('../utils/filtrosAtencion');
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { visibilidadPorAscensorWhere, aplicarVisibilidadWhere } = require('../utils/visibilidadEdificio');
 const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
-const { keyDesdeRuta, eliminarObjeto } = require('../utils/storage');
-const {
-  INCLUDE_ADJUNTOS, COUNT_ADJUNTOS, MAX_ADJUNTOS,
-  vincularAdjuntosEnTx, bajaAdjuntosEnTx, puedeGestionar
-} = require('../utils/adjuntosEmergencia');
+const adjuntos = require('../utils/adjuntosEmergencia');
+const { INCLUDE_ADJUNTOS, COUNT_ADJUNTOS, vincularAdjuntosEnTx, bajaAdjuntosEnTx } = adjuntos;
 const {
   sincronizarDiasYEventos,
   reprogramarConservandoForma,
@@ -90,6 +89,8 @@ const listar = async (req, res) => {
     const where = whereEmergenciasVisibles(req.user);
     if (estado_emergencia) where.estado_emergencia = estado_emergencia;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
+    // Técnico asignado e inicio de ejecución (rango), sobre el servicio vinculado.
+    conAlcance(where, whereFiltrosAtencion(req.query));
     // Buscador libre: edificio/obra, cliente, ascensor, distrito, motivo y código del servicio.
     if (q) where.OR = [
       { motivo: { contains: q, mode: 'insensitive' } },
@@ -232,7 +233,8 @@ const crear = async (req, res) => {
         id_ascensor: Number(d.id_ascensor),
         motivo: d.motivo,
         nivel_urgencia: d.nivel_urgencia || 'alta',
-        estado_emergencia: tecnicos.length > 0 ? 'En atención' : 'Reportada',
+        // Luego lo mantiene al día el servicio (utils/estadoAtencion.js).
+        estado_emergencia: ESTADO_EMERGENCIA_INICIAL,
         observaciones: d.observaciones || null,
         user_id_registration: req.user.id
       }
@@ -379,7 +381,7 @@ const actualizar = async (req, res) => {
           motivo: nuevoMotivo,
           nivel_urgencia: nuevoNivel,
           // `estado_emergencia` no se edita: lo deriva el servicio que atiende la
-          // emergencia (ver sincronizarEstadoEmergencia en utils/estadoServicio.js).
+          // emergencia (ver sincronizarEstadoAtencion en utils/estadoServicio.js).
           observaciones: d.observaciones ?? previo.observaciones,
           user_id_modification: req.user.id, date_time_modification: new Date()
         }
@@ -552,86 +554,7 @@ async function emergenciaVisible(user, id) {
   return prisma.tbl_emergencias.findFirst({ where: { ...where, id }, select: { id: true } });
 }
 
-const listarArchivos = async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!await emergenciaVisible(req.user, id)) {
-      return res.status(404).json({ error: 'Emergencia no encontrada' });
-    }
-    const archivos = await prisma.tbl_emergencias_archivos.findMany({
-      ...INCLUDE_ADJUNTOS,
-      where: { ...INCLUDE_ADJUNTOS.where, id_emergencia: id }
-    });
-    res.json({ data: archivos, meta: { max: MAX_ADJUNTOS, puede_gestionar: puedeGestionar(req.user) } });
-  } catch (err) {
-    console.error('[emergencias.listarArchivos]', err);
-    res.status(500).json({ error: 'Error al listar los adjuntos' });
-  }
-};
-
-const agregarArchivos = async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!await emergenciaVisible(req.user, id)) {
-      return res.status(404).json({ error: 'Emergencia no encontrada' });
-    }
-    const creados = await vincularAdjuntosEnTx(prisma, id, req.body?.archivos, req.user.id);
-    if (creados === 0) return res.status(400).json({ error: 'No se recibió ningún archivo válido' });
-
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_emergencias_archivos', id_entidad: id,
-      accion: 'CREATE', valor_nuevo: { id_emergencia: id, adjuntos: creados }, ip: req.ip
-    });
-
-    const archivos = await prisma.tbl_emergencias_archivos.findMany({
-      ...INCLUDE_ADJUNTOS,
-      where: { ...INCLUDE_ADJUNTOS.where, id_emergencia: id }
-    });
-    res.status(201).json({ data: archivos });
-  } catch (err) {
-    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
-    console.error('[emergencias.agregarArchivos]', err);
-    res.status(500).json({ error: 'Error al adjuntar archivos' });
-  }
-};
-
-const eliminarArchivo = async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const idVinculo = Number(req.params.idVinculo);
-    if (!await emergenciaVisible(req.user, id)) {
-      return res.status(404).json({ error: 'Emergencia no encontrada' });
-    }
-    const vinculo = await prisma.tbl_emergencias_archivos.findFirst({
-      where: { id: idVinculo, id_emergencia: id, estado: 1 },
-      include: { archivo: { select: { id: true, ruta_almacenamiento: true } } }
-    });
-    if (!vinculo) return res.status(404).json({ error: 'Adjunto no encontrado' });
-
-    const marca = { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() };
-    await prisma.$transaction(async (tx) => {
-      await tx.tbl_emergencias_archivos.update({ where: { id: idVinculo }, data: marca });
-      await tx.tbl_archivos.updateMany({ where: { id: vinculo.id_archivo, estado: 1 }, data: marca });
-    });
-
-    // Purga del bucket tras el commit: si falla, el registro ya quedó dado de
-    // baja y el objeto se limpia después — nunca al revés.
-    const key = vinculo.archivo?.ruta_almacenamiento ? keyDesdeRuta(vinculo.archivo.ruta_almacenamiento) : null;
-    if (key) {
-      try { await eliminarObjeto(key); }
-      catch (e) { console.warn('[emergencias.eliminarArchivo] no se pudo borrar del bucket:', e.message); }
-    }
-
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_emergencias_archivos', id_entidad: idVinculo,
-      accion: 'DELETE', valor_anterior: vinculo, ip: req.ip
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('[emergencias.eliminarArchivo]', err);
-    res.status(500).json({ error: 'Error al eliminar el adjunto' });
-  }
-};
+const { listarArchivos, agregarArchivos, eliminarArchivo } = adjuntos.handlers({ registroVisible: emergenciaVisible });
 
 module.exports = {
   listar, obtener, crear, actualizar, eliminar,

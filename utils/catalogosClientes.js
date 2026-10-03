@@ -16,9 +16,9 @@
  *
  * Es la SSoT del mapeo área → columnas: la usan el controlador (validar y
  * guardar los contratos) y utils/alcanceUsuario.js (decidir qué clientes ve
- * cada usuario según su ámbito). Como al crear un cliente es obligatorio
- * registrar el contrato de su área (una sola: Servicios o Proyectos), estas
- * columnas son la marca explícita de a qué área pertenece cada cliente.
+ * cada usuario según su ámbito). El área del cliente vive en su propia columna
+ * (`tbl_clientes.area`) porque el contrato es opcional; si lo tiene, va en esas
+ * columnas de su área.
  */
 const CAMPOS_CONTRATO_AREA = {
   servicio: { inicio: 'contrato_servicio_inicio', fin: 'contrato_servicio_fin', archivo: 'id_archivo_contrato_servicio' },
@@ -36,13 +36,9 @@ const AREAS_CLIENTE = Object.keys(CAMPOS_CONTRATO_AREA);
 const AREA_AMBAS = 'ambos';
 
 /**
- * Áreas a las que pertenece un cliente POR CONTRATO: aquellas con inicio y fin
- * registrados. Es la marca EXPLÍCITA del área y existe desde que se crea el
- * cliente, antes de que tenga ningún servicio o proyecto.
- *
- * Espejo en JS de la primera condición de `clienteAlcanceWhere`
- * (utils/alcanceUsuario.js): lo que allí se consulta en SQL, aquí se evalúa
- * sobre una fila ya cargada. El cliente debe traer las columnas de contrato.
+ * Áreas en las que el cliente tiene contrato registrado (inicio y fin). Lo
+ * normal es una o ninguna (el contrato es opcional); dos solo en clientes
+ * antiguos, de cuando existía la opción «Ambas».
  *
  * @param {object} cliente fila de tbl_clientes (o un select con esas columnas)
  * @returns {string[]} subconjunto de AREAS_CLIENTE
@@ -55,13 +51,35 @@ function areasPorContrato(cliente) {
   });
 }
 
-/** Columnas de contrato que necesita `areasPorContrato`, como `select` de Prisma. */
-const SELECT_CONTRATO_AREAS = Object.fromEntries(
-  AREAS_CLIENTE.flatMap(area => {
-    const campos = CAMPOS_CONTRATO_AREA[area];
-    return [[campos.inicio, true], [campos.fin, true]];
-  })
-);
+/**
+ * Áreas a las que pertenece un cliente: la elegida al registrarlo
+ * (`tbl_clientes.area`) más la de su contrato, que coinciden salvo en los
+ * clientes antiguos con contrato en las dos áreas (sin área elegida aún). Existe
+ * desde que se crea el cliente, antes de que tenga ningún servicio o proyecto.
+ *
+ * Espejo en JS de las condiciones de área y de contrato de `clienteAlcanceWhere`
+ * (utils/alcanceUsuario.js): lo que allí se consulta en SQL, aquí se evalúa
+ * sobre una fila ya cargada (con SELECT_AREAS_CLIENTE).
+ *
+ * @param {object} cliente fila de tbl_clientes (o un select con esas columnas)
+ * @returns {string[]} subconjunto de AREAS_CLIENTE
+ */
+function areasDelCliente(cliente) {
+  if (!cliente) return [];
+  const porContrato = areasPorContrato(cliente);
+  return AREAS_CLIENTE.filter(area => area === cliente.area || porContrato.includes(area));
+}
+
+/** Columnas que necesita `areasDelCliente`, como `select` de Prisma. */
+const SELECT_AREAS_CLIENTE = {
+  area: true,
+  ...Object.fromEntries(
+    AREAS_CLIENTE.flatMap(area => {
+      const campos = CAMPOS_CONTRATO_AREA[area];
+      return [[campos.inicio, true], [campos.fin, true]];
+    })
+  )
+};
 
 module.exports = {
   CAMPOS_CONTRATO_AREA,
@@ -69,5 +87,6 @@ module.exports = {
   AREAS_CLIENTE,
   AREA_AMBAS,
   areasPorContrato,
-  SELECT_CONTRATO_AREAS
+  areasDelCliente,
+  SELECT_AREAS_CLIENTE
 };

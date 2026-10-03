@@ -4,9 +4,11 @@ const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, finDelDiaLima, parse
 const { COLORES } = require('../utils/recordatoriosAuto');
 const { paginarArray } = require('../utils/paginacion');
 const {
-  tiposRecordatorioPermitidos,
-  soloOperativosAsignados
-} = require('../utils/visibilidadCalendario');
+  whereRecordatoriosVisibles,
+  whereRecordatoriosEnviados,
+  relacionConRecordatorio
+} = require('../utils/visibilidadRecordatorios');
+const { mapaUsuariosPorId } = require('../utils/resolverUsuarios');
 const {
   puedeVerFinanzas, servicioSinPrecios, planMantenimientoSinFinanzas, omitir
 } = require('../utils/visibilidadFinanzas');
@@ -50,40 +52,33 @@ const includeRel = {
     }
   },
   cobro: { include: { cliente: true, servicio: true } },
-  cuota: true
+  cuota: true,
+  usuario_destino: { select: { id: true, nombres: true } }
 };
 
+// Quién ve qué vive en utils/visibilidadRecordatorios.js (compartido con el
+// Calendario). Aquí solo se elige la bandeja: la agenda propia o los
+// registrados para otra persona.
+function whereVisible(user, vista) {
+  return vista === 'enviados' ? whereRecordatoriosEnviados(user) : whereRecordatoriosVisibles(user);
+}
+
 /**
- * Construye el `where` de Prisma con los filtros de visibilidad para el usuario:
- * - Limita por `tipo` según la matriz VISIBILIDAD_POR_ROL.
- * - Si el rol solo ve operativos asignados (técnico), exige que el recordatorio
- *   tenga `id_servicio` con asignación activa al técnico, o `id_emergencia`
- *   cuyo servicio esté asignado al técnico.
+ * Valida el dueño elegido para un recordatorio manual. Devuelve el id o lanza
+ * un error con `status` 400 si no es un usuario activo.
  */
-function whereVisible(user) {
-  const tipos = tiposRecordatorioPermitidos(user.rol_codigo);
-  const clauses = [{ tipo: { in: tipos } }];
-  // Los recordatorios manuales son PRIVADOS: cada usuario ve únicamente los que
-  // él creó. Los demás tipos (auto: servicio, cobro, etc.) se comparten según
-  // la matriz de roles.
-  if (tipos.includes('manual')) {
-    clauses.push({ OR: [{ tipo: { not: 'manual' } }, { user_id_registration: user.id }] });
+async function resolverDestino(valor, user) {
+  if (valor === undefined || valor === null || valor === '') return user.id;
+  const id = Number(valor);
+  const destino = Number.isInteger(id)
+    ? await prisma.tbl_usuarios.findFirst({ where: { id, estado: 1 }, select: { id: true } })
+    : null;
+  if (!destino) {
+    const err = new Error('El usuario elegido no existe o está inactivo');
+    err.status = 400;
+    throw err;
   }
-  if (soloOperativosAsignados(user.rol_codigo)) {
-    const idTec = user.id_tecnico || -1;
-    clauses.push({
-      OR: [
-        { servicio:   { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } },
-        { emergencia: { servicio: { asignaciones: { some: { id_tecnico: idTec, estado: 1 } } } } }
-      ]
-    });
-  }
-  // Recordatorio DIRIGIDO a un rol (alerta de observación con destinatario
-  // elegido por el técnico): solo lo ve ese rol. Los que no llevan destinatario
-  // —todo el histórico y el resto de automatismos— se rigen como siempre por la
-  // matriz de tipos, así que este filtro no les cambia nada.
-  clauses.push({ OR: [{ rol_destinatario: null }, { rol_destinatario: user.rol_codigo }] });
-  return clauses.length === 1 ? clauses[0] : { AND: clauses };
+  return destino.id;
 }
 
 /**
@@ -99,11 +94,6 @@ function andWhere(base, extra) {
 }
 
 /**
- * Valida si el usuario puede operar sobre un recordatorio concreto. Espera que
- * el recordatorio haya sido cargado con el `includeRel` de arriba (en
- * particular las asignaciones del servicio y de la emergencia.servicio).
- */
-/**
  * True si el valor (string del input datetime-local o ISO) representa un
  * instante anterior al minuto actual. La fecha de un recordatorio no puede
  * quedar en el pasado, ni al crear ni al editar.
@@ -115,25 +105,19 @@ function fechaEnPasado(valor) {
   return fecha.getTime() < inicioDelMinutoActual().getTime();
 }
 
-function puedeAcceder(rec, user) {
-  const tipos = tiposRecordatorioPermitidos(user.rol_codigo);
-  if (!tipos.includes(rec.tipo)) return false;
-  // Un recordatorio manual solo lo puede ver/operar su creador (privado).
-  if (rec.tipo === 'manual' && rec.user_id_registration !== user.id) return false;
-  // Dirigido a un rol: no accesible ni por id desde otro rol (espejo del filtro
-  // de `whereVisible`, que si no se saltaría abriendo el recordatorio directo).
-  if (rec.rol_destinatario && rec.rol_destinatario !== user.rol_codigo) return false;
-  if (!soloOperativosAsignados(user.rol_codigo)) return true;
-  const idTec = user.id_tecnico;
-  if (!idTec) return false;
-  const enServicio = (rec.servicio?.asignaciones || []).some(a => a.id_tecnico === idTec && a.estado === 1);
-  const enEmergencia = (rec.emergencia?.servicio?.asignaciones || []).some(a => a.id_tecnico === idTec && a.estado === 1);
-  return enServicio || enEmergencia;
+// Añade el nombre de quien registró cada recordatorio (`user_id_registration`
+// no es una relación declarada, así que no se puede `include`).
+async function conAutor(list) {
+  const usuarios = await mapaUsuariosPorId(list.map(r => r.user_id_registration));
+  return list.map(r => {
+    const u = usuarios[r.user_id_registration];
+    return { ...r, registrado_por: u ? { id: u.id, nombres: u.nombres } : null };
+  });
 }
 
 const listar = async (req, res) => {
   try {
-    const { tipo, estado_recordatorio, prioridad, id_cliente, desde, hasta, q, origen } = req.query;
+    const { tipo, estado_recordatorio, prioridad, id_cliente, desde, hasta, q, origen, vista } = req.query;
     const filtros = { estado: 1 };
     if (tipo) filtros.tipo = tipo;
     if (estado_recordatorio) filtros.estado_recordatorio = estado_recordatorio;
@@ -154,12 +138,13 @@ const listar = async (req, res) => {
       ];
     }
 
-    const where = andWhere(filtros, whereVisible(req.user));
+    const where = andWhere(filtros, whereVisible(req.user, vista));
 
+    // El más reciente arriba: orden por fecha del recordatorio, descendente.
     let list = await prisma.tbl_recordatorios.findMany({
       where,
       include: includeRel,
-      orderBy: [{ fecha_recordatorio: 'asc' }, { id: 'desc' }],
+      orderBy: [{ fecha_recordatorio: 'desc' }, { id: 'desc' }],
       take: req.query.page ? undefined : 500
     });
 
@@ -171,13 +156,16 @@ const listar = async (req, res) => {
           r.servicio?.codigo, r.servicio?.cliente?.nombre,
           r.mantenimiento_plan?.cliente?.nombre,
           r.emergencia?.cliente?.nombre,
-          r.cobro?.cliente?.nombre
+          r.cobro?.cliente?.nombre,
+          r.usuario_destino?.nombres
         ].filter(Boolean).join(' ').toLowerCase();
         return haystack.includes(ql);
       });
     }
 
-    res.json(paginarArray(list.map(r => sanearRecordatorio(r, req.user)), req.query));
+    const resp = paginarArray(list.map(r => sanearRecordatorio(r, req.user)), req.query);
+    // Solo se hidrata el autor de lo que se devuelve (la página, no las 500 filas).
+    res.json({ ...resp, data: await conAutor(resp.data) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar recordatorios' });
@@ -191,8 +179,9 @@ const obtener = async (req, res) => {
       where: { id }, include: includeRel
     });
     if (!r || r.estado !== 1) return res.status(404).json({ error: 'Recordatorio no encontrado' });
-    if (!puedeAcceder(r, req.user)) return res.status(404).json({ error: 'Recordatorio no encontrado' });
-    res.json({ data: sanearRecordatorio(r, req.user) });
+    if (!relacionConRecordatorio(r, req.user)) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const [conNombre] = await conAutor([sanearRecordatorio(r, req.user)]);
+    res.json({ data: conNombre });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener recordatorio' });
@@ -209,6 +198,8 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'La fecha no puede ser anterior al momento actual' });
     }
     const tipo = d.tipo || 'manual';
+    // Dueño: quien lo registra, salvo que lo registre para otra persona.
+    const idDestino = await resolverDestino(d.id_usuario_destino, req.user);
     const r = await prisma.tbl_recordatorios.create({
       data: {
         titulo: d.titulo,
@@ -223,6 +214,7 @@ const crear = async (req, res) => {
         id_mantenimiento_plan: d.id_mantenimiento_plan ? Number(d.id_mantenimiento_plan) : null,
         id_emergencia: d.id_emergencia ? Number(d.id_emergencia) : null,
         id_cobro: d.id_cobro ? Number(d.id_cobro) : null,
+        id_usuario_destino: idDestino,
         user_id_registration: req.user.id
       },
       include: includeRel
@@ -233,26 +225,33 @@ const crear = async (req, res) => {
     });
     res.json({ data: r });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al crear recordatorio' });
   }
 };
 
-// Carga un recordatorio y valida acceso antes de mutarlo. Devuelve el registro
-// previo o null si el usuario no puede acceder (caller responde 404).
+// Carga un recordatorio y valida acceso antes de mutarlo. Devuelve
+// { previo, relacion } —relación del usuario con él: 'destinatario' | 'autor'—
+// o null si el usuario no puede acceder (caller responde 404).
 async function cargarSiAcceso(id, user) {
   const previo = await prisma.tbl_recordatorios.findUnique({ where: { id }, include: includeRel });
   if (!previo || previo.estado !== 1) return null;
-  if (!puedeAcceder(previo, user)) return null;
-  return previo;
+  const relacion = relacionConRecordatorio(previo, user);
+  return relacion ? { previo, relacion } : null;
 }
+
+// Atender, descartar, reactivar o leer un recordatorio con dueño le toca a su
+// dueño: quien se lo registró a otra persona no puede cerrárselo.
+const NO_ES_DESTINATARIO = 'Solo la persona a quien va dirigido el recordatorio puede cambiar su estado';
 
 const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const d = req.body;
-    const previo = await cargarSiAcceso(id, req.user);
-    if (!previo) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const acceso = await cargarSiAcceso(id, req.user);
+    if (!acceso) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const { previo } = acceso;
     if (d.fecha_recordatorio !== undefined && fechaEnPasado(d.fecha_recordatorio)) {
       return res.status(400).json({ error: 'La fecha no puede ser anterior al momento actual' });
     }
@@ -260,6 +259,10 @@ const actualizar = async (req, res) => {
     // El proceso vinculado solo se puede cambiar en recordatorios manuales; los
     // 'auto' derivan su vínculo del proceso que los generó y no debe tocarse.
     const puedeVincular = previo.origen === 'manual';
+    // En los manuales también se puede pasar el recordatorio a otra persona.
+    const idDestino = puedeVincular && d.id_usuario_destino !== undefined
+      ? await resolverDestino(d.id_usuario_destino, req.user)
+      : undefined;
 
     const r = await prisma.tbl_recordatorios.update({
       where: { id },
@@ -274,6 +277,7 @@ const actualizar = async (req, res) => {
         ...(puedeVincular && d.id_mantenimiento_plan !== undefined && { id_mantenimiento_plan: d.id_mantenimiento_plan ? Number(d.id_mantenimiento_plan) : null }),
         ...(puedeVincular && d.id_emergencia !== undefined && { id_emergencia: d.id_emergencia ? Number(d.id_emergencia) : null }),
         ...(puedeVincular && d.id_cobro !== undefined && { id_cobro: d.id_cobro ? Number(d.id_cobro) : null }),
+        ...(idDestino !== undefined && { id_usuario_destino: idDestino }),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       },
@@ -285,6 +289,7 @@ const actualizar = async (req, res) => {
     });
     res.json({ data: r });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al actualizar recordatorio' });
   }
@@ -293,8 +298,10 @@ const actualizar = async (req, res) => {
 const cambiarEstado = (nuevoEstado) => async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const previo = await cargarSiAcceso(id, req.user);
-    if (!previo) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const acceso = await cargarSiAcceso(id, req.user);
+    if (!acceso) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const { previo, relacion } = acceso;
+    if (relacion !== 'destinatario') return res.status(403).json({ error: NO_ES_DESTINATARIO });
     const r = await prisma.tbl_recordatorios.update({
       where: { id },
       data: {
@@ -321,8 +328,9 @@ const cambiarEstado = (nuevoEstado) => async (req, res) => {
 const eliminar = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const previo = await cargarSiAcceso(id, req.user);
-    if (!previo) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const acceso = await cargarSiAcceso(id, req.user);
+    if (!acceso) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const { previo } = acceso;
     if (previo.origen === 'auto') {
       return res.status(400).json({ error: 'Los recordatorios automáticos no se eliminan; descártalos en su lugar' });
     }
@@ -368,9 +376,11 @@ const contadores = async (req, res) => {
 const marcarLeido = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const previo = await cargarSiAcceso(id, req.user);
-    if (!previo) return res.status(404).json({ error: 'Recordatorio no encontrado' });
-    if (previo.fecha_lectura) return res.json({ data: previo });
+    const acceso = await cargarSiAcceso(id, req.user);
+    if (!acceso) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const { previo, relacion } = acceso;
+    // Abrirlo desde «Registrados para otros» no cuenta como lectura del dueño.
+    if (previo.fecha_lectura || relacion !== 'destinatario') return res.json({ data: previo });
     const r = await prisma.tbl_recordatorios.update({
       where: { id },
       data: {
@@ -417,15 +427,32 @@ const proximos = async (req, res) => {
       orderBy: { fecha_recordatorio: 'asc' },
       take: limite
     });
-    res.json({ data: list });
+    res.json({ data: list.map(r => sanearRecordatorio(r, req.user)) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener próximos' });
   }
 };
 
+// Personas a quienes se puede registrar un recordatorio: todos los usuarios
+// activos. Endpoint propio porque /usuarios/catalogo no está abierto a todos los
+// roles y cualquiera puede dejarle un recordatorio a otro.
+const destinatarios = async (_req, res) => {
+  try {
+    const list = await prisma.tbl_usuarios.findMany({
+      where: { estado: 1 },
+      select: { id: true, nombres: true, rol: { select: { codigo: true, nombre: true } } },
+      orderBy: { nombres: 'asc' }
+    });
+    res.json({ data: list });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al listar destinatarios' });
+  }
+};
+
 module.exports = {
-  listar, obtener, crear, actualizar, eliminar,
+  listar, obtener, crear, actualizar, eliminar, destinatarios,
   marcarAtendido: cambiarEstado('atendido'),
   marcarPendiente: cambiarEstado('pendiente'),
   descartar: cambiarEstado('descartado'),

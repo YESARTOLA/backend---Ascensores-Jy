@@ -23,10 +23,19 @@ const { idTecnicoFiltro } = require('../utils/visibilidadCalendario');
  * usuario no tiene ficha vinculada) para los que solo ven lo suyo.
  */
 
+/**
+ * Ficha de técnico vinculada a un USUARIO activo con rol Técnico. La plantilla
+ * también guarda fichas sin usuario o de personas con otro rol (arquitectas,
+ * administración…) que figuran en asignaciones; los filtros "Técnico" solo
+ * deben ofrecer a los técnicos de verdad.
+ */
+const WHERE_USUARIO_TECNICO = { usuario: { is: { estado: 1, rol: { is: { codigo: 'tecnico' } } } } };
+
 const listar = async (req, res) => {
   try {
-    const { q, estado_operativo } = req.query;
+    const { q, estado_operativo, solo_usuarios_tecnico } = req.query;
     const where = { estado: 1 };
+    if (solo_usuarios_tecnico === '1') Object.assign(where, WHERE_USUARIO_TECNICO);
     const idTec = idTecnicoFiltro(req.user);
     if (idTec !== null) where.id = idTec;
     if (q) where.OR = [

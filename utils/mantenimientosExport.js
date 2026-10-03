@@ -151,9 +151,10 @@ function _mapearFilaPrograma(i) {
 function _mapearFilaPlan(p) {
   // Un plan cubre N ascensores; el precio total es la suma de sus montos.
   const ascs = (p.ascensores || []).map(a => a.ascensor).filter(Boolean);
-  // El importe del plan es el monto MENSUAL global; el total descuenta los
-  // meses gratuitos (SSoT: utils/planMantenimientoMensual.totalesDelPlan).
-  const tot = totalesDelPlan(p);
+  // El importe del plan es el monto MENSUAL global, cobrado en los meses con
+  // mantenimiento fuera del cupo gratuito (SSoT:
+  // utils/planMantenimientoMensual.totalesDelPlan).
+  const tot = totalesDelPlan(p, p.meses_con_mantenimiento);
   const mensual = tot.monto_mensual;
   const meses = tot.meses;
   const moneda = p.moneda || (p.ascensores || [])[0]?.moneda || MONEDA_POR_DEFECTO;

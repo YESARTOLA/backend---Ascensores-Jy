@@ -94,6 +94,7 @@ model tbl_usuarios {
   leads_cotizaciones_subidas tbl_leads_cotizaciones[] @relation("LeadCotizacionRegistrador")
   leads_documentos_subidos   tbl_leads_archivos[]     @relation("LeadArchivoRegistrador")
   atenciones_responsable     tbl_atenciones_rapidas[] @relation("AtencionResponsable")
+  recordatorios_recibidos    tbl_recordatorios[]      @relation("RecordatorioDestino")
 }
 
 // ---------------------------------------------------------------------
@@ -118,10 +119,15 @@ model tbl_clientes {
   contacto_admin_correo        String?                            @db.VarChar(150)
   contacto_admin_telefono      String?                            @db.VarChar(30)
   observaciones                String?
+  // Área del cliente: 'servicio' | 'proyecto' (ver AREAS_CLIENTE). Es la que se
+  // elige al inicio del formulario y decide qué usuarios lo ven. Un cliente es de
+  // una sola área y puede registrarse sin contrato. NULL solo en clientes
+  // antiguos con contrato en las dos áreas, que aún deben elegir la suya.
+  area                         String?                            @db.VarChar(20)
   // Contrato de servicio por ÁREA: cada área (Servicios / Proyectos) tiene sus
-  // propias fechas de vigencia y su propio documento de contrato. Al crear/editar
-  // debe llenarse al menos un área. Los datos previos (área única) se migraron al
-  // área de Servicios.
+  // propias fechas de vigencia y su propio documento de contrato. Es opcional:
+  // si se registra, va en el área del cliente. Los datos previos (área única) se
+  // migraron al área de Servicios.
   contrato_servicio_inicio     DateTime?                          @db.Date
   contrato_servicio_fin        DateTime?                          @db.Date
   id_archivo_contrato_servicio Int?
@@ -300,6 +306,10 @@ model tbl_ascensores {
   cuarto_maquinas                  String?                                @db.VarChar(2)
   observaciones                    String?
   estado                           Int                                    @default(1)
+  // Distingue un ascensor ELIMINADO (baja en cascada, solo visible para el
+  // Super Admin) de uno INACTIVO: ambos tienen estado = 0. NULL = no eliminado.
+  // Ver utils/eliminacionAscensor.js.
+  fecha_eliminacion                DateTime?                              @db.Timestamptz(6)
   user_id_registration             Int?
   date_time_registration           DateTime?                              @default(now()) @db.Timestamptz(6)
   user_id_modification             Int?
@@ -338,6 +348,7 @@ model tbl_tecnicos {
   tipos_servicio         tbl_tipos_servicio_tecnicos[]
   guias                  tbl_servicios_guias[]
   evidencias             tbl_servicios_evidencias[]
+  planes_mantenimiento   tbl_mantenimientos_planes[]
 }
 
 // ---------------------------------------------------------------------
@@ -754,8 +765,9 @@ model tbl_mantenimientos_planes {
   id_cliente                        Int
   id_tipo_servicio                  Int
   tipo_plan                         String                                 @default("continuo") @db.VarChar(20)
-  // Frecuencia por DEFECTO del plan: la que se propone al añadir un ascensor.
-  // La autoridad real es la frecuencia de cada fila de la junction.
+  // Frecuencia de respaldo del plan, derivada de sus ascensores (la más
+  // repetida); no se elige en el formulario. La autoridad real es la frecuencia
+  // de cada fila de la junction; esta solo cubre filas antiguas sin la suya.
   frecuencia                        String?                                @db.VarChar(30)
   frecuencia_dias_custom            Int?
   // Meses que dura el plan. Junto con la frecuencia de cada ascensor determina
@@ -772,6 +784,10 @@ model tbl_mantenimientos_planes {
   moneda                            String                                 @default("PEN") @db.VarChar(10)
   fecha_inicio                      DateTime                               @db.Date
   hora_programada                   String?                                @db.VarChar(10)
+  // Técnico del plan: se asigna a todos sus servicios (los que se crean y los
+  // aún no iniciados). Cada servicio puede cambiarlo a mano y ese cambio se
+  // respeta (ver utils/tecnicoPlanMantenimiento.js).
+  id_tecnico                        Int?
   estado_plan                       String                                 @default("activo") @db.VarChar(30)
   observaciones                     String?
   estado                            Int                                    @default(1)
@@ -781,6 +797,7 @@ model tbl_mantenimientos_planes {
   date_time_modification            DateTime?                              @db.Timestamptz(6)
   cliente                           tbl_clientes                           @relation(fields: [id_cliente], references: [id])
   tipo_servicio                     tbl_tipos_servicio                     @relation(fields: [id_tipo_servicio], references: [id])
+  tecnico                           tbl_tecnicos?                          @relation(fields: [id_tecnico], references: [id])
   ascensores                        tbl_mantenimientos_planes_ascensores[]
   programacion                      tbl_mantenimientos_programacion[]
   eventos_calendario                tbl_calendario_eventos[]
@@ -870,7 +887,8 @@ model tbl_emergencias {
   motivo                 String
   nivel_urgencia         String                     @default("alta") @db.VarChar(20)
   fecha_reporte          DateTime                   @default(now()) @db.Timestamptz(6)
-  estado_emergencia      String                     @default("Reportada") @db.VarChar(30)
+  // En atención / Atendida / Cancelada: lo deriva el servicio (utils/estadoAtencion.js).
+  estado_emergencia      String                     @default("En atención") @db.VarChar(30)
   observaciones          String?
   estado                 Int                        @default(1)
   user_id_registration   Int?
@@ -935,7 +953,8 @@ model tbl_correctivos {
   falla                  String
   nivel_urgencia         String                   @default("media") @db.VarChar(20)
   fecha_reporte          DateTime                 @default(now()) @db.Timestamptz(6)
-  estado_correctivo      String                   @default("Reportado") @db.VarChar(30)
+  // En atención / Atendido / Cancelado: lo deriva el servicio (utils/estadoAtencion.js).
+  estado_correctivo      String                   @default("En atención") @db.VarChar(30)
   observaciones          String?
   estado                 Int                      @default(1)
   user_id_registration   Int?
@@ -945,6 +964,26 @@ model tbl_correctivos {
   servicio               tbl_servicios_proyectos? @relation(fields: [id_servicio], references: [id])
   cliente                tbl_clientes             @relation(fields: [id_cliente], references: [id])
   ascensor               tbl_ascensores           @relation(fields: [id_ascensor], references: [id])
+  archivos               tbl_correctivos_archivos[]
+}
+
+// Adjuntos de contexto del correctivo (fotos / videos / PDFs de la falla), igual
+// que tbl_emergencias_archivos. La lógica vive en utils/adjuntosRegistro.js.
+model tbl_correctivos_archivos {
+  id                     Int             @id @default(autoincrement())
+  id_correctivo          Int
+  id_archivo             Int
+  descripcion            String?         @db.VarChar(200)
+  orden                  Int             @default(0)
+  estado                 Int             @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?       @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?       @db.Timestamptz(6)
+  correctivo             tbl_correctivos @relation(fields: [id_correctivo], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos    @relation(fields: [id_archivo], references: [id])
+
+  @@index([id_correctivo])
 }
 
 model tbl_atenciones_rapidas {
@@ -1294,6 +1333,7 @@ model tbl_archivos {
   leads_documentos            tbl_leads_archivos[]
   cotizaciones_items          tbl_cotizaciones_items[]
   emergencias_archivos        tbl_emergencias_archivos[]
+  correctivos_archivos        tbl_correctivos_archivos[]
 }
 
 // ---------------------------------------------------------------------
@@ -1399,6 +1439,11 @@ model tbl_recordatorios {
   // concreto (alertas de observación con destinatario elegido). NULL = lo rige
   // solo la matriz por tipo de utils/visibilidadCalendario.js, como siempre.
   rol_destinatario       String?                    @db.VarChar(30)
+  // Usuario dueño del recordatorio manual: quien lo registró para sí mismo o la
+  // persona para quien lo registró. Solo él lo ve en su módulo, su campana y su
+  // calendario, sea cual sea su rol (ver utils/visibilidadRecordatorios.js).
+  // NULL en los automáticos, que se rigen por rol.
+  id_usuario_destino     Int?
   // Auditoría
   estado                 Int                        @default(1)
   user_id_registration   Int?
@@ -1411,6 +1456,7 @@ model tbl_recordatorios {
   emergencia             tbl_emergencias?           @relation(fields: [id_emergencia], references: [id], onDelete: SetNull)
   cobro                  tbl_cobros?                @relation(fields: [id_cobro], references: [id], onDelete: SetNull)
   cuota                  tbl_cobros_cuotas?         @relation(fields: [id_cuota], references: [id], onDelete: Cascade)
+  usuario_destino        tbl_usuarios?              @relation("RecordatorioDestino", fields: [id_usuario_destino], references: [id], onDelete: SetNull)
 
   @@index([fecha_recordatorio])
   @@index([estado_recordatorio, fecha_recordatorio])
@@ -1422,6 +1468,7 @@ model tbl_recordatorios {
   @@index([id_cuota])
 
   @@index([rol_destinatario])
+  @@index([id_usuario_destino])
 }
 
 // ---------------------------------------------------------------------

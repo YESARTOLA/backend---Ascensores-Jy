@@ -18,5 +18,9 @@ router.put('/:id', permitirRoles('super_admin', 'admin', 'coordinador'), c.actua
 // visibilidad financiera: el Coordinador no ve precios, así que tampoco los fija.
 router.put('/:id/precios', soloFinanzas, c.guardarPrecio);
 router.patch('/:id/estado', permitirRoles('super_admin', 'admin'), c.cambiarEstado);
+// Eliminar en cascada (más que marcar como Inactivo) y su vista previa:
+// exclusivo del Super Admin, igual que eliminar un edificio.
+router.get('/:id/impacto-eliminacion', permitirRoles('super_admin'), c.impactoEliminacion);
+router.delete('/:id', permitirRoles('super_admin'), c.eliminar);
 
 module.exports = router;

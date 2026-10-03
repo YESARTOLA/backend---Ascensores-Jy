@@ -85,13 +85,15 @@ function servicioAlcanceWhere(user) {
  * Fragmento Prisma para tbl_clientes: solo los clientes del/de los ámbito(s) del
  * usuario. Un cliente pertenece a un área si cumple CUALQUIERA de estas señales:
  *
- *   1. Tiene contrato de esa área (inicio y fin registrados). Es la marca
- *      explícita y la que existe desde el minuto uno: al crear un cliente es
- *      obligatorio registrar el contrato de su área (una sola: Servicios o
- *      Proyectos), y un usuario acotado solo puede llenar la suya. Así un
- *      cliente recién creado no desaparece de la lista de quien lo creó.
- *   2. Tiene al menos un servicio/proyecto de esa área. Cubre a los clientes con
- *      historial cuyo contrato quedó registrado solo en la otra área.
+ *   1. Es de esa área (`tbl_clientes.area`, la que se elige al registrarlo).
+ *      Es la marca explícita y existe desde el minuto uno, tenga o no contrato;
+ *      un usuario acotado solo puede elegir la suya. Así un cliente recién
+ *      creado no desaparece de la lista de quien lo creó.
+ *   2. Tiene contrato de esa área (inicio y fin registrados). Coincide con la
+ *      anterior salvo en los clientes antiguos con contrato en las dos áreas,
+ *      que aún no tienen área elegida.
+ *   3. Tiene al menos un servicio/proyecto de esa área. Cubre a los clientes con
+ *      historial en la otra área.
  *
  * Así, el usuario de Servicios no ve a los clientes de Proyectos ni al revés.
  * Solo un cliente con actividad en la otra área (o uno antiguo, de cuando
@@ -101,12 +103,13 @@ function servicioAlcanceWhere(user) {
 function clienteAlcanceWhere(user) {
   const tipos = tiposRegistroPermitidos(user);
   if (tipos === null) return {};
-  const condiciones = tipos.map(t => {
+  // Con `tipos` vacío estas condiciones usan el centinela y no devuelven nada,
+  // que es el resultado esperado para un usuario acotado que quedara sin ámbitos.
+  const condiciones = [{ area: inTipos(tipos) }];
+  for (const t of tipos) {
     const campos = CAMPOS_CONTRATO_AREA[t];
-    return { [campos.inicio]: { not: null }, [campos.fin]: { not: null } };
-  });
-  // Con `tipos` vacío esta condición usa el centinela y no devuelve nada, que es
-  // el resultado esperado para un usuario acotado que quedara sin ámbitos.
+    condiciones.push({ [campos.inicio]: { not: null }, [campos.fin]: { not: null } });
+  }
   condiciones.push({ servicios: { some: { estado: 1, tipo_registro: inTipos(tipos) } } });
   return { OR: condiciones };
 }

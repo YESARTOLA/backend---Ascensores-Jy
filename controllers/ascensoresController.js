@@ -5,6 +5,12 @@ const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, ymdLima } = require('../utils/tiempo');
 const { resolverClasificacion } = require('../utils/clasificacionesCliente');
 const { bajaAscensorCascadaEnTx } = require('../utils/bajaAscensorCascada');
+const {
+  whereAscensorVisible,
+  ascensorVisiblePara,
+  calcularImpactoAscensor,
+  eliminarAscensorCascadaEnTx
+} = require('../utils/eliminacionAscensor');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { MONEDAS_CODIGOS, MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { normalizarDatosSitio } = require('../utils/datosSitioAscensor');
@@ -125,6 +131,8 @@ function construirWhereAscensores(query, user) {
   conAlcance(where, ascensorAlcanceWhere(user));
   // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
   conAlcance(where, ascensorEdificioAlcanceWhere(user));
+  // Los eliminados solo los ve el Super Admin (los inactivos, todos).
+  conAlcance(where, whereAscensorVisible(user));
   return where;
 }
 
@@ -226,7 +234,7 @@ const obtener = async (req, res) => {
       where: { id },
       include: { edificio: { include: { cliente: true } }, precios: INCLUDE_PRECIOS }
     });
-    if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    if (!ascensorVisiblePara(ascensor, req.user)) return res.status(404).json({ error: 'Ascensor no encontrado' });
     res.json({ data: ascensorSinFinanzas(ascensor, req.user) });
   } catch (err) {
     console.error(err);
@@ -255,7 +263,10 @@ const historial = async (req, res) => {
           ascensores: { where: { estado: 1 }, include: { ascensor: { select: { id: true, codigo: true, ubicacion: true } } } },
           asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
           guias: { include: { archivo: true, tecnico: true } },
-          evidencias: { include: { archivo: true, tecnico: true } }
+          evidencias: { include: { archivo: true, tecnico: true } },
+          // La visita de un plan nace con precio_interno = 0: su importe es el
+          // monto mensual del plan. Sin esto la tabla la mostraba como S/ 0.00.
+          mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } }
         }
       }),
       prisma.tbl_emergencias.findMany({
@@ -269,7 +280,7 @@ const historial = async (req, res) => {
       }),
       prisma.tbl_ascensores_historial.findMany({ where: { id_ascensor: id }, orderBy: { fecha_evento: 'desc' }, take: 200 })
     ]);
-    if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    if (!ascensorVisiblePara(ascensor, req.user)) return res.status(404).json({ error: 'Ascensor no encontrado' });
 
     const idsServicios = servicios.map(s => s.id);
     const [entregas, facturas, guias, evidencias] = idsServicios.length === 0
@@ -401,7 +412,7 @@ const actualizar = async (req, res) => {
     const id = Number(req.params.id);
     const data = req.body;
     const previo = await prisma.tbl_ascensores.findUnique({ where: { id } });
-    if (!previo) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    if (!ascensorVisiblePara(previo, req.user)) return res.status(404).json({ error: 'Ascensor no encontrado' });
 
     if (data.codigo && data.codigo !== previo.codigo) {
       const dup = await prisma.tbl_ascensores.findUnique({ where: { codigo: data.codigo } });
@@ -455,6 +466,8 @@ const actualizar = async (req, res) => {
           // hace bajaAscensorCascadaEnTx, que necesita ver estado = 1 para actuar;
           // por eso aquí no se toca todavía. En los demás casos se alinea directo.
           estado: pasaAInactivo ? previo.estado : nuevoEstado,
+          // Volver a un estado operativo activo reactiva también a un eliminado.
+          ...(nuevoEstado === 1 ? { fecha_eliminacion: null } : {}),
           fecha_instalacion: data.fecha_instalacion ? parseYMDLima(data.fecha_instalacion) : previo.fecha_instalacion,
           proximo_mantenimiento: data.proximo_mantenimiento ? parseYMDLima(data.proximo_mantenimiento) : previo.proximo_mantenimiento,
           ...sitio.data,
@@ -570,7 +583,8 @@ const cambiarEstado = async (req, res) => {
       return res.status(400).json({ error: 'Estado inválido: use 0 (desactivar) o 1 (reactivar)' });
     }
     const previo = await prisma.tbl_ascensores.findUnique({ where: { id } });
-    if (!previo) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    // Un eliminado solo lo reactiva el Super Admin: para el resto no existe.
+    if (!ascensorVisiblePara(previo, req.user)) return res.status(404).json({ error: 'Ascensor no encontrado' });
 
     // Desactivar arrastra sus planes de mantenimiento (baja lógica, conservando
     // el historial ejecutado/cobrado). Reactivar solo reabre el ascensor: los
@@ -599,10 +613,12 @@ const cambiarEstado = async (req, res) => {
 
     // 'Inactivo' es el estado operativo que acompaña a la baja lógica: al
     // reactivar hay que sacarlo de ahí o quedaría activo y marcado Inactivo.
+    // Lo eliminado en cascada (servicios, cobros…) no vuelve: solo el ascensor.
     const ascensor = await prisma.tbl_ascensores.update({
       where: { id },
       data: {
         estado,
+        fecha_eliminacion: null,
         ...(previo.estado_operativo === 'Inactivo' ? { estado_operativo: 'Operativo' } : {}),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
@@ -627,4 +643,51 @@ const cambiarEstado = async (req, res) => {
   }
 };
 
-module.exports = { listar, exportar, obtener, historial, crear, actualizar, guardarPrecio, cambiarEstado };
+// Vista previa del impacto de eliminar: alimenta el modal de doble confirmación
+// con lo mismo que ejecuta la cascada. Solo lee.
+const impactoEliminacion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const ascensor = await prisma.tbl_ascensores.findUnique({
+      where: { id }, select: { id: true, codigo: true, estado: true }
+    });
+    if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    const impacto = await calcularImpactoAscensor(prisma, id);
+    res.json({ data: { ascensor, ...impacto } });
+  } catch (err) {
+    console.error('[ascensores.impactoEliminacion]', err);
+    res.status(500).json({ error: 'Error al calcular el impacto de la eliminación' });
+  }
+};
+
+// Eliminación en cascada (regla en utils/eliminacionAscensor.js). Distinta de
+// marcar como inactivo: se lleva también lo ya ejecutado o cobrado.
+const eliminar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = await prisma.tbl_ascensores.findUnique({ where: { id } });
+    if (!previo) return res.status(404).json({ error: 'Ascensor no encontrado' });
+    if (previo.fecha_eliminacion) return res.status(400).json({ error: 'El ascensor ya está eliminado' });
+
+    const { wasabiKeys, tecnicoIds, resumen } = await prisma.$transaction(
+      tx => eliminarAscensorCascadaEnTx(tx, id, req.user.id, req.ip),
+      { timeout: 30000 }
+    );
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_ascensores', id_entidad: id,
+      accion: 'DELETE', valor_anterior: previo, valor_nuevo: { estado: 0, impacto: resumen }, ip: req.ip
+    });
+    await purgarObjetosWasabi(wasabiKeys);
+    await liberarTecnicos(tecnicoIds, -1);
+    const ascensor = await prisma.tbl_ascensores.findUnique({ where: { id } });
+    res.json({ data: ascensor, impacto: resumen });
+  } catch (err) {
+    console.error('[ascensores.eliminar]', err);
+    res.status(500).json({ error: 'Error al eliminar el ascensor' });
+  }
+};
+
+module.exports = {
+  listar, exportar, obtener, historial, crear, actualizar, guardarPrecio, cambiarEstado,
+  impactoEliminacion, eliminar
+};

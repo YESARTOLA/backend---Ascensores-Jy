@@ -7,7 +7,8 @@
  *
  * Diferencias frente a Emergencias:
  *   - nivel_urgencia default = 'media' (no 'alta')
- *   - estado_correctivo default = 'Reportado'
+ *   - estado_correctivo: En atención / Atendido / Cancelado, derivado del
+ *     servicio igual que el de la emergencia (utils/estadoAtencion.js)
  *   - El tipo de servicio se busca/crea por categoría = 'Correctivo'
  *   - color del calendario = ámbar (#f59e0b)
  *   - La fecha programada se elige al crear (por defecto hoy) y admite una
@@ -35,6 +36,10 @@ const { resolverGratuidad } = require('../utils/gratuidadServicio');
 const { paginar } = require('../utils/paginacion');
 const { validarConsistenciaAsignaciones } = require('../utils/asignacionesValidaciones');
 const { esServicioEditable, esCorrectivoCerrado } = require('../utils/estadoServicio');
+const { ESTADO_CORRECTIVO_INICIAL } = require('../utils/estadoAtencion');
+const { whereFiltrosAtencion } = require('../utils/filtrosAtencion');
+const adjuntos = require('../utils/adjuntosCorrectivo');
+const { INCLUDE_ADJUNTOS, COUNT_ADJUNTOS, vincularAdjuntosEnTx, bajaAdjuntosEnTx } = adjuntos;
 const { whereServicioAsignadoSiTecnico } = require('../utils/visibilidadCalendario');
 const { subtipoPorDefectoDeModulo, clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { bajaServicioCascadaEnTx, purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
@@ -49,6 +54,22 @@ const { porAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuari
 
 const ROLES_PRECIO_COR = ['super_admin', 'admin', 'contabilidad'];
 
+/**
+ * Cláusula de visibilidad de correctivos para un usuario. Única fuente de verdad
+ * compartida por el listado y por los endpoints de adjuntos, para que un técnico
+ * no pueda alcanzar por una vía lo que el listado le oculta por la otra.
+ */
+function whereCorrectivosVisibles(user) {
+  const where = { estado: 1 };
+  const filtroServicio = whereServicioAsignadoSiTecnico(user);
+  if (filtroServicio) where.servicio = filtroServicio;
+  // Oculta a roles distintos de super_admin los correctivos de edificios inactivos.
+  aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(user));
+  // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
+  conAlcance(where, porAscensorEdificioWhere(user));
+  return where;
+}
+
 // Devuelve un correctivo por id con la misma forma que una fila del listado
 // (incluye servicio + ejecución). Lo consume el frontend para abrir el modal de
 // edición desde la página del servicio (ServicioDetalle → /correctivos?edit=ID).
@@ -60,6 +81,7 @@ const obtener = async (req, res) => {
       include: {
         cliente: true,
         ascensor: { include: { edificio: true } },
+        archivos: INCLUDE_ADJUNTOS,
         servicio: {
           include: {
             asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
@@ -86,10 +108,12 @@ const obtener = async (req, res) => {
 const listar = async (req, res) => {
   try {
     const { estado_correctivo, nivel_urgencia, id_cliente, q } = req.query;
-    const where = { estado: 1 };
+    const where = whereCorrectivosVisibles(req.user);
     if (estado_correctivo) where.estado_correctivo = estado_correctivo;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
     if (id_cliente) where.id_cliente = Number(id_cliente);
+    // Técnico asignado e inicio de ejecución (rango), sobre el servicio vinculado.
+    conAlcance(where, whereFiltrosAtencion(req.query));
     // Buscador libre: edificio/obra, cliente, ascensor, distrito, falla y código del servicio.
     if (q) where.OR = [
       { falla: { contains: q, mode: 'insensitive' } },
@@ -99,12 +123,6 @@ const listar = async (req, res) => {
       { ascensor: { edificio: { distrito: { contains: q, mode: 'insensitive' } } } },
       { servicio: { codigo: { contains: q, mode: 'insensitive' } } }
     ];
-    const filtroServicio = whereServicioAsignadoSiTecnico(req.user);
-    if (filtroServicio) where.servicio = filtroServicio;
-    // Oculta a roles distintos de super_admin los correctivos de edificios inactivos.
-    aplicarVisibilidadWhere(where, visibilidadPorAscensorWhere(req.user));
-    // Alcance por tipo de edificio (Administrador acotado a Edificios u Obras).
-    conAlcance(where, porAscensorEdificioWhere(req.user));
 
     const result = await paginar(
       prisma.tbl_correctivos,
@@ -114,6 +132,8 @@ const listar = async (req, res) => {
         include: {
           cliente: true,
           ascensor: { include: { edificio: true } },
+          // Solo el CONTADOR de adjuntos: el detalle se pide al abrir el modal.
+          _count: COUNT_ADJUNTOS,
           servicio: {
             include: {
               asignaciones: { include: { tecnico: true }, where: { estado: 1 } },
@@ -242,11 +262,16 @@ const crear = async (req, res) => {
         id_ascensor: Number(d.id_ascensor),
         falla: d.falla,
         nivel_urgencia: nivelUrgencia,
-        estado_correctivo: tecnicos.length > 0 ? 'En atención' : 'Reportado',
+        // Luego lo mantiene al día el servicio (utils/estadoAtencion.js).
+        estado_correctivo: ESTADO_CORRECTIVO_INICIAL,
         observaciones: d.observaciones || null,
         user_id_registration: req.user.id
       }
     });
+
+    // Adjuntos de contexto: el modal los sube a POST /archivos antes de guardar
+    // (el correctivo aún no existía) y manda aquí los ids resultantes.
+    await vincularAdjuntosEnTx(prisma, correctivo.id, d.archivos, req.user.id);
 
     // Grilla de días + un evento de calendario por día programado. Con un solo
     // día se conserva el comportamiento previo (evento único que puede
@@ -388,7 +413,8 @@ const actualizar = async (req, res) => {
           id_ascensor: nuevoIdAscensor,
           falla: nuevaFalla,
           nivel_urgencia: nuevoNivel,
-          estado_correctivo: d.estado_correctivo ?? previo.estado_correctivo,
+          // `estado_correctivo` no se edita: lo deriva el servicio que atiende el
+          // correctivo (ver sincronizarEstadoAtencion en utils/estadoServicio.js).
           observaciones: d.observaciones ?? previo.observaciones,
           user_id_modification: req.user.id,
           date_time_modification: new Date()
@@ -507,9 +533,14 @@ const eliminar = async (req, res) => {
         data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
       });
 
+      // Adjuntos de contexto: cuelgan del correctivo, no del servicio, así que la
+      // cascada de servicio no los alcanza. Sin esto quedarían huérfanos en el
+      // bucket.
+      wasabiKeys = await bajaAdjuntosEnTx(tx, id, req.user.id);
+
       if (idServicio) {
         const r = await bajaServicioCascadaEnTx(tx, idServicio, req.user.id);
-        wasabiKeys = r.wasabiKeys;
+        wasabiKeys = [...wasabiKeys, ...r.wasabiKeys];
         tecnicoIds = r.tecnicoIds;
       }
 
@@ -529,4 +560,23 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, crear, actualizar, eliminar };
+// ---------------------------------------------------------------------
+// ADJUNTOS DE CONTEXTO (fotos / videos de la falla)
+//
+// Igual que en Emergencias: LEER está abierto a cualquier rol que alcance el
+// correctivo —incluido el técnico, que es el destinatario— mientras que
+// ADJUNTAR y ELIMINAR quedan en los roles de gestión.
+// ---------------------------------------------------------------------
+
+/** Resuelve el correctivo con la MISMA visibilidad que el listado (null si no lo alcanza). */
+async function correctivoVisible(user, id) {
+  const where = whereCorrectivosVisibles(user);
+  return prisma.tbl_correctivos.findFirst({ where: { ...where, id }, select: { id: true } });
+}
+
+const { listarArchivos, agregarArchivos, eliminarArchivo } = adjuntos.handlers({ registroVisible: correctivoVisible });
+
+module.exports = {
+  listar, obtener, crear, actualizar, eliminar,
+  listarArchivos, agregarArchivos, eliminarArchivo
+};

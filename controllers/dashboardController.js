@@ -8,6 +8,7 @@ const {
 const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 const { whereElegibleContable } = require('../utils/elegibilidadContable');
 const { ESTADO_PLAN_ACTIVO } = require('../utils/estadoPlanMantenimiento');
+const { ESTADO_EMERGENCIA_INICIAL } = require('../utils/estadoAtencion');
 
 const resumen = async (req, res) => {
   try {
@@ -39,7 +40,7 @@ const resumen = async (req, res) => {
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'Asignado', estado: 1 } }),
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, estado_servicio: 'En curso', estado: 1 } }),
       prisma.tbl_servicios_proyectos.count({ where: { ...SOLO_SERVICIO, ...ESTADOS_FINALIZADO } }),
-      prisma.tbl_emergencias.count({ where: { estado_emergencia: { in: ['Reportada', 'En atención'] }, estado: 1 } }),
+      prisma.tbl_emergencias.count({ where: { estado_emergencia: ESTADO_EMERGENCIA_INICIAL, estado: 1 } }),
       prisma.tbl_tecnicos.count({ where: { estado_operativo: 'Disponible', estado: 1 } }),
       prisma.tbl_mantenimientos_planes.count({ where: { estado_plan: ESTADO_PLAN_ACTIVO, estado: 1 } }),
       prisma.tbl_leads.count({ where: { date_time_registration: { gte: inicioMes, lte: finMes }, estado: 1 } }),

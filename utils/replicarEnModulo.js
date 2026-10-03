@@ -25,8 +25,9 @@ const { parseYMDLima } = require('./tiempo');
 const { clasificarTipoServicio, MODULOS_VALIDOS } = require('./clasificacionServicio');
 const { ESTADO_PLAN_ACTIVO } = require('./estadoPlanMantenimiento');
 const { mesesParaVisitas } = require('./frecuenciaMantenimiento');
-const { generarProgramacion } = require('./planMantenimientoMensual');
+const { generarProgramacion, mesesConMantenimiento } = require('./planMantenimientoMensual');
 const { crearCobroInicial } = require('./crearCobroInicial');
+const { estadoEmergenciaDesdeServicio, estadoCorrectivoDesdeServicio } = require('./estadoAtencion');
 
 function nivelUrgencia(valor, defaultValor) {
   return ['alta', 'media', 'baja'].includes(valor) ? valor : defaultValor;
@@ -79,7 +80,7 @@ async function replicarEnModulo(tx, args) {
         id_ascensor: primerAscensor,
         motivo,
         nivel_urgencia: nivelUrgencia(d.nivel_urgencia, 'alta'),
-        estado_emergencia: 'Reportada',
+        estado_emergencia: estadoEmergenciaDesdeServicio(servicio),
         observaciones: obs,
         user_id_registration: usuarioId
       }
@@ -97,7 +98,7 @@ async function replicarEnModulo(tx, args) {
         id_ascensor: primerAscensor,
         falla,
         nivel_urgencia: nivelUrgencia(d.nivel_urgencia, 'media'),
-        estado_correctivo: 'Reportado',
+        estado_correctivo: estadoCorrectivoDesdeServicio(servicio),
         observaciones: obs,
         user_id_registration: usuarioId
       }
@@ -140,11 +141,18 @@ async function replicarEnModulo(tx, args) {
       user_id_registration: usuarioId
     }));
     // Monto mensual: el importe pactado por ocurrencia repartido sobre los
-    // meses del plan, de modo que el total del contrato no cambie.
+    // meses del plan QUE TIENEN MANTENIMIENTO —los únicos que se cobran (ver
+    // planMantenimientoMensual.totalesDelPlan)—, de modo que el total del
+    // contrato no cambie: trimestral × 4 a S/ 200 → S/ 200 en 4 meses = S/ 800.
     const sumaPorOcurrencia = filasAsc.reduce((acc, a) => acc + Number(a.monto || 0), 0);
+    const mesesCobrables = mesesConMantenimiento(
+      { tipo_plan: tipoPlan, fecha_inicio: fechaInicioPlan, duracion_meses: duracionMeses, frecuencia, frecuencia_dias_custom: frecDiasCustom },
+      [],
+      [{ id_ascensor: 0, frecuencia, frecuencia_dias_custom: frecDiasCustom }]
+    ).size || duracionMeses;
     const montoMensual = Number(d.monto_mensual) >= 0 && d.monto_mensual !== undefined && d.monto_mensual !== null && d.monto_mensual !== ''
       ? Math.round(Number(d.monto_mensual) * 100) / 100
-      : Math.round((sumaPorOcurrencia * (cantidadMant ?? duracionMeses) / duracionMeses) * 100) / 100;
+      : Math.round((sumaPorOcurrencia * (cantidadMant ?? mesesCobrables) / mesesCobrables) * 100) / 100;
     const monedaPlan = filasAsc[0]?.moneda || 'PEN';
 
     const plan = await tx.tbl_mantenimientos_planes.create({

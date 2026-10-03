@@ -58,6 +58,10 @@ function servicioSinPrecios(servicio) {
   if (Array.isArray(clon.ascensores)) {
     clon.ascensores = clon.ascensores.map(a => ({ ...a, monto: null }));
   }
+  // Plan que cubre la visita: su monto mensual es el precio pactado.
+  if (clon.mantenimiento_plan) {
+    clon.mantenimiento_plan = { ...clon.mantenimiento_plan, monto_mensual: null };
+  }
   return clon;
 }
 

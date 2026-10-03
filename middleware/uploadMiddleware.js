@@ -32,6 +32,7 @@ const TIPOS_VALIDOS = new Set([
   'leads',              // documentos libres del lead (tbl_leads_archivos)
   'observaciones',      // adjuntos de tbl_servicios_observaciones
   'emergencias',        // fotos/videos de contexto de tbl_emergencias_archivos
+  'correctivos',        // fotos/videos de contexto de tbl_correctivos_archivos
   'informes-servicio',  // PDFs auto-generados por checklist de finalización
   'documents'
 ]);

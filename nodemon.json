@@ -1,0 +1,5 @@
+{
+  "watch": ["index.js", "config", "controllers", "middleware", "models", "routes", "utils"],
+  "ext": "js,json",
+  "delay": 1500
+}

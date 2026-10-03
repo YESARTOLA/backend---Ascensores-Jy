@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { TIPOS_EDIFICIO, normalizarTipoEdificio } = require('../utils/catalogosEdificios');
 const { TIPO_REGISTRO } = require('../utils/clasificacionServicio');
-const { areasPorContrato, SELECT_CONTRATO_AREAS } = require('../utils/catalogosClientes');
+const { areasDelCliente, SELECT_AREAS_CLIENTE } = require('../utils/catalogosClientes');
 const { bajaEdificioCascadaEnTx, calcularImpactoEdificio } = require('../utils/bajaEdificioCascada');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { whereEstadoDesdeFiltro } = require('../utils/filtroEstadoRegistro');
@@ -77,8 +77,8 @@ const listar = async (req, res) => {
       where,
       orderBy: { id: 'desc' },
       include: {
-        // Las columnas de contrato alimentan el área heredada del cliente.
-        cliente: { select: { id: true, nombre: true, ...SELECT_CONTRATO_AREAS } },
+        // El área y las columnas de contrato alimentan el área heredada del cliente.
+        cliente: { select: { id: true, nombre: true, ...SELECT_AREAS_CLIENTE } },
         _count: { select: { ascensores: true } },
         ascensores: {
           where: { estado: 1 },
@@ -96,10 +96,10 @@ const listar = async (req, res) => {
     const data = filas.map(({ ascensores, ...edificio }) => {
       const tiposAscensores = [...new Set(ascensores.map(a => a.tipo).filter(Boolean))]
         .sort((a, b) => a.localeCompare(b, 'es'));
-      // Punto de partida: el área que el edificio HEREDA de su cliente, según
-      // los contratos registrados. La actividad de los ascensores solo puede
-      // añadir áreas, nunca quitarlas.
-      const areasCliente = areasPorContrato(edificio.cliente);
+      // Punto de partida: el área que el edificio HEREDA de su cliente (la
+      // elegida al registrarlo, o la de su contrato). La actividad de los
+      // ascensores solo puede añadir áreas, nunca quitarlas.
+      const areasCliente = areasDelCliente(edificio.cliente);
       let tieneServicios = areasCliente.includes(TIPO_REGISTRO.SERVICIO);
       let tieneProyectos = areasCliente.includes(TIPO_REGISTRO.PROYECTO);
       for (const a of ascensores) {
@@ -112,8 +112,8 @@ const listar = async (req, res) => {
       }
       return {
         ...edificio,
-        // El cliente sale como antes (id + nombre): las columnas de contrato se
-        // trajeron solo para derivar el área y no tienen por qué viajar.
+        // El cliente sale como antes (id + nombre): su área y sus columnas de
+        // contrato se trajeron solo para derivar el área y no tienen por qué viajar.
         cliente: edificio.cliente && { id: edificio.cliente.id, nombre: edificio.cliente.nombre },
         tipos_ascensores: tiposAscensores,
         tiene_servicios: tieneServicios,
@@ -133,8 +133,8 @@ const obtener = async (req, res) => {
     const edificio = await prisma.tbl_edificios.findUnique({
       where: { id },
       include: {
-        // Las columnas de contrato alimentan el área heredada del cliente.
-        cliente: { select: { id: true, nombre: true, ...SELECT_CONTRATO_AREAS } },
+        // El área y las columnas de contrato alimentan el área heredada del cliente.
+        cliente: { select: { id: true, nombre: true, ...SELECT_AREAS_CLIENTE } },
         ascensores: { where: { estado: 1 }, orderBy: { id: 'desc' } }
       }
     });

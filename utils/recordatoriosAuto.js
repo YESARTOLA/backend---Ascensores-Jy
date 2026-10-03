@@ -50,7 +50,8 @@ const COLORES = {
 };
 
 const ESTADOS_TERMINALES_SERVICIO = ['Cerrado', 'Cancelado', 'Cobrado total', 'Facturado'];
-const ESTADOS_TERMINALES_EMERGENCIA = ['Atendida', 'Cerrada'];
+// Atendida o cancelada: la emergencia ya no está en atención (utils/estadoAtencion.js).
+const { esEmergenciaCerrada } = require('./estadoAtencion');
 const ESTADOS_TERMINALES_COBRO = ['Pagado', 'Cerrado', 'Incobrable'];
 const { ESTADOS_PLAN_TERMINALES } = require('./estadoPlanMantenimiento');
 
@@ -168,7 +169,7 @@ async function sincronizarRecordatorioEmergencia(emergenciaId) {
   if (!e || e.estado !== 1) {
     return descartarAuto({ tipo: 'emergencia', id_emergencia: emergenciaId });
   }
-  if (ESTADOS_TERMINALES_EMERGENCIA.includes(e.estado_emergencia)) {
+  if (esEmergenciaCerrada(e.estado_emergencia)) {
     return descartarAuto({ tipo: 'emergencia', id_emergencia: emergenciaId });
   }
   const titulo = `Emergencia · ${e.motivo?.substring(0, 80) || 'Sin motivo'}`;

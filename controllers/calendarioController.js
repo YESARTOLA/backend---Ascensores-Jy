@@ -3,9 +3,9 @@ const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
 const {
   incluyeOperativos,
   soloOperativosAsignados,
-  tiposRecordatorioPermitidos,
   colorPorTipo
 } = require('../utils/visibilidadCalendario');
+const { whereRecordatoriosVisibles } = require('../utils/visibilidadRecordatorios');
 const { tiposRegistroPermitidos } = require('../utils/alcanceUsuario');
 const {
   puedeVerFinanzasReq, servicioSinPrecios, planMantenimientoSinFinanzas, omitir
@@ -48,92 +48,73 @@ const listar = async (req, res) => {
       });
     }
 
-    // 2) Recordatorios (tbl_recordatorios). Se restringe por los tipos
-    //    permitidos al rol — contabilidad solo ve 'cobro', coordinador no ve
-    //    'cobro', etc.
+    // 2) Recordatorios (tbl_recordatorios): los mismos que el usuario tiene en
+    //    su módulo de Recordatorios —los suyos más los que su rol, su ámbito y
+    //    sus asignaciones le dejan ver—, ver utils/visibilidadRecordatorios.js.
     let recordatorios = [];
     if (incluirRec) {
-      const tiposPermitidos = tiposRecordatorioPermitidos(rol);
-      if (tiposPermitidos.length > 0) {
-        const whereRec = {
-          estado: 1,
-          estado_recordatorio: 'pendiente',
-          tipo: { in: tiposPermitidos }
-        };
-        // Los recordatorios manuales son privados: en el calendario cada usuario
-        // solo ve los manuales que él creó (el resto de tipos se comparte).
-        if (tiposPermitidos.includes('manual')) {
-          whereRec.OR = [{ tipo: { not: 'manual' } }, { user_id_registration: req.user.id }];
-        }
-        // Alerta dirigida a un rol concreto: solo la ve ese rol. Va en AND
-        // aparte para no pisar el OR de los recordatorios manuales.
-        whereRec.AND = [{ OR: [{ rol_destinatario: null }, { rol_destinatario: rol }] }];
-        if (desde || hasta) {
-          whereRec.fecha_recordatorio = {};
-          if (desde) whereRec.fecha_recordatorio.gte = parseYMDLima(desde);
-          if (hasta) whereRec.fecha_recordatorio.lte = parseYMDFinDiaLima(hasta);
-        }
-        const recsRaw = await prisma.tbl_recordatorios.findMany({
-          where: whereRec,
-          include: {
-            servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } }, asignaciones: { where: { estado: 1 } } } },
-            mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } } } },
-            emergencia: { include: { cliente: true, ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } },
-            cobro: { include: { cliente: true, servicio: true } }
-          }
-        });
-        // Si el rol solo ve operativos asignados (técnico), también filtramos
-        // los recordatorios operativos por asignación al técnico.
-        const recsPorAsignacion = soloOperativosAsignados(rol)
-          ? recsRaw.filter(r => {
-              const tecs = r.servicio?.asignaciones || [];
-              return tecs.some(a => a.id_tecnico === req.user.id_tecnico);
-            })
-          : recsRaw;
-
-        // Dedup: un servicio/mantenimiento/emergencia tiene siempre un evento
-        // operativo en `tbl_calendario_eventos` y, en paralelo, un recordatorio
-        // 'auto' del mismo tipo creado por `sincronizarRecordatorio*`. En el
-        // calendario eso provoca duplicados (mismo día, uno 'programado' y
-        // otro 'pendiente'). Aquí descartamos el recordatorio auto cuando el
-        // evento operativo ya está presente en la respuesta. Los recordatorios
-        // sin contraparte operativa (cobro, observacion, cotizacion_urgente,
-        // manuales) siguen visibles. La página /recordatorios consulta su
-        // propio endpoint y no se ve afectada.
-        // Cada set también recoge el id desde el servicio vinculado al evento.
-        // Eso cubre el caso en que el evento operativo no llevó el id_plan en
-        // sus columnas (datos legacy o eventos creados por otro flujo) pero el
-        // servicio sí está vinculado al plan — sin esto el recordatorio del
-        // plan se "colaba" como tercer ítem el día del primer mantenimiento.
-        const idsServicioConEvento = new Set(eventos.map(e => e.id_servicio).filter(Boolean));
-        const idsMantenimientoConEvento = new Set(
-          eventos.flatMap(e => [e.id_mantenimiento_plan, e.servicio?.id_mantenimiento_plan]).filter(Boolean)
-        );
-        const idsEmergenciaConEvento = new Set(eventos.map(e => e.id_emergencia).filter(Boolean));
-        const recsFiltrados = recsPorAsignacion.filter(r => {
-          if (r.origen !== 'auto') return true;
-          if (r.tipo === 'servicio' && r.id_servicio && idsServicioConEvento.has(r.id_servicio)) return false;
-          if (r.tipo === 'mantenimiento' && r.id_mantenimiento_plan && idsMantenimientoConEvento.has(r.id_mantenimiento_plan)) return false;
-          if (r.tipo === 'emergencia' && r.id_emergencia && idsEmergenciaConEvento.has(r.id_emergencia)) return false;
-          return true;
-        });
-        recordatorios = recsFiltrados.map(r => ({
-          id: `rec-${r.id}`,
-          es_recordatorio: true,
-          recordatorio_id: r.id,
-          titulo: r.titulo,
-          descripcion: r.descripcion,
-          tipo_evento: r.tipo,
-          estado_evento: r.estado_recordatorio,
-          prioridad: r.prioridad,
-          color: r.color || colorPorTipo(r.tipo),
-          fecha_inicio: r.fecha_recordatorio,
-          servicio: r.servicio || (r.cobro?.servicio ? r.cobro.servicio : null),
-          emergencia: r.emergencia,
-          mantenimiento_plan: r.mantenimiento_plan,
-          cobro: r.cobro
-        }));
+      const whereRec = {
+        estado: 1,
+        estado_recordatorio: 'pendiente',
+        AND: [whereRecordatoriosVisibles(req.user)]
+      };
+      if (desde || hasta) {
+        whereRec.fecha_recordatorio = {};
+        if (desde) whereRec.fecha_recordatorio.gte = parseYMDLima(desde);
+        if (hasta) whereRec.fecha_recordatorio.lte = parseYMDFinDiaLima(hasta);
       }
+      const recsRaw = await prisma.tbl_recordatorios.findMany({
+        where: whereRec,
+        include: {
+          servicio: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } }, asignaciones: { where: { estado: 1 } } } },
+          mantenimiento_plan: { include: { cliente: true, ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } } } },
+          emergencia: { include: { cliente: true, ascensor: { include: { edificio: { select: { id: true, nombre: true } } } } } },
+          cobro: { include: { cliente: true, servicio: true } }
+        }
+      });
+
+      // Dedup: un servicio/mantenimiento/emergencia tiene siempre un evento
+      // operativo en `tbl_calendario_eventos` y, en paralelo, un recordatorio
+      // 'auto' del mismo tipo creado por `sincronizarRecordatorio*`. En el
+      // calendario eso provoca duplicados (mismo día, uno 'programado' y
+      // otro 'pendiente'). Aquí descartamos el recordatorio auto cuando el
+      // evento operativo ya está presente en la respuesta. Los recordatorios
+      // sin contraparte operativa (cobro, observacion, cotizacion_urgente,
+      // manuales) siguen visibles. La página /recordatorios consulta su
+      // propio endpoint y no se ve afectada.
+      // Cada set también recoge el id desde el servicio vinculado al evento.
+      // Eso cubre el caso en que el evento operativo no llevó el id_plan en
+      // sus columnas (datos legacy o eventos creados por otro flujo) pero el
+      // servicio sí está vinculado al plan — sin esto el recordatorio del
+      // plan se "colaba" como tercer ítem el día del primer mantenimiento.
+      const idsServicioConEvento = new Set(eventos.map(e => e.id_servicio).filter(Boolean));
+      const idsMantenimientoConEvento = new Set(
+        eventos.flatMap(e => [e.id_mantenimiento_plan, e.servicio?.id_mantenimiento_plan]).filter(Boolean)
+      );
+      const idsEmergenciaConEvento = new Set(eventos.map(e => e.id_emergencia).filter(Boolean));
+      const recsFiltrados = recsRaw.filter(r => {
+        if (r.origen !== 'auto') return true;
+        if (r.tipo === 'servicio' && r.id_servicio && idsServicioConEvento.has(r.id_servicio)) return false;
+        if (r.tipo === 'mantenimiento' && r.id_mantenimiento_plan && idsMantenimientoConEvento.has(r.id_mantenimiento_plan)) return false;
+        if (r.tipo === 'emergencia' && r.id_emergencia && idsEmergenciaConEvento.has(r.id_emergencia)) return false;
+        return true;
+      });
+      recordatorios = recsFiltrados.map(r => ({
+        id: `rec-${r.id}`,
+        es_recordatorio: true,
+        recordatorio_id: r.id,
+        titulo: r.titulo,
+        descripcion: r.descripcion,
+        tipo_evento: r.tipo,
+        estado_evento: r.estado_recordatorio,
+        prioridad: r.prioridad,
+        color: r.color || colorPorTipo(r.tipo),
+        fecha_inicio: r.fecha_recordatorio,
+        servicio: r.servicio || (r.cobro?.servicio ? r.cobro.servicio : null),
+        emergencia: r.emergencia,
+        mantenimiento_plan: r.mantenimiento_plan,
+        cobro: r.cobro
+      }));
     }
 
     // Derivar tipo_evento/color desde servicio.tipo_registro. Esto cubre
@@ -162,8 +143,9 @@ const listar = async (req, res) => {
       return esProyecto ? tiposAmbito.includes('proyecto') : tiposAmbito.includes('servicio');
     };
 
-    const combinado = [...eventosNormalizados, ...recordatorios]
-      .filter(visiblePorAmbito)
+    // Los recordatorios ya llegan acotados por ámbito desde la consulta (y los
+    // que tienen dueño se ven siempre): el filtro aplica a los eventos.
+    const combinado = [...eventosNormalizados.filter(visiblePorAmbito), ...recordatorios]
       .sort((a, b) => new Date(a.fecha_inicio) - new Date(b.fecha_inicio));
 
     // Los ítems del calendario arrastran el servicio y el plan completos: se les

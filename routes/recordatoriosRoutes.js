@@ -7,6 +7,7 @@ router.use(verificarToken);
 
 router.get('/contadores', c.contadores);
 router.get('/proximos', c.proximos);
+router.get('/destinatarios', c.destinatarios);
 router.patch('/leer-todos', c.marcarTodosLeidos);
 router.get('/', c.listar);
 router.get('/:id', c.obtener);

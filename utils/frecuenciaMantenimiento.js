@@ -25,7 +25,8 @@
  *                   plan. `offsets_dia` son los días a sumar al ancla del mes.
  *                   quincenal → [0, 15] (2 por mes); semanal → [0,7,14,21].
  *   - `cada_meses`: frecuencias de una visita cada N meses del plan
- *                   (mensual 1, bimestral 2, trimestral 3, semestral 6, anual 12).
+ *                   (mensual 1, bimestral 2, trimestral 3, cuatrimestral 4,
+ *                   semestral 6, anual 12).
  *   - ninguno de los dos (diaria, custom): se recorren por paso de días dentro
  *                   del horizonte, y el mes de cada fecha se deduce de la
  *                   ventana que la contiene.
@@ -38,6 +39,7 @@ const FRECUENCIAS = [
   { codigo: 'mensual',    etiqueta: 'Mensual',    unidad: 'mes',   paso: 1,  por_mes: 1,    offsets_dia: [0],         cada_meses: 1 },
   { codigo: 'bimestral',  etiqueta: 'Bimestral',  unidad: 'mes',   paso: 2,  por_mes: null, offsets_dia: null,        cada_meses: 2 },
   { codigo: 'trimestral', etiqueta: 'Trimestral', unidad: 'mes',   paso: 3,  por_mes: null, offsets_dia: null,        cada_meses: 3 },
+  { codigo: 'cuatrimestral', etiqueta: 'Cuatrimestral', unidad: 'mes', paso: 4, por_mes: null, offsets_dia: null,     cada_meses: 4 },
   { codigo: 'semestral',  etiqueta: 'Semestral',  unidad: 'mes',   paso: 6,  por_mes: null, offsets_dia: null,        cada_meses: 6 },
   { codigo: 'anual',      etiqueta: 'Anual',      unidad: 'mes',   paso: 12, por_mes: null, offsets_dia: null,        cada_meses: 12 },
   { codigo: 'custom',     etiqueta: 'Personalizada (días)', unidad: 'custom', paso: null, por_mes: null, offsets_dia: null, cada_meses: null }

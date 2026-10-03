@@ -16,6 +16,7 @@ const { whereElegibleContable, whereCobroElegible } = require('../utils/elegibil
 
 // Roles con visibilidad de datos económicos (SSoT: utils/visibilidadFinanzas.js).
 const { ROLES_FINANZAS: ROLES_PRECIO, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
+const { whereAscensorVisible } = require('../utils/eliminacionAscensor');
 
 // El usuario acotado solo a Proyectos no ve reportes de dominio Servicios
 // (emergencias, correctivos, mantenimientos, atención rápida).
@@ -260,7 +261,7 @@ const historialTecnicoAscensor = async (req, res) => {
 
     const alcanceAsc = ascensorAlcanceWhere(req.user);
     const ascensor = await prisma.tbl_ascensores.findFirst({
-      where: { id: Number(id_ascensor), ...alcanceAsc },
+      where: { id: Number(id_ascensor), ...alcanceAsc, ...whereAscensorVisible(req.user) },
       include: { edificio: { include: { cliente: true } } }
     });
     if (!ascensor) return res.status(404).json({ error: 'Ascensor no encontrado' });

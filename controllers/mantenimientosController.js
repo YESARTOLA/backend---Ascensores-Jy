@@ -8,7 +8,7 @@ const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServici
 const { paginar, paginarArray } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion, visitasEnMeses } = require('../utils/frecuenciaMantenimiento');
 const {
-  generarProgramacion, mesesDelPlan, tituloBasePlan, eventoDeVisita, frecuenciaDeAscensor
+  generarProgramacion, mesesDelPlan, mesesConMantenimiento, tituloBasePlan, eventoDeVisita, frecuenciaDeAscensor
 } = require('../utils/planMantenimientoMensual');
 // Cálculo de las fechas teóricas del plan. Lo usa `_regenerarProgramacion` al
 // recalcular el cronograma tras editar duración, frecuencias o fecha de inicio.
@@ -18,12 +18,17 @@ const { validarPertenenciaAscensores } = require('../utils/ascensoresMonto');
 const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPlan');
-const { estaServicioRealizado, esServicioEditable, ESTADO_SERVICIO_CANCELADO } = require('../utils/estadoServicio');
+const {
+  estaServicioRealizado, esServicioEditable, ESTADO_SERVICIO_CANCELADO, ESTADO_SERVICIO_PENDIENTE, ESTADO_SERVICIO_ASIGNADO
+} = require('../utils/estadoServicio');
 const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
 const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
 const { sincronizarDiasYEventos } = require('../utils/diasServicio');
 const { normalizarProgramacion } = require('../utils/programacionDias');
+const {
+  resolverTecnicoPlan, tecnicoActivoDelPlan, datosAsignacionTecnicoPlan, propagarTecnicoDelPlan
+} = require('../utils/tecnicoPlanMantenimiento');
 
 // Un plan admite cupo de mantenimientos gratuitos solo si su subtipo pertenece
 // al módulo Mantenimientos (preventivo). SSoT: se deriva de modulo_asociado.
@@ -90,6 +95,7 @@ const listar = async (req, res) => {
           cliente: true,
           ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: true } } } },
           tipo_servicio: true,
+          tecnico: { select: { id: true, nombre: true, estado: true } },
           // Cobro ÚNICO del plan (facturación a nivel de plan).
           cobro: { select: { id: true, monto_total: true, total_abonado: true, saldo_pendiente: true, estado_cobro: true, moneda: true } },
           servicios_generados: {
@@ -132,8 +138,9 @@ const listar = async (req, res) => {
 
 /**
  * Crea el SERVICIO de una visita del cronograma. Cada visita cubre UN ascensor
- * en UNA fecha, así que genera exactamente un servicio, listo para asignarle su
- * técnico.
+ * en UNA fecha, así que genera exactamente un servicio. Nace con el técnico del
+ * plan (y por eso «Asignado»: tiene técnico y fecha); sin técnico en el plan,
+ * queda «Pendiente» para asignarlo desde el servicio.
  *
  * Estos servicios NO llevan precio propio ni generan cobro: el importe del plan
  * es el `monto_mensual`, que se cobra una vez al mes en el cobro único del plan
@@ -150,6 +157,7 @@ async function _crearServicioDeVisita(tx, { plan, tituloBase, idAscensor, codigo
   const titulo = codigoAscensor ? `${tituloBase} · ${codigoAscensor}` : tituloBase;
   // Contacto en sitio y cuarto de máquinas heredados de la ficha del ascensor.
   const datosSitio = await datosSitioParaServicio(tx, [idAscensor]);
+  const idTecnico = await tecnicoActivoDelPlan(tx, plan);
   return tx.tbl_servicios_proyectos.create({
     data: {
       codigo,
@@ -163,7 +171,7 @@ async function _crearServicioDeVisita(tx, { plan, tituloBase, idAscensor, codigo
       fecha_programada: fechaProgramada,
       hora_programada: horaProgramada,
       prioridad: 'media',
-      estado_servicio: 'Pendiente',
+      estado_servicio: idTecnico ? ESTADO_SERVICIO_ASIGNADO : ESTADO_SERVICIO_PENDIENTE,
       // El precio vive en el plan (monto_mensual), no en la visita: el importe
       // del mes no varía con el número de mantenimientos realizados.
       precio_interno: 0,
@@ -178,7 +186,8 @@ async function _crearServicioDeVisita(tx, { plan, tituloBase, idAscensor, codigo
       user_id_registration: userId,
       ascensores: {
         create: [{ id_ascensor: idAscensor, monto: 0, moneda: plan.moneda || MONEDA_POR_DEFECTO, user_id_registration: userId }]
-      }
+      },
+      ...(idTecnico ? { asignaciones: { create: [datosAsignacionTecnicoPlan(idTecnico, userId)] } } : {})
     }
   });
 }
@@ -285,6 +294,32 @@ function _normalizarFrecuencia(entrada, porDefecto, etiqueta) {
 }
 
 /**
+ * Frecuencia del PLAN (tbl_mantenimientos_planes.frecuencia). No se elige en el
+ * formulario: cada ascensor lleva la suya y esa es la autoridad para el
+ * cronograma y el cobro. El plan conserva una como respaldo técnico —para las
+ * filas antiguas de la junction sin frecuencia propia y para reconstruir
+ * cronogramas— y se deriva de sus ascensores: la más repetida (a igualdad, la
+ * del primero).
+ *
+ * @param {Array<{frecuencia?:string, frecuencia_dias_custom?:number}>} entradas
+ * @returns {{frecuencia:string, frecuencia_dias_custom:number|null}|null}
+ *          null si ningún ascensor trae una frecuencia válida.
+ */
+function _frecuenciaPlanDesdeAscensores(entradas) {
+  const conteo = new Map();
+  for (const e of entradas || []) {
+    if (!obtenerFrecuencia(e?.frecuencia)) continue;
+    const dias = e.frecuencia === 'custom' ? Number(e.frecuencia_dias_custom) : null;
+    const clave = `${e.frecuencia}|${dias ?? ''}`;
+    if (!conteo.has(clave)) conteo.set(clave, { n: 0, frecuencia: e.frecuencia, frecuencia_dias_custom: dias });
+    conteo.get(clave).n += 1;
+  }
+  let elegida = null;
+  for (const c of conteo.values()) if (!elegida || c.n > elegida.n) elegida = c;
+  return elegida ? { frecuencia: elegida.frecuencia, frecuencia_dias_custom: elegida.frecuencia_dias_custom } : null;
+}
+
+/**
  * Valida y normaliza el body de creación/actualización de plan.
  *
  * El plan se dimensiona en MESES (`duracion_meses`) y lleva un `monto_mensual`
@@ -349,7 +384,8 @@ function _normalizarPlanInput(d, tipoServicio) {
   if (cantidad_mantenimientos_gratuitos > meses) {
     throw new Error('Los meses gratuitos no pueden superar la duración del plan');
   }
-  // Frecuencia del plan = la propuesta por defecto para sus ascensores.
+  // Frecuencia del plan: respaldo técnico derivado de sus ascensores por quien
+  // llama (ver _frecuenciaPlanDesdeAscensores).
   const { frecuencia, frecuencia_dias_custom } = _normalizarFrecuencia(d, null, 'el plan');
   return {
     tipo_plan,
@@ -408,7 +444,9 @@ const crear = async (req, res) => {
     let normalizado;
     const frecuenciasPorAscensor = new Map();
     try {
-      normalizado = _normalizarPlanInput(d, tipoServicio);
+      // La frecuencia del plan sale de sus ascensores (la que traiga el body
+      // solo cuenta si ninguno trae la suya).
+      normalizado = _normalizarPlanInput({ ...d, ..._frecuenciaPlanDesdeAscensores(entradas) }, tipoServicio);
       // Un plan eventual no tiene serie: una sola visita por ascensor.
       if (normalizado.tipo_plan === 'continuo') {
         const codigos = await prisma.tbl_ascensores.findMany({
@@ -427,6 +465,10 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: e.message });
     }
 
+    // Técnico del plan (opcional): se asigna a todos sus servicios.
+    const tecnicoPlan = await resolverTecnicoPlan(prisma, d.id_tecnico);
+    if (!tecnicoPlan.ok) return res.status(400).json({ error: tecnicoPlan.error });
+
     const moneda = d.moneda || MONEDA_POR_DEFECTO;
     // El mes 1 es gratuito si el plan tiene cupo: su cobro no se genera.
     const primerMesGratuito = normalizado.cantidad_mantenimientos_gratuitos >= 1;
@@ -440,6 +482,7 @@ const crear = async (req, res) => {
           moneda,
           fecha_inicio: parseYMDLima(d.fecha_inicio),
           hora_programada: d.hora_programada || null,
+          id_tecnico: tecnicoPlan.id,
           estado_plan: ESTADO_PLAN_ACTIVO,
           observaciones: d.observaciones || null,
           user_id_registration: req.user.id,
@@ -838,16 +881,33 @@ const actualizar = async (req, res) => {
       return res.status(cambioAscensores.status || 409).json({ error: cambioAscensores.error });
     }
 
+    // Técnico del plan: solo cambia si llega en el body.
+    let idTecnicoFinal = previo.id_tecnico;
+    if (Object.prototype.hasOwnProperty.call(d, 'id_tecnico')) {
+      const tecnicoPlan = await resolverTecnicoPlan(prisma, d.id_tecnico);
+      if (!tecnicoPlan.ok) return res.status(400).json({ error: tecnicoPlan.error });
+      idTecnicoFinal = tecnicoPlan.id;
+    }
+
     const idTipoFinal = d.id_tipo_servicio ? Number(d.id_tipo_servicio) : previo.id_tipo_servicio;
     const tipoServicioFinal = idTipoFinal === previo.id_tipo_servicio
       ? previo.tipo_servicio
       : await prisma.tbl_tipos_servicio.findUnique({ where: { id: idTipoFinal } });
 
     const tipoPlanFinal = d.tipo_plan ?? previo.tipo_plan;
+    // Frecuencia del plan: se deriva del conjunto FINAL de ascensores con sus
+    // frecuencias (ver _frecuenciaPlanDesdeAscensores).
+    const entradasFinales = Array.isArray(d.ascensores)
+      ? d.ascensores
+      : previo.ascensores.map(f => (Array.isArray(d.ascensores_frecuencias)
+          && d.ascensores_frecuencias.find(e => Number(e?.id_ascensor) === f.id_ascensor)) || f);
+    const frecuenciaDerivada = _frecuenciaPlanDesdeAscensores(entradasFinales);
     const mergeInput = {
       tipo_plan: tipoPlanFinal,
-      frecuencia: d.frecuencia ?? previo.frecuencia,
-      frecuencia_dias_custom: d.frecuencia_dias_custom ?? previo.frecuencia_dias_custom,
+      frecuencia: frecuenciaDerivada?.frecuencia ?? d.frecuencia ?? previo.frecuencia,
+      frecuencia_dias_custom: frecuenciaDerivada
+        ? frecuenciaDerivada.frecuencia_dias_custom
+        : (d.frecuencia_dias_custom ?? previo.frecuencia_dias_custom),
       duracion_meses: d.duracion_meses ?? previo.duracion_meses,
       cantidad_mantenimientos_gratuitos: d.cantidad_mantenimientos_gratuitos ?? previo.cantidad_mantenimientos_gratuitos,
       monto_mensual: d.monto_mensual ?? previo.monto_mensual
@@ -892,13 +952,22 @@ const actualizar = async (req, res) => {
         || fila.frecuencia !== f.frecuencia
         || Number(fila.frecuencia_dias_custom || 0) !== Number(f.frecuencia_dias_custom || 0);
     });
+    // La frecuencia del plan solo es el respaldo de los ascensores sin
+    // frecuencia propia (planes antiguos): si ninguno depende de ella, que
+    // cambie no mueve ninguna visita.
+    const cambioFrecuenciaPlan = previo.ascensores.some(f => !f.frecuencia) && (
+      normalizado.frecuencia !== previo.frecuencia ||
+      Number(normalizado.frecuencia_dias_custom || 0) !== Number(previo.frecuencia_dias_custom || 0)
+    );
     // Cambios que invalidan el cronograma futuro y obligan a recalcularlo.
     const requiereRegenerar =
       normalizado.tipo_plan !== previo.tipo_plan ||
       Number(normalizado.duracion_meses || 0) !== Number(previo.duracion_meses || 0) ||
-      normalizado.frecuencia !== previo.frecuencia ||
-      Number(normalizado.frecuencia_dias_custom || 0) !== Number(previo.frecuencia_dias_custom || 0) ||
-      nuevaFechaInicio.getTime() !== previo.fecha_inicio.getTime() ||
+      cambioFrecuenciaPlan ||
+      // Por día calendario: la columna es @db.Date (00:00 UTC) y la del body
+      // llega anclada a Lima (05:00 UTC); comparar instantes daba siempre
+      // distinto y cualquier edición regeneraba el cronograma.
+      ymdDeFecha(nuevaFechaInicio) !== ymdDeFecha(previo.fecha_inicio) ||
       cambioFrecuenciaAscensor ||
       // Entra o sale un ascensor: su serie de visitas nace o desaparece.
       cambioAscensores.cambia;
@@ -926,6 +995,7 @@ const actualizar = async (req, res) => {
           cantidad_mantenimientos: previo.cantidad_mantenimientos,
           fecha_inicio: nuevaFechaInicio,
           hora_programada: d.hora_programada ?? previo.hora_programada,
+          id_tecnico: idTecnicoFinal,
           estado_plan: d.estado_plan ?? previo.estado_plan,
           observaciones: d.observaciones ?? previo.observaciones,
           ...stamp
@@ -952,12 +1022,28 @@ const actualizar = async (req, res) => {
       return { plan, prog, cuotas, servicios };
     });
 
+    // Nuevo técnico del plan: pasa a sus servicios aún no iniciados, salvo los
+    // que se cambiaron a mano. Quitarlo del plan no desasigna a nadie.
+    const tecnicoAsignadoA = idTecnicoFinal && idTecnicoFinal !== previo.id_tecnico
+      ? await propagarTecnicoDelPlan({
+        idPlan: id, idTecnicoAnterior: previo.id_tecnico, idTecnicoNuevo: idTecnicoFinal, userId: req.user.id
+      })
+      : 0;
+
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_mantenimientos_planes', id_entidad: id,
       accion: 'UPDATE', valor_anterior: previo, valor_nuevo: resultado.plan, ip: req.ip
     });
     sincronizarRecordatorioMantenimientoPlan(id).catch(err => console.error('Sync rec mant:', err));
-    res.json({ data: { ...resultado.plan, programacion: resultado.prog, cuotas_ajustadas: resultado.cuotas, servicios_gratuitos: resultado.servicios } });
+    res.json({
+      data: {
+        ...resultado.plan,
+        programacion: resultado.prog,
+        cuotas_ajustadas: resultado.cuotas,
+        servicios_gratuitos: resultado.servicios,
+        servicios_con_tecnico_del_plan: tecnicoAsignadoA
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al actualizar mantenimiento: ' + err.message });
@@ -1022,6 +1108,61 @@ async function _materializarVisitaEnTx(tx, visita, plan, userId, overrides = {})
   return servicio;
 }
 
+// Lo que la materialización de una visita necesita del plan y de la visita.
+const INCLUDE_PLAN_MATERIALIZAR = {
+  tipo_servicio: true,
+  ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { nombre: true } } } } } }
+};
+const INCLUDE_VISITA_MATERIALIZAR = {
+  ascensor: { select: { codigo: true } },
+  servicio: { select: { id: true, estado: true } }
+};
+
+/**
+ * Valida una visita del cronograma y crea su servicio, respondiendo la
+ * petición. Compartido por el calendario (por evento) y por el detalle del plan
+ * (por fila del cronograma). Body opcional: fecha_programada, hora_programada,
+ * dias (ver _materializarVisitaEnTx).
+ */
+async function _responderMaterializacion(req, res, plan, visita, errorSinVisita) {
+  if (!plan || plan.estado !== 1) {
+    return res.status(400).json({ error: 'El plan asociado no está activo' });
+  }
+  if (plan.estado_plan === ESTADO_PLAN_CANCELADO) {
+    return res.status(409).json({ error: 'El plan está cancelado: ya no genera servicios' });
+  }
+  if (!visita) return res.status(404).json({ error: errorSinVisita });
+  if (visita.activo === 0) {
+    return res.status(409).json({ error: 'Esta fecha fue omitida del plan. Reactívela antes de crear el servicio.' });
+  }
+  // Solo bloquea si el servicio enganchado sigue VIVO: una visita cuyo
+  // servicio fue eliminado (datos previos al desenganche automático) debe
+  // poder materializarse de nuevo.
+  if (visita.id_servicio && visita.servicio?.estado === 1) {
+    return res.status(409).json({ error: 'Esta visita ya tiene un servicio creado' });
+  }
+
+  const overrides = {
+    fecha_programada: req.body?.fecha_programada,
+    hora_programada: req.body?.hora_programada,
+    dias: req.body?.dias
+  };
+
+  let servicio;
+  try {
+    servicio = await prisma.$transaction(tx => _materializarVisitaEnTx(tx, visita, plan, req.user.id, overrides));
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  await registrarAuditoria({
+    id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: servicio.id,
+    accion: 'CREATE', valor_nuevo: servicio, ip: req.ip
+  });
+  sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync rec servicio:', err));
+  return res.status(201).json({ data: { servicios: [servicio], servicio } });
+}
+
 /**
  * POST /eventos/:id/crear-servicio — materializa la visita del cronograma
  * asociada a un evento de calendario del plan.
@@ -1043,57 +1184,40 @@ const materializarEvento = async (req, res) => {
 
     const plan = await prisma.tbl_mantenimientos_planes.findUnique({
       where: { id: evento.id_mantenimiento_plan },
-      include: {
-        tipo_servicio: true,
-        ascensores: { where: { estado: 1 }, include: { ascensor: { include: { edificio: { select: { nombre: true } } } } } }
-      }
+      include: INCLUDE_PLAN_MATERIALIZAR
     });
-    if (!plan || plan.estado !== 1) {
-      return res.status(400).json({ error: 'El plan asociado no está activo' });
-    }
-
-    const visita = await prisma.tbl_mantenimientos_programacion.findFirst({
+    const visita = plan && await prisma.tbl_mantenimientos_programacion.findFirst({
       where: { id_evento: idEvento, id_plan: plan.id, estado: 1 },
-      include: {
-        ascensor: { select: { codigo: true } },
-        servicio: { select: { id: true, estado: true } }
-      }
+      include: INCLUDE_VISITA_MATERIALIZAR
     });
-    if (!visita) {
-      return res.status(404).json({ error: 'El evento no tiene una visita del cronograma asociada' });
-    }
-    if (visita.activo === 0) {
-      return res.status(409).json({ error: 'Esta fecha fue omitida del plan. Reactívela antes de crear el servicio.' });
-    }
-    // Solo bloquea si el servicio enganchado sigue VIVO: una visita cuyo
-    // servicio fue eliminado (datos previos al desenganche automático) debe
-    // poder materializarse de nuevo.
-    if (visita.id_servicio && visita.servicio?.estado === 1) {
-      return res.status(409).json({ error: 'Esta visita ya tiene un servicio creado' });
-    }
-
-    const overrides = {
-      fecha_programada: req.body?.fecha_programada,
-      hora_programada: req.body?.hora_programada,
-      dias: req.body?.dias
-    };
-
-    let servicio;
-    try {
-      servicio = await prisma.$transaction(tx => _materializarVisitaEnTx(tx, visita, plan, req.user.id, overrides));
-    } catch (e) {
-      return res.status(400).json({ error: e.message });
-    }
-
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_servicios_proyectos', id_entidad: servicio.id,
-      accion: 'CREATE', valor_nuevo: servicio, ip: req.ip
-    });
-    sincronizarRecordatorioServicio(servicio.id).catch(err => console.error('Sync rec servicio:', err));
-    res.status(201).json({ data: { servicios: [servicio], servicio } });
+    return await _responderMaterializacion(req, res, plan, visita,
+      'El evento no tiene una visita del cronograma asociada');
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al materializar evento: ' + err.message });
+  }
+};
+
+/**
+ * POST /:id/programacion/:idVisita/crear-servicio — crea el servicio de una
+ * visita del cronograma directamente desde el detalle del plan, sin pasar por
+ * el calendario. El servicio nace con el técnico del plan.
+ */
+const crearServicioDeVisita = async (req, res) => {
+  try {
+    const idPlan = Number(req.params.id);
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+      where: { id: idPlan },
+      include: INCLUDE_PLAN_MATERIALIZAR
+    });
+    const visita = plan && await prisma.tbl_mantenimientos_programacion.findFirst({
+      where: { id: Number(req.params.idVisita), id_plan: idPlan, estado: 1 },
+      include: INCLUDE_VISITA_MATERIALIZAR
+    });
+    return await _responderMaterializacion(req, res, plan, visita, 'La visita no pertenece a este plan');
+  } catch (err) {
+    console.error('[mantenimientos.crearServicioDeVisita]', err);
+    res.status(500).json({ error: 'Error al crear el servicio de la visita: ' + err.message });
   }
 };
 
@@ -1259,7 +1383,13 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
       // vista necesita la grilla y no solo `fecha_programada` (el primer día).
       dias: { where: { estado: 1 }, orderBy: { fecha: 'asc' }, select: { id: true, orden: true, fecha: true } },
       historial_estados: { where: { estado: 1 }, orderBy: { fecha_cambio: 'asc' } },
-      servicio_realizado: { select: { fecha_realizacion: true } }
+      servicio_realizado: { select: { fecha_realizacion: true } },
+      // Técnicos del servicio (el del plan o el que se le puso a mano).
+      asignaciones: {
+        where: { estado: 1 },
+        orderBy: [{ responsable_principal: 'desc' }, { id: 'asc' }],
+        select: { tecnico: { select: { nombre: true } } }
+      }
     }
   });
 
@@ -1287,6 +1417,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         moneda: s.moneda,
         sin_cobro: s.sin_cobro,
         estado_servicio: s.estado_servicio,
+        tecnicos: s.asignaciones.map(a => a.tecnico?.nombre).filter(Boolean).join(', ') || null,
         fecha_programada: s.fecha_programada,
         // Días programados de la ocurrencia (pueden no ser corridos).
         dias: s.dias,
@@ -1333,7 +1464,8 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
               id: true, id_cliente: true,
               cliente: { select: { id: true, nombre: true } },
               tipo_servicio: { select: { id: true, nombre: true } },
-              cantidad_mantenimientos_gratuitos: true
+              cantidad_mantenimientos_gratuitos: true,
+              tecnico: { select: { nombre: true, estado: true } }
             }
           }
         }
@@ -1359,6 +1491,8 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         ascensor_tipo: resumen.ascensor_tipo,
         tipo_servicio: v.plan.tipo_servicio?.nombre || null,
         es_mantenimiento_gratuito: v.numero_mes <= Number(v.plan.cantidad_mantenimientos_gratuitos || 0),
+        // Aún sin servicio: el técnico que recibirá al crearse (el del plan).
+        tecnico_plan: v.plan.tecnico?.estado === 1 ? v.plan.tecnico.nombre : null,
         fecha_programada: v.fecha_programada,
         estado_ejecucion: 'Pendiente',
         fecha_inicio_real: null,
@@ -1509,6 +1643,17 @@ async function _construirDatasetReporte({ idsCliente, idsAscensor, estadoEjecuci
     }),
     _obtenerPlanesParaReporte({ ids_cliente: idsCliente, ids_ascensor: idsAscensor })
   ]);
+
+  // Meses con mantenimiento de cada plan (los que se cobran): el total del plan
+  // en el export sale de ahí (utils/planMantenimientoMensual.totalesDelPlan).
+  const mesesProgramados = planes.length === 0 ? [] : await prisma.tbl_mantenimientos_programacion.groupBy({
+    by: ['id_plan', 'numero_mes'],
+    where: { id_plan: { in: planes.map(p => p.id) }, estado: 1 }
+  });
+  for (const plan of planes) {
+    const visitas = mesesProgramados.filter(v => v.id_plan === plan.id);
+    plan.meses_con_mantenimiento = [...mesesConMantenimiento(plan, visitas, plan.ascensores)];
+  }
 
   // Mapa de claves "plan-fecha" para deduplicar con proyecciones teóricas.
   const claveExistente = new Set(
@@ -1867,6 +2012,7 @@ const listarPeriodos = async (req, res) => {
           ...data,
           id_cobro: null,
           monto_mensual: null,
+          totales: null,
           meses: (data.meses || []).map(({ monto, cuota, ...resto }) => resto)
         }
       });
@@ -2142,6 +2288,7 @@ const reconstruirProgramacion = async (req, res) => {
  * cobro único del plan, y el cobro sube su total. El importe NO depende de
  * cuántas visitas se hayan ejecutado — por eso no hay modo "equivalente": un
  * mes incompleto se puede aprobar forzado, pero siempre por el monto pactado.
+ * Un mes sin mantenimiento programado no se cobra y, por tanto, no se aprueba.
  *
  * Body: { numero_mes: number, forzar?: bool }
  * Devuelve la cuota creada → el front abre el modal de factura con id_cuota.
@@ -2173,6 +2320,9 @@ const aprobarPeriodo = async (req, res) => {
     const p = info.meses.find(x => x.numero_mes === mesPedido);
     if (!p) return res.status(404).json({ error: 'Mes no encontrado en el plan' });
     if (p.cuota) return res.status(409).json({ error: 'El mes ya fue aprobado' });
+    if (!p.con_mantenimiento) {
+      return res.status(409).json({ error: 'Este mes no tiene mantenimientos programados: no se cobra' });
+    }
 
     if (!p.completo && !forzar) {
       return res.status(409).json({
@@ -2397,7 +2547,7 @@ const actualizarMontoMensual = async (req, res) => {
 };
 
 module.exports = {
-  listar, crear, actualizar, materializarEvento, listarFrecuencias,
+  listar, crear, actualizar, materializarEvento, crearServicioDeVisita, listarFrecuencias,
   actualizarMontoMensual,
   materializarSiguienteEventoDelPlan, listarInstancias, exportar,
   impactoEliminacion, eliminar,
