@@ -15,7 +15,7 @@ const {
 const { programacionDelPlan, teoricasFaltantes } = require('../utils/programacionPlanMantenimiento');
 const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarPertenenciaAscensores } = require('../utils/ascensoresMonto');
-const { MONEDA_POR_DEFECTO } = require('../utils/catalogosBancarios');
+const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPlan');
 const {
@@ -469,7 +469,8 @@ const crear = async (req, res) => {
     const tecnicoPlan = await resolverTecnicoPlan(prisma, d.id_tecnico);
     if (!tecnicoPlan.ok) return res.status(400).json({ error: tecnicoPlan.error });
 
-    const moneda = d.moneda || MONEDA_POR_DEFECTO;
+    const moneda = _monedaDelBody(d.moneda, MONEDA_POR_DEFECTO);
+    if (!moneda) return res.status(400).json({ error: 'Moneda no válida' });
     // El mes 1 es gratuito si el plan tiene cupo: su cobro no se genera.
     const primerMesGratuito = normalizado.cantidad_mantenimientos_gratuitos >= 1;
 
@@ -858,6 +859,68 @@ async function _aplicarCambioDeAlcance(tx, previo, cambio, entradasFrecuencia, n
   }
 }
 
+/**
+ * Moneda recibida en el body: vacía → `porDefecto`; fuera del catálogo → null,
+ * para que quien llama responda 400 en vez de guardar un código desconocido.
+ */
+function _monedaDelBody(valor, porDefecto) {
+  if (valor === undefined || valor === null || valor === '') return porDefecto;
+  return normalizarMoneda(valor);
+}
+
+// Cobros del plan: el único del modelo mensual y, en planes anteriores a él,
+// los que colgaban de cada servicio generado.
+const _cobrosDelPlanWhere = (idPlan) => ({
+  estado: 1,
+  OR: [{ id_mantenimiento_plan: idPlan }, { servicio: { is: { id_mantenimiento_plan: idPlan } } }]
+});
+
+/**
+ * La moneda del plan rotula su monto mensual y la heredan su cobro, sus cuotas
+ * y sus facturas (la factura no guarda moneda propia: la toma del cobro). Solo
+ * se puede cambiar mientras nada se haya facturado ni pagado en la moneda
+ * actual; si no, se reetiquetarían importes ya emitidos o cobrados.
+ *
+ * @returns {Promise<string|null>} motivo del bloqueo, o null si se puede cambiar
+ */
+async function _motivoBloqueoCambioMoneda(db, idPlan) {
+  const facturas = await db.tbl_facturas.count({
+    where: {
+      estado: 1,
+      OR: [
+        { id_mantenimiento_plan: idPlan },
+        { servicio: { is: { id_mantenimiento_plan: idPlan } } },
+        { cobro: { is: _cobrosDelPlanWhere(idPlan) } }
+      ]
+    }
+  });
+  if (facturas > 0) {
+    return 'No se puede cambiar la moneda: el plan ya tiene comprobantes emitidos en la moneda actual.';
+  }
+  const conPagos = await db.tbl_cobros.count({
+    where: { ..._cobrosDelPlanWhere(idPlan), total_abonado: { gt: 0 } }
+  });
+  if (conPagos > 0) {
+    return 'No se puede cambiar la moneda: el plan ya tiene pagos registrados en la moneda actual.';
+  }
+  return null;
+}
+
+/**
+ * Lleva la nueva moneda del plan a todo lo que la hereda: sus ascensores, sus
+ * servicios (y el monto por ascensor de cada uno) y sus cobros. Correr dentro de
+ * la transacción, después de cualquier alta de ascensores del mismo cambio.
+ */
+async function _propagarMonedaPlan(tx, idPlan, moneda, userId) {
+  const data = { moneda, user_id_modification: userId, date_time_modification: new Date() };
+  await tx.tbl_mantenimientos_planes_ascensores.updateMany({ where: { id_plan: idPlan, estado: 1 }, data });
+  await tx.tbl_servicios_proyectos.updateMany({ where: { id_mantenimiento_plan: idPlan, estado: 1 }, data });
+  await tx.tbl_servicios_ascensores.updateMany({
+    where: { estado: 1, servicio: { is: { id_mantenimiento_plan: idPlan } } }, data
+  });
+  await tx.tbl_cobros.updateMany({ where: _cobrosDelPlanWhere(idPlan), data });
+}
+
 const actualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -879,6 +942,14 @@ const actualizar = async (req, res) => {
     const cambioAscensores = await _validarCambioDeAlcance(d, previo);
     if (cambioAscensores.error) {
       return res.status(cambioAscensores.status || 409).json({ error: cambioAscensores.error });
+    }
+
+    const monedaFinal = _monedaDelBody(d.moneda, previo.moneda);
+    if (!monedaFinal) return res.status(400).json({ error: 'Moneda no válida' });
+    const cambioMoneda = monedaFinal !== previo.moneda;
+    if (cambioMoneda) {
+      const motivo = await _motivoBloqueoCambioMoneda(prisma, id);
+      if (motivo) return res.status(409).json({ error: motivo });
     }
 
     // Técnico del plan: solo cambia si llega en el body.
@@ -993,6 +1064,7 @@ const actualizar = async (req, res) => {
           // `cantidad_mantenimientos` es derivado del cronograma: lo fija la
           // regeneración, no el body.
           cantidad_mantenimientos: previo.cantidad_mantenimientos,
+          moneda: monedaFinal,
           fecha_inicio: nuevaFechaInicio,
           hora_programada: d.hora_programada ?? previo.hora_programada,
           id_tecnico: idTecnicoFinal,
@@ -1018,6 +1090,7 @@ const actualizar = async (req, res) => {
       const servicios = cambioCupo
         ? await _sincronizarGratuitosDeServicios(tx, id, normalizado.cantidad_mantenimientos_gratuitos, req.user.id)
         : null;
+      if (cambioMoneda) await _propagarMonedaPlan(tx, id, monedaFinal, req.user.id);
 
       return { plan, prog, cuotas, servicios };
     });
@@ -2378,7 +2451,9 @@ const aprobarPeriodo = async (req, res) => {
       accion: 'CREATE',
       valor_nuevo: {
         plan: id, numero_mes: p.numero_mes, etiqueta: p.etiqueta, monto,
-        forzado: !!forzar, realizadas: p.realizadas, total: p.total_visitas
+        // Aprobado con mantenimientos pendientes (p. ej. facturado al recibir el
+        // pago del mes, antes de las visitas).
+        forzado: !p.completo, realizadas: p.realizadas, total: p.total_visitas
       },
       ip: req.ip
     });
@@ -2512,14 +2587,23 @@ const actualizarMontoMensual = async (req, res) => {
     });
     if (!plan || plan.estado === 0) return res.status(404).json({ error: 'Plan no encontrado' });
 
+    const monedaFinal = _monedaDelBody(moneda, plan.moneda);
+    if (!monedaFinal) return res.status(400).json({ error: 'Moneda no válida' });
+    const cambioMoneda = monedaFinal !== plan.moneda;
+    if (cambioMoneda) {
+      const motivo = await _motivoBloqueoCambioMoneda(prisma, id);
+      if (motivo) return res.status(409).json({ error: motivo });
+    }
+
     const anterior = { monto_mensual: Number(plan.monto_mensual), moneda: plan.moneda };
     const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
 
     const resultado = await prisma.$transaction(async (tx) => {
       const actualizado = await tx.tbl_mantenimientos_planes.update({
         where: { id },
-        data: { monto_mensual: round2(monto), ...(moneda ? { moneda } : {}), ...stamp }
+        data: { monto_mensual: round2(monto), moneda: monedaFinal, ...stamp }
       });
+      if (cambioMoneda) await _propagarMonedaPlan(tx, id, monedaFinal, req.user.id);
       const cuotas = await _reflejarMontoMensualEnCuotas(tx, id, round2(monto), req.user.id);
       return { plan: actualizado, cuotas };
     });

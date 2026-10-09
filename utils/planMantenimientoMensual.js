@@ -437,7 +437,10 @@ async function mesesDelPlan(client, idPlan) {
             numero_mes: cuota.numero_mes,
             monto: Number(cuota.monto),
             monto_pagado: Number(cuota.monto_pagado || 0),
-            estado_cuota: cuota.estado_cuota
+            estado_cuota: cuota.estado_cuota,
+            // Aparte de estado_periodo: un mes 'pagado' puede seguir sin factura
+            // si el abono se registró antes que el comprobante.
+            facturada: cuotaFacturada.has(cuota.id)
           }
         : null,
       estado_periodo

@@ -520,6 +520,7 @@ const crear = async (req, res) => {
     // que facturar — el único vehículo de cobro/factura es el del servicio, y
     // bloquearlo dejaría esas cuotas incobrables. Se permite el flujo normal
     // por servicio SOLO en ese caso.
+    let esPlanLegacyConCobroPropio = false;
     if (servicio.id_mantenimiento_plan) {
       const cobroPlan = await prisma.tbl_cobros.findFirst({
         where: { id_mantenimiento_plan: servicio.id_mantenimiento_plan, estado: 1 },
@@ -531,6 +532,7 @@ const crear = async (req, res) => {
           error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura contra la cuota del plan desde Contabilidad → Por facturar, Gestión de cobros → Por facturar o el detalle del plan (Facturación mensual).'
         });
       }
+      esPlanLegacyConCobroPropio = true;
     }
     // Regla ÚNICA de elegibilidad contable (utils/elegibilidadContable):
     //  - Origen cotización → habilitado por conversión efectiva a servicio.
@@ -541,7 +543,12 @@ const crear = async (req, res) => {
     }
     // Bandera persistida "requiere factura": si el servicio está marcado como
     // "Sin factura" (requiere_factura = 0), no admite emisión de comprobante.
-    if (servicio.requiere_factura === 0) {
+    //
+    // No aplica a la excepción legacy de arriba: todo servicio de plan nace (o
+    // quedó, por la migración 20260731120000) con la marca en 0 porque en el
+    // modelo mensual se factura la cuota del plan. En un plan legacy esa cuota no
+    // existe y el cobro propio del servicio es la única vía de facturarlo.
+    if (servicio.requiere_factura === 0 && !esPlanLegacyConCobroPropio) {
       return res.status(400).json({ error: 'El servicio está marcado como "Sin factura"; no admite emisión de comprobantes.' });
     }
 

@@ -13,6 +13,7 @@ const { detalleMensualPorCuota } = require('../utils/planMantenimientoMensual');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { whereCobroConMonto, whereCuotaConMonto } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
+const { sincronizarFechasPagoCuotas } = require('../utils/fechaPagoCuotas');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -208,7 +209,7 @@ const listar = async (req, res) => {
       q, estado_cobro, vencidos, en_mora, pagados, pendientes,
       id_cliente, id_tipo_servicio, id_proyecto,
       tipo_categoria, situacion_cobro, por_cobrar, banco, id_cuenta_bancaria,
-      moneda, monto_min, monto_max,
+      moneda, monto_min, monto_max, numero_cuotas,
       aprobacion_desde, aprobacion_hasta,
       orden, direccion
     } = req.query;
@@ -219,6 +220,10 @@ const listar = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (id_cliente) where.id_cliente = Number(id_cliente);
     if (id_proyecto) where.id_servicio = Number(id_proyecto);
+    // Filtro "N° de cobros": en cuántas cuotas se cobra (el total de la columna
+    // "Cuotas (P/T)"). Coincidencia exacta; un valor no entero o < 1 se ignora.
+    const nCuotas = Number(numero_cuotas);
+    if (Number.isInteger(nCuotas) && nCuotas >= 1) where.numero_cuotas = nCuotas;
     // Filtro por moneda del cobro: es la divisa de sus tres importes (facturado,
     // abonado y saldo) y la que agrupa el resumen de cobranza, así que recortar
     // por ella deja tarjetas y tabla en una sola moneda. Un código fuera del
@@ -705,13 +710,16 @@ const registrarPago = async (req, res) => {
       if (!cuenta) return res.status(400).json({ error: 'Cuenta bancaria no encontrada o inactiva' });
     }
 
+    // Fecha REAL de cobro (la que registra Contabilidad, puede ser pasada): es
+    // también la fecha de pago de las cuotas que este abono termine de cubrir.
+    const fechaAbono = d.fecha_pago ? parseYMDLima(d.fecha_pago) : inicioDelDiaLima();
     const numAbono = cobro.pagos.length + 1;
     await prisma.tbl_pagos.create({
       data: {
         id_cobro: id,
         numero_abono: numAbono,
         monto,
-        fecha_pago: d.fecha_pago ? parseYMDLima(d.fecha_pago) : inicioDelDiaLima(),
+        fecha_pago: fechaAbono,
         metodo_pago: metodoPago,
         id_archivo_comprobante: d.id_archivo_comprobante || null,
         id_cuenta_bancaria: idCuentaBancaria,
@@ -747,7 +755,7 @@ const registrarPago = async (req, res) => {
         data: {
           monto_pagado: nuevoMontoPagado,
           estado_cuota: estadoCu,
-          fecha_pago: estadoCu === 'Pagada' ? inicioDelDiaLima() : cu.fecha_pago,
+          fecha_pago: estadoCu === 'Pagada' ? fechaAbono : cu.fecha_pago,
           user_id_modification: req.user.id, date_time_modification: new Date()
         }
       });
@@ -778,7 +786,8 @@ const registrarPago = async (req, res) => {
         saldo_pendiente: nuevoSaldo,
         cuotas_pagadas: cuotasPagadas,
         cuotas_faltantes: Math.max(0, cobro.numero_cuotas - cuotasPagadas),
-        fecha_ultimo_abono: d.fecha_pago ? parseYMDLima(d.fecha_pago) : inicioDelDiaLima(),
+        // Un abono con fecha anterior a otro ya registrado no retrocede el "último abono".
+        fecha_ultimo_abono: cobro.pagos.reduce((max, p) => (p.fecha_pago > max ? p.fecha_pago : max), fechaAbono),
         fecha_proximo_abono: nuevaFechaProximo,
         estado_cobro: nuevoEstado,
         user_id_modification: req.user.id, date_time_modification: new Date()
@@ -827,6 +836,51 @@ const registrarPago = async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al registrar abono: ' + err.message });
+  }
+};
+
+/**
+ * PATCH /:id/pagos/:idPago/fecha — corrige la fecha REAL de cobro de un abono
+ * (Super Admin y Contabilidad). Solo cambia la fecha: monto, cuenta y cuotas
+ * cubiertas quedan igual. Las cuotas que ese abono terminó de cubrir y el
+ * "último abono" del cobro se realinean con la nueva fecha.
+ *
+ * Body: { fecha_pago: 'YYYY-MM-DD' }
+ */
+const editarFechaPago = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const idPago = Number(req.params.idPago);
+    const fechaYMD = String(req.body.fecha_pago || '').slice(0, 10);
+    // Ida y vuelta por Date: descarta también días inexistentes (2026-02-31).
+    const fechaValida = /^\d{4}-\d{2}-\d{2}$/.test(fechaYMD)
+      && new Date(`${fechaYMD}T00:00:00Z`).toISOString().slice(0, 10) === fechaYMD;
+    if (!fechaValida) {
+      return res.status(400).json({ error: 'Fecha de cobro inválida' });
+    }
+    const pago = await prisma.tbl_pagos.findFirst({ where: { id: idPago, id_cobro: id, estado: 1 } });
+    if (!pago) return res.status(404).json({ error: 'Abono no encontrado' });
+
+    const anterior = pago.fecha_pago.toISOString().slice(0, 10);
+    if (anterior === fechaYMD) return res.json({ ok: true, cuotas_actualizadas: 0 });
+
+    const cambios = await prisma.$transaction(async (tx) => {
+      await tx.tbl_pagos.update({
+        where: { id: idPago },
+        data: { fecha_pago: parseYMDLima(fechaYMD), user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      return sincronizarFechasPagoCuotas(tx, id, req.user.id);
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_pagos', id_entidad: idPago,
+      accion: 'UPDATE', valor_anterior: { fecha_pago: anterior },
+      valor_nuevo: { fecha_pago: fechaYMD, cuotas: cambios.cuotas }, ip: req.ip
+    });
+    res.json({ ok: true, cuotas_actualizadas: cambios.cuotas.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar la fecha del abono: ' + err.message });
   }
 };
 
@@ -1277,4 +1331,4 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, cuotasNoFacturadas, listarProyectos, eliminar };
+module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, editarFechaPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, cuotasNoFacturadas, listarProyectos, eliminar };
