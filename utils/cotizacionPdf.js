@@ -4,12 +4,14 @@
  * Usa pdfkit (server-side, sin Chromium). Devuelve un Buffer con el PDF
  * para que el caller lo suba a Wasabi vía utils/storage.js.
  *
- * No referencia datos hardcodeados de la empresa: todo lo lee de
- * tbl_configuracion (utils/configuracion.js).
+ * No referencia datos hardcodeados de la empresa: la cabecera sale de la
+ * empresa emisora elegida en la versión (utils/empresaEmisora.js) y los
+ * términos por defecto de tbl_configuracion (utils/configuracion.js).
  */
 
 const PDFDocument = require('pdfkit');
 const configuracion = require('./configuracion');
+const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const prisma = require('../config/prisma');
 const { keyDesdeRuta, obtenerStream } = require('./storage');
 
@@ -94,10 +96,7 @@ function formatearFecha(d) {
  * @returns {Promise<Buffer>}
  */
 async function generarPdfCotizacion(ctx) {
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION',
-    'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
-  ]);
+  const empresa = await obtenerDatosEmpresa(ctx.version.id_empresa_emisora);
   const terminos = ctx.version.terminos || (await configuracion.obtener('COTIZACION_TERMINOS'));
   const garantia = (ctx.version.garantia || '').trim();
   const cuentasBancarias = await obtenerCuentasBancariasPdf(ctx.version.cuentas_pdf);

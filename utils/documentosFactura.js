@@ -56,6 +56,21 @@ function errorHttp(mensaje, codigoHttp = 400) {
   return err;
 }
 
+/** Tipo de documento validado contra el catálogo (lanza 400 si no está). */
+function tipoDocumentoValido(tipo) {
+  if (!esTipoDocumentoFacturaValido(tipo)) {
+    throw errorHttp(`Tipo de documento inválido: "${tipo}". Valores permitidos: ${TIPOS_DOCUMENTO_FACTURA_CODIGOS.join(', ')}`);
+  }
+  return tipo;
+}
+
+/** Descripción normalizada: recortada a 200 caracteres, o null si viene vacía. */
+function descripcionDocumento(descripcion) {
+  return typeof descripcion === 'string' && descripcion.trim()
+    ? descripcion.trim().slice(0, 200)
+    : null;
+}
+
 /**
  * Normaliza el payload de documentos que llega del cliente. Un tipo fuera del
  * catálogo se rechaza en vez de guardarse como "Otro" en silencio: el tipo es
@@ -65,19 +80,11 @@ function normalizarDocumentos(crudo) {
   if (!Array.isArray(crudo)) return [];
   return crudo
     .filter(d => d && d.id_archivo)
-    .map(d => {
-      const tipo = d.tipo_documento || TIPO_DOCUMENTO_FACTURA_OTRO;
-      if (!esTipoDocumentoFacturaValido(tipo)) {
-        throw errorHttp(`Tipo de documento inválido: "${tipo}". Valores permitidos: ${TIPOS_DOCUMENTO_FACTURA_CODIGOS.join(', ')}`);
-      }
-      return {
-        id_archivo: Number(d.id_archivo),
-        tipo_documento: tipo,
-        descripcion: typeof d.descripcion === 'string' && d.descripcion.trim()
-          ? d.descripcion.trim().slice(0, 200)
-          : null
-      };
-    })
+    .map(d => ({
+      id_archivo: Number(d.id_archivo),
+      tipo_documento: tipoDocumentoValido(d.tipo_documento || TIPO_DOCUMENTO_FACTURA_OTRO),
+      descripcion: descripcionDocumento(d.descripcion)
+    }))
     .filter(d => Number.isInteger(d.id_archivo) && d.id_archivo > 0);
 }
 
@@ -157,7 +164,10 @@ module.exports = {
   MAX_DOCUMENTOS_FACTURA,
   SELECT_ARCHIVO,
   INCLUDE_DOCUMENTOS,
+  errorHttp,
   esTipoDocumentoFacturaValido,
+  tipoDocumentoValido,
+  descripcionDocumento,
   normalizarDocumentos,
   vincularDocumentosEnTx,
   bajaDocumentosDeFacturasEnTx

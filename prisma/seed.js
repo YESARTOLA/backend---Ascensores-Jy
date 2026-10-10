@@ -219,6 +219,25 @@ async function main() {
   await upsertConfig('MAPA_CENTRO_LNG', '-77.0428', 'number', 'Longitud por defecto del mapa de clientes (Lima)');
   await upsertConfig('MAPA_ZOOM_DEFAULT', '12', 'number', 'Zoom por defecto del mapa de clientes');
 
+  // Empresa emisora predeterminada (cabecera de los PDF). Con `migrate deploy`
+  // la crea la migración 20261010120000_empresas_emisoras; con `db push` la
+  // tabla nace vacía y se siembra aquí con las claves EMPRESA_* de arriba.
+  if ((await prisma.tbl_empresas_emisoras.count({ where: { estado: 1 } })) === 0) {
+    const cfg = Object.fromEntries((await prisma.tbl_configuracion.findMany({
+      where: { clave: { startsWith: 'EMPRESA_' } }
+    })).map(f => [f.clave, f.valor]));
+    await prisma.tbl_empresas_emisoras.create({
+      data: {
+        razon_social: cfg.EMPRESA_RAZON_SOCIAL || 'Ascensores Jy S.A.C.',
+        ruc: cfg.EMPRESA_RUC || '20000000000',
+        direccion: cfg.EMPRESA_DIRECCION || null,
+        telefono: cfg.EMPRESA_TELEFONO || null,
+        correo: cfg.EMPRESA_CORREO || null,
+        es_predeterminada: true
+      }
+    });
+  }
+
   console.log('───────────────────────────────────────────────');
   console.log('✅ Seed completado (modo PRODUCCIÓN).');
   console.log('───────────────────────────────────────────────');

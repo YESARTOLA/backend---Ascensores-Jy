@@ -8,12 +8,12 @@
  * `/exportar?formato=pdf` (por si se consume desde un cliente que no quiere
  * generar el PDF localmente).
  *
- * Cabecera empresa se obtiene de tbl_configuracion — sin hardcodeo.
+ * Cabecera empresa: la empresa emisora predeterminada (utils/empresaEmisora.js) — sin hardcodeo.
  */
 
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const configuracion = require('./configuracion');
+const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const { ymdLima } = require('./tiempo');
 const { obtenerFrecuencia } = require('./frecuenciaMantenimiento');
 const { totalesDelPlan } = require('./planMantenimientoMensual');
@@ -151,10 +151,10 @@ function _mapearFilaPrograma(i) {
 function _mapearFilaPlan(p) {
   // Un plan cubre N ascensores; el precio total es la suma de sus montos.
   const ascs = (p.ascensores || []).map(a => a.ascensor).filter(Boolean);
-  // El importe del plan es el monto MENSUAL global, cobrado en los meses con
-  // mantenimiento fuera del cupo gratuito (SSoT:
-  // utils/planMantenimientoMensual.totalesDelPlan).
-  const tot = totalesDelPlan(p, p.meses_con_mantenimiento);
+  // El importe del plan es el monto MENSUAL global (o, en planes con precio por
+  // ascensor, el importe de cada mes), cobrado en los meses con mantenimiento
+  // fuera del cupo gratuito (SSoT: utils/planMantenimientoMensual.totalesDelPlan).
+  const tot = totalesDelPlan(p, p.meses_con_mantenimiento, p.montos_por_mes);
   const mensual = tot.monto_mensual;
   const meses = tot.meses;
   const moneda = p.moneda || (p.ascensores || [])[0]?.moneda || MONEDA_POR_DEFECTO;
@@ -355,9 +355,7 @@ function _dibujarHojaCliente(ws, empresa, hoy, grupo) {
 }
 
 async function generarExcelMantenimientos({ dataset, filtros }) {
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION'
-  ]);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
 
   const wb = new ExcelJS.Workbook();
@@ -393,9 +391,7 @@ async function generarExcelMantenimientos({ dataset, filtros }) {
  * para clientes que consuman el endpoint sin pasar por el navegador.
  */
 async function generarPdfMantenimientos({ dataset, filtros }) {
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION'
-  ]);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
   const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 36 });
   const chunks = [];

@@ -43,6 +43,9 @@ router.post('/:id/programacion/reconstruir', permitirRoles('super_admin', 'admin
 // mensual pactado, con el detalle de todas las visitas de ese mes.
 router.get('/:id/periodos', permitirRoles('super_admin', 'admin', 'coordinador', 'contabilidad'), c.listarPeriodos);
 router.post('/:id/periodos/aprobar', permitirRoles('super_admin', 'admin'), c.aprobarPeriodo);
+// Deshace la aprobación de un mes (aprobado por error) mientras no tenga
+// factura vigente ni abonos.
+router.post('/:id/periodos/revertir', permitirRoles('super_admin', 'admin'), c.revertirPeriodo);
 
 // Preview del borrado en cascada (solo lectura). Mismo rol que el DELETE: lo
 // consulta el modal de confirmación para mostrar el impacto real antes de borrar.

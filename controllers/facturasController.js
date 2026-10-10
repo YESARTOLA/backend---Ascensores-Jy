@@ -7,7 +7,7 @@ const {
   ESTADO_SERVICIO_EN_CURSO
 } = require('../utils/estadoServicio');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima, parseYMDFinDiaLima } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDFinDiaLima, ymdDeFecha } = require('../utils/tiempo');
 const { descartarAlertaFacturarServicio } = require('../utils/recordatoriosAuto');
 const {
   TIPOS_COMPROBANTE_CODIGOS,
@@ -26,11 +26,15 @@ const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionElim
 const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
+const { sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const {
   MAX_DOCUMENTOS_FACTURA,
   SELECT_ARCHIVO,
   INCLUDE_DOCUMENTOS,
+  errorHttp,
+  tipoDocumentoValido,
+  descripcionDocumento,
   vincularDocumentosEnTx,
   bajaDocumentosDeFacturasEnTx
 } = require('../utils/documentosFactura');
@@ -410,6 +414,19 @@ async function recomputarEstadoFacturacionServicio(idServicio, idUsuario) {
 }
 
 /**
+ * Factura de PLAN: refleja el cambio en los mantenimientos del mes que cubre
+ * (Contabilidad lista cada uno con su estado de factura). La factura ya quedó
+ * grabada: un fallo aquí se registra pero no la deshace.
+ */
+async function sincronizarServiciosDelPlan(idPlan, idUsuario) {
+  try {
+    await sincronizarFacturacionServiciosPlan(prisma, idPlan, idUsuario);
+  } catch (err) {
+    console.error(`[facturas] sincronizar servicios del plan #${idPlan}:`, err);
+  }
+}
+
+/**
  * Crea una factura para el cobro ÚNICO de un plan de mantenimiento (sin servicio).
  * El plan se factura una sola vez por el total; admite factura general o por cuota,
  * con las mismas reglas de exclusividad que las facturas por servicio.
@@ -424,30 +441,15 @@ async function _crearFacturaPlan(req, res, d, tipoComprobante) {
   if (!cobro) return res.status(400).json({ error: 'El plan no tiene cobro activo para facturar' });
 
   const idCuota = d.id_cuota ? Number(d.id_cuota) : null;
-  const facturasExistentes = await prisma.tbl_facturas.findMany({
-    where: { id_mantenimiento_plan: idPlan, estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } }
+  const errorCobertura = await validarCoberturaFactura({
+    ambito: { id_mantenimiento_plan: idPlan },
+    nombre: 'plan',
+    cobro,
+    totalCobrable: Number(cobro.monto_total || 0),
+    idCuota,
+    monto: d.monto
   });
-  const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
-  const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
-
-  if (idCuota === null) {
-    if (hayPorCuota) return res.status(400).json({ error: 'Este plan ya tiene facturas por cuota. No se puede emitir una factura general además.' });
-    if (hayGeneral) return res.status(400).json({ error: 'Este plan ya tiene una factura general emitida.' });
-    const totalCobrable = Number(cobro.monto_total || 0);
-    if (totalCobrable > 0 && Number(d.monto) - totalCobrable > 0.01) {
-      return res.status(400).json({ error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) excede el total del plan (S/ ${totalCobrable.toFixed(2)}).` });
-    }
-  } else {
-    if (hayGeneral) return res.status(400).json({ error: 'Este plan ya tiene una factura general. No se puede emitir factura por cuota además.' });
-    const cuota = await prisma.tbl_cobros_cuotas.findUnique({ where: { id: idCuota } });
-    if (!cuota) return res.status(400).json({ error: 'Cuota no existe' });
-    if (cuota.id_cobro !== cobro.id) return res.status(400).json({ error: 'La cuota no pertenece a este plan' });
-    const yaFacturada = facturasExistentes.find(f => f.id_cuota === idCuota);
-    if (yaFacturada) return res.status(400).json({ error: `La cuota N° ${cuota.numero_cuota} ya tiene factura (${yaFacturada.numero_factura})` });
-    if (Math.abs(Number(d.monto) - Number(cuota.monto)) > 0.01) {
-      return res.status(400).json({ error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) debe igualar el monto de la cuota N° ${cuota.numero_cuota} (S/ ${Number(cuota.monto).toFixed(2)})` });
-    }
-  }
+  if (errorCobertura) return res.status(400).json({ error: errorCobertura });
 
   const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
     ? d.estado_factura : ESTADO_FACTURA_EMITIDA;
@@ -477,6 +479,7 @@ async function _crearFacturaPlan(req, res, d, tipoComprobante) {
   await registrarAuditoria({
     id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'CREATE', valor_nuevo: factura, ip: req.ip
   });
+  await sincronizarServiciosDelPlan(idPlan, req.user.id);
   return res.status(201).json({ data: factura });
 }
 
@@ -552,52 +555,19 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'El servicio está marcado como "Sin factura"; no admite emisión de comprobantes.' });
     }
 
-    // Modo: general (id_cuota null) vs por-cuota (id_cuota set).
-    // Mutuamente excluyentes a nivel servicio.
+    // Modo: general (id_cuota null) vs por-cuota (id_cuota set), mutuamente
+    // excluyentes a nivel servicio. La general no supera el total cobrable
+    // (monto del cobro o, en su defecto, el precio del servicio).
     const idCuota = d.id_cuota ? Number(d.id_cuota) : null;
-    const facturasExistentes = await prisma.tbl_facturas.findMany({
-      where: { id_servicio: Number(d.id_servicio), estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } }
+    const errorCobertura = await validarCoberturaFactura({
+      ambito: { id_servicio: Number(d.id_servicio) },
+      nombre: 'servicio',
+      cobro: servicio.cobro,
+      totalCobrable: Number(servicio.cobro?.monto_total ?? servicio.precio_interno ?? 0),
+      idCuota,
+      monto: d.monto
     });
-    const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
-    const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
-
-    if (idCuota === null) {
-      // Quiere crear factura general
-      if (hayPorCuota) {
-        return res.status(400).json({ error: 'Este servicio ya tiene facturas por cuota. No se puede emitir una factura general además.' });
-      }
-      if (hayGeneral) {
-        return res.status(400).json({ error: 'Este servicio ya tiene una factura general emitida.' });
-      }
-      // No exceder el monto del servicio: la factura general no puede superar el
-      // total cobrable (monto del cobro o, en su defecto, el precio del servicio).
-      const totalCobrable = Number(servicio.cobro?.monto_total ?? servicio.precio_interno ?? 0);
-      if (totalCobrable > 0 && Number(d.monto) - totalCobrable > 0.01) {
-        return res.status(400).json({
-          error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) excede el total del servicio (S/ ${totalCobrable.toFixed(2)}).`
-        });
-      }
-    } else {
-      // Quiere crear factura por cuota
-      if (hayGeneral) {
-        return res.status(400).json({ error: 'Este servicio ya tiene una factura general. No se puede emitir factura por cuota además.' });
-      }
-      const cuota = await prisma.tbl_cobros_cuotas.findUnique({ where: { id: idCuota } });
-      if (!cuota) return res.status(400).json({ error: 'Cuota no existe' });
-      if (servicio.cobro && cuota.id_cobro !== servicio.cobro.id) {
-        return res.status(400).json({ error: 'La cuota no pertenece a este servicio' });
-      }
-      const yaFacturada = facturasExistentes.find(f => f.id_cuota === idCuota);
-      if (yaFacturada) {
-        return res.status(400).json({ error: `La cuota N° ${cuota.numero_cuota} ya tiene factura (${yaFacturada.numero_factura})` });
-      }
-      // Monto debe igualar el monto de la cuota (no editable)
-      if (Math.abs(Number(d.monto) - Number(cuota.monto)) > 0.01) {
-        return res.status(400).json({
-          error: `El monto de la factura (S/ ${Number(d.monto).toFixed(2)}) debe igualar el monto de la cuota N° ${cuota.numero_cuota} (S/ ${Number(cuota.monto).toFixed(2)})`
-        });
-      }
-    }
+    if (errorCobertura) return res.status(400).json({ error: errorCobertura });
 
     const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
       ? d.estado_factura
@@ -690,29 +660,15 @@ const cambiarEstado = async (req, res) => {
     // Facturas de servicio: recalcular estado_facturacion agregado y sincronizar
     // el estado contable del servicio. Las facturas de PLAN no tienen servicio.
     if (previo.id_servicio) {
-      const estadoFacturacion = await recomputarEstadoFacturacionServicio(
+      await sincronizarServicioTrasFactura(
         previo.id_servicio,
-        req.user.id
+        req.user.id,
+        `Factura ${previo.numero_factura} pasó a ${estado_factura}`
       );
-      const servicio = await prisma.tbl_servicios_proyectos.findUnique({
-        where: { id: previo.id_servicio }, include: { cobro: true }
-      });
-      if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
-        const cobro = servicio.cobro;
-        const nuevoEstadoServ = estadoServicioDesdeCobro({
-          estado_cobro: cobro?.estado_cobro,
-          total_abonado: cobro?.total_abonado,
-          saldo_pendiente: cobro?.saldo_pendiente,
-          facturado: esFacturado(estadoFacturacion)
-        });
-        await cambiarEstadoServicio(
-          previo.id_servicio,
-          nuevoEstadoServ,
-          req.user.id,
-          `Factura ${previo.numero_factura} pasó a ${estado_factura}`
-        );
-      }
     }
+    // Factura de PLAN: anularla (o marcarla Enviada) cambia el estado de los
+    // mantenimientos del mes que cubre.
+    if (previo.id_mantenimiento_plan) await sincronizarServiciosDelPlan(previo.id_mantenimiento_plan, req.user.id);
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: id,
@@ -770,21 +726,9 @@ const eliminar = async (req, res) => {
     // Facturas de servicio: recalcular estado_facturacion y resincronizar estado.
     // Las facturas de PLAN no tienen servicio que recalcular.
     if (idServicio) {
-      const estadoFacturacion = await recomputarEstadoFacturacionServicio(idServicio, req.user.id);
-      const servicio = await prisma.tbl_servicios_proyectos.findUnique({
-        where: { id: idServicio }, include: { cobro: true }
-      });
-      if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
-        const cobro = servicio.cobro;
-        const nuevoEstadoServ = estadoServicioDesdeCobro({
-          estado_cobro: cobro?.estado_cobro,
-          total_abonado: cobro?.total_abonado,
-          saldo_pendiente: cobro?.saldo_pendiente,
-          facturado: esFacturado(estadoFacturacion)
-        });
-        await cambiarEstadoServicio(idServicio, nuevoEstadoServ, req.user.id, `Factura ${previo.numero_factura} eliminada`);
-      }
+      await sincronizarServicioTrasFactura(idServicio, req.user.id, `Factura ${previo.numero_factura} eliminada`);
     }
+    if (previo.id_mantenimiento_plan) await sincronizarServiciosDelPlan(previo.id_mantenimiento_plan, req.user.id);
 
     res.json({ ok: true });
   } catch (err) {
@@ -894,43 +838,402 @@ const eliminarDocumento = async (req, res) => {
   }
 };
 
+/** Archivo activo de tbl_archivos con ese id, o null. */
+async function archivoActivo(idArchivo) {
+  const id = Number(idArchivo);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return prisma.tbl_archivos.findFirst({ where: { id, estado: 1 }, select: { id: true } });
+}
+
 /**
- * Adjunta el comprobante a una factura registrada SIN él. No reemplaza uno ya
- * adjunto: la factura pudo enviarse al cliente con ese archivo, y pisarlo
- * borraría lo que se le entregó. Cualquier otro archivo va como documento
- * adicional.
+ * Cambia el comprobante de la factura (tbl_facturas.id_archivo): lo adjunta,
+ * lo reemplaza (`idArchivoNuevo`) o lo quita (null). El archivo anterior se da
+ * de baja y se purga del bucket tras el commit; la auditoría guarda cuál era.
+ *
+ * El UPDATE exige que el comprobante siga siendo el que se leyó: dos cambios
+ * simultáneos no pueden pisarse en silencio.
  */
+async function cambiarComprobante(factura, idArchivoNuevo, idUsuario, ip) {
+  let key = null;
+  await prisma.$transaction(async (tx) => {
+    const r = await tx.tbl_facturas.updateMany({
+      where: { id: factura.id, estado: 1, id_archivo: factura.id_archivo },
+      data: { id_archivo: idArchivoNuevo, user_id_modification: idUsuario, date_time_modification: new Date() }
+    });
+    if (r.count === 0) throw errorHttp('El comprobante de la factura cambió mientras tanto. Vuelve a abrirla.', 409);
+    key = await bajaArchivoEnTx(tx, factura.id_archivo, idUsuario);
+  });
+  await purgarObjetosWasabi([key]);
+  await registrarAuditoria({
+    id_usuario: idUsuario, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'UPDATE',
+    valor_anterior: { id_archivo: factura.id_archivo }, valor_nuevo: { id_archivo: idArchivoNuevo }, ip
+  });
+}
+
+/** Adjunta el comprobante a la factura o REEMPLAZA el que tiene. */
 const adjuntarComprobante = async (req, res) => {
   try {
     const factura = await facturaVigente(Number(req.params.id));
     if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
-    const idArchivo = Number(req.body?.id_archivo);
-    const archivo = Number.isInteger(idArchivo) && idArchivo > 0
-      ? await prisma.tbl_archivos.findFirst({ where: { id: idArchivo, estado: 1 }, select: { id: true } })
-      : null;
+    const archivo = await archivoActivo(req.body?.id_archivo);
     if (!archivo) return res.status(400).json({ error: 'Archivo no válido' });
-
-    // Condición en el propio UPDATE: dos adjuntos simultáneos no pueden pisarse.
-    const r = await prisma.tbl_facturas.updateMany({
-      where: { id: factura.id, estado: 1, id_archivo: null },
-      data: { id_archivo: archivo.id, user_id_modification: req.user.id, date_time_modification: new Date() }
-    });
-    if (r.count === 0) {
-      return res.status(400).json({ error: 'La factura ya tiene su comprobante. Agrega los demás archivos como documentos adicionales.' });
+    if (archivo.id !== factura.id_archivo) {
+      await cambiarComprobante(factura, archivo.id, req.user.id, req.ip);
     }
-
-    await registrarAuditoria({
-      id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id,
-      accion: 'UPDATE', valor_anterior: { id_archivo: null }, valor_nuevo: { id_archivo: archivo.id }, ip: req.ip
-    });
     res.json(await respuestaDocumentos(await facturaVigente(factura.id)));
   } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
     console.error('[facturas.adjuntarComprobante]', err);
     res.status(500).json({ error: 'Error al adjuntar el comprobante' });
   }
 };
 
+/** Quita el comprobante de la factura (la factura queda registrada sin archivo). */
+const quitarComprobante = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    if (!factura.id_archivo) return res.status(400).json({ error: 'La factura no tiene comprobante adjunto' });
+    await cambiarComprobante(factura, null, req.user.id, req.ip);
+    res.json(await respuestaDocumentos(await facturaVigente(factura.id)));
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[facturas.quitarComprobante]', err);
+    res.status(500).json({ error: 'Error al quitar el comprobante' });
+  }
+};
+
+/**
+ * Edita un documento adicional: su tipo, su descripción y/o su archivo. Al
+ * reemplazar el archivo, el anterior se da de baja y se purga del bucket.
+ * Body (todo opcional): { tipo_documento, descripcion, id_archivo }
+ */
+const editarDocumento = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    const idDocumento = Number(req.params.idDocumento);
+    const documento = Number.isInteger(idDocumento) && idDocumento > 0
+      ? await prisma.tbl_facturas_archivos.findFirst({ where: { id: idDocumento, id_factura: factura.id, estado: 1 } })
+      : null;
+    if (!documento) return res.status(404).json({ error: 'Documento no encontrado' });
+
+    const d = req.body || {};
+    const data = {};
+    if (d.tipo_documento !== undefined) data.tipo_documento = tipoDocumentoValido(d.tipo_documento);
+    if (d.descripcion !== undefined) data.descripcion = descripcionDocumento(d.descripcion);
+    if (d.id_archivo !== undefined && Number(d.id_archivo) !== documento.id_archivo) {
+      const archivo = await archivoActivo(d.id_archivo);
+      if (!archivo) return res.status(400).json({ error: 'Archivo no válido' });
+      data.id_archivo = archivo.id;
+    }
+    if (Object.keys(data).length === 0) return res.json(await respuestaDocumentos(factura));
+
+    let key = null;
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_facturas_archivos.update({
+        where: { id: documento.id },
+        data: { ...data, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      if (data.id_archivo) key = await bajaArchivoEnTx(tx, documento.id_archivo, req.user.id);
+    });
+    await purgarObjetosWasabi([key]);
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas_archivos', id_entidad: documento.id, accion: 'UPDATE',
+      valor_anterior: Object.fromEntries(Object.keys(data).map(k => [k, documento[k]])),
+      valor_nuevo: data,
+      ip: req.ip
+    });
+    res.json(await respuestaDocumentos(factura));
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[facturas.editarDocumento]', err);
+    res.status(500).json({ error: 'Error al editar el documento' });
+  }
+};
+
+// ---------------------------------------------------------------------
+// EDICIÓN DE LA FACTURA
+//
+// Corrige los datos de una factura ya registrada: tipo de comprobante, número,
+// fecha de emisión, monto, cobertura (general o cuota) y estado. Sus archivos
+// se editan con los endpoints de documentos de arriba.
+// ---------------------------------------------------------------------
+
+/**
+ * Tras un cambio en las facturas de un servicio: recalcula su estado de
+ * facturación agregado y, si el servicio ya está en post-ejecución, su estado
+ * (lo mueven el cobro y la facturación).
+ */
+async function sincronizarServicioTrasFactura(idServicio, idUsuario, motivo) {
+  const estadoFacturacion = await recomputarEstadoFacturacionServicio(idServicio, idUsuario);
+  const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+    where: { id: idServicio }, include: { cobro: true }
+  });
+  if (servicio && estaServicioFinalizado(servicio.estado_servicio)) {
+    const cobro = servicio.cobro;
+    const nuevoEstadoServ = estadoServicioDesdeCobro({
+      estado_cobro: cobro?.estado_cobro,
+      total_abonado: cobro?.total_abonado,
+      saldo_pendiente: cobro?.saldo_pendiente,
+      facturado: esFacturado(estadoFacturacion)
+    });
+    await cambiarEstadoServicio(idServicio, nuevoEstadoServ, idUsuario, motivo);
+  }
+}
+
+/**
+ * Reglas de COBERTURA de una factura y de su monto, comunes a emitirla y a
+ * editarla:
+ *  - factura general y facturas por cuota se excluyen dentro del mismo
+ *    servicio / plan; hay una sola general y una sola factura por cuota;
+ *  - la general no supera el total cobrable; la de cuota iguala el monto de la cuota.
+ * Las anuladas no cuentan. `excluirId` deja fuera a la propia factura al editar.
+ *
+ * @param {object} p
+ * @param {object} p.ambito         { id_servicio } | { id_mantenimiento_plan }
+ * @param {'servicio'|'plan'} p.nombre  cómo nombrar el ámbito en los mensajes
+ * @param {object|null} p.cobro     cobro del ámbito (la cuota debe ser suya)
+ * @param {number} p.totalCobrable  tope de la factura general (0 = sin tope)
+ * @param {number|null} p.idCuota
+ * @param {number|string} p.monto
+ * @param {number} [p.excluirId]
+ * @returns {Promise<string|null>} mensaje de error, o null si es válida
+ */
+async function validarCoberturaFactura({ ambito, nombre, cobro, totalCobrable, idCuota, monto, excluirId }) {
+  const facturasExistentes = await prisma.tbl_facturas.findMany({
+    where: {
+      ...ambito, estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA },
+      ...(excluirId ? { id: { not: excluirId } } : {})
+    }
+  });
+  const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
+  const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
+
+  if (idCuota === null) {
+    if (hayPorCuota) return `Este ${nombre} ya tiene facturas por cuota. No se puede emitir una factura general además.`;
+    if (hayGeneral) return `Este ${nombre} ya tiene una factura general emitida.`;
+    if (totalCobrable > 0 && Number(monto) - totalCobrable > 0.01) {
+      return `El monto de la factura (S/ ${Number(monto).toFixed(2)}) excede el total del ${nombre} (S/ ${totalCobrable.toFixed(2)}).`;
+    }
+    return null;
+  }
+  if (hayGeneral) return `Este ${nombre} ya tiene una factura general. No se puede emitir factura por cuota además.`;
+  const cuota = await prisma.tbl_cobros_cuotas.findUnique({ where: { id: idCuota } });
+  if (!cuota || cuota.estado !== 1) return 'Cuota no existe';
+  if (cobro && cuota.id_cobro !== cobro.id) return `La cuota no pertenece a este ${nombre}`;
+  const yaFacturada = facturasExistentes.find(f => f.id_cuota === idCuota);
+  if (yaFacturada) return `La cuota N° ${cuota.numero_cuota} ya tiene factura (${yaFacturada.numero_factura})`;
+  // El monto de una factura de cuota es el de la cuota (no editable).
+  if (Math.abs(Number(monto) - Number(cuota.monto)) > 0.01) {
+    return `El monto de la factura (S/ ${Number(monto).toFixed(2)}) debe igualar el monto de la cuota N° ${cuota.numero_cuota} (S/ ${Number(cuota.monto).toFixed(2)})`;
+  }
+  return null;
+}
+
+/**
+ * Ámbito de cobertura de una factura ya registrada (su servicio o su plan),
+ * para `validarCoberturaFactura`. Null si la factura no cuelga de ninguno.
+ */
+async function contextoCoberturaDeFactura(f) {
+  if (f.id_servicio) {
+    const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+      where: { id: f.id_servicio }, include: { cobro: true }
+    });
+    return {
+      ambito: { id_servicio: f.id_servicio },
+      nombre: 'servicio',
+      cobro: servicio?.cobro || null,
+      totalCobrable: Number(servicio?.cobro?.monto_total ?? servicio?.precio_interno ?? 0)
+    };
+  }
+  if (f.id_mantenimiento_plan) {
+    const cobro = f.id_cobro ? await prisma.tbl_cobros.findUnique({ where: { id: f.id_cobro } }) : null;
+    return {
+      ambito: { id_mantenimiento_plan: f.id_mantenimiento_plan },
+      nombre: 'plan',
+      cobro,
+      totalCobrable: Number(cobro?.monto_total || 0)
+    };
+  }
+  return null;
+}
+
+/**
+ * Lo que necesita el formulario de edición: los datos de la factura, su moneda
+ * y las opciones de cobertura — las cuotas activas de su cobro y las OTRAS
+ * facturas vigentes del mismo servicio o plan (para marcar qué está ocupado).
+ */
+const contextoEdicion = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const f = Number.isInteger(id) && id > 0
+      ? await prisma.tbl_facturas.findUnique({
+          where: { id },
+          include: {
+            cobro: { select: { moneda: true } },
+            servicio: { select: { moneda: true } },
+            cuota: { select: { numero_cuota: true } }
+          }
+        })
+      : null;
+    if (!f || f.estado === 0) return res.status(404).json({ error: 'Factura no encontrada' });
+    const ctx = await contextoCoberturaDeFactura(f);
+    const idCobro = ctx?.cobro?.id ?? f.id_cobro;
+    const [cuotas, otrasFacturas] = await Promise.all([
+      idCobro
+        ? prisma.tbl_cobros_cuotas.findMany({
+            where: { id_cobro: idCobro, estado: 1 },
+            orderBy: { numero_cuota: 'asc' },
+            select: { id: true, numero_cuota: true, numero_mes: true, fecha_vencimiento: true, monto: true }
+          })
+        : [],
+      ctx
+        ? prisma.tbl_facturas.findMany({
+            where: { ...ctx.ambito, estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA }, id: { not: id } },
+            select: { id: true, numero_factura: true, id_cuota: true }
+          })
+        : []
+    ]);
+    res.json({
+      data: {
+        factura: {
+          id: f.id,
+          numero_factura: f.numero_factura,
+          tipo_comprobante: f.tipo_comprobante,
+          fecha_emision: f.fecha_emision,
+          monto: f.monto,
+          id_cuota: f.id_cuota,
+          numero_cuota: f.cuota?.numero_cuota ?? null,
+          estado_factura: f.estado_factura,
+          es_plan: !f.id_servicio && !!f.id_mantenimiento_plan
+        },
+        moneda: f.cobro?.moneda || f.servicio?.moneda || MONEDA_POR_DEFECTO,
+        cuotas,
+        otras_facturas: otrasFacturas
+      }
+    });
+  } catch (err) {
+    console.error('[facturas.contextoEdicion]', err);
+    res.status(500).json({ error: 'Error al cargar la factura' });
+  }
+};
+
+// ¿El valor nuevo de un campo es igual al guardado? (Decimal, fecha o texto.)
+function mismoValor(campo, anterior, nuevo) {
+  if (campo === 'monto') return Math.round(Number(anterior) * 100) === Math.round(Number(nuevo) * 100);
+  if (campo === 'fecha_emision') return ymdDeFecha(anterior) === ymdDeFecha(nuevo);
+  return anterior === nuevo;
+}
+
+/**
+ * Edita los datos de una factura. Body (todo opcional; lo que no viene no
+ * cambia): { tipo_comprobante, numero_factura, fecha_emision, monto, id_cuota,
+ * estado_factura }.
+ *
+ * Solo se valida lo que cambia: corregir el número de una factura antigua no
+ * tropieza con una regla de monto que entonces no existía. Una factura ANULADA
+ * admite corregir sus datos pero no su cobertura ni su estado: la anulación es
+ * definitiva y ya no cubre nada. Para anular está su propia acción (pide motivo).
+ */
+const actualizar = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const previo = Number.isInteger(id) && id > 0 ? await prisma.tbl_facturas.findUnique({ where: { id } }) : null;
+    if (!previo || previo.estado === 0) return res.status(404).json({ error: 'Factura no encontrada' });
+    const d = req.body || {};
+
+    const data = {};
+    if (d.tipo_comprobante !== undefined) {
+      if (!esTipoComprobanteValido(d.tipo_comprobante)) {
+        return res.status(400).json({ error: `Tipo de comprobante inválido. Valores permitidos: ${TIPOS_COMPROBANTE_CODIGOS.join(', ')}` });
+      }
+      data.tipo_comprobante = normalizarTipoComprobante(d.tipo_comprobante);
+    }
+    if (d.numero_factura !== undefined) {
+      const numero = String(d.numero_factura ?? '').trim();
+      if (!numero) return res.status(400).json({ error: 'El número de comprobante es obligatorio' });
+      if (numero.length > 50) return res.status(400).json({ error: 'El número de comprobante admite hasta 50 caracteres' });
+      data.numero_factura = numero;
+    }
+    if (d.fecha_emision !== undefined) {
+      const fecha = /^\d{4}-\d{2}-\d{2}$/.test(String(d.fecha_emision ?? '')) ? parseYMDLima(d.fecha_emision) : null;
+      if (!fecha || isNaN(fecha.getTime())) return res.status(400).json({ error: 'Fecha de emisión inválida' });
+      data.fecha_emision = fecha;
+    }
+    if (d.monto !== undefined) {
+      const monto = d.monto === null || d.monto === '' ? NaN : Number(d.monto);
+      if (!Number.isFinite(monto) || monto < 0) return res.status(400).json({ error: 'Monto inválido' });
+      data.monto = Math.round(monto * 100) / 100;
+    }
+    if (d.id_cuota !== undefined) {
+      const idCuota = d.id_cuota === null || d.id_cuota === '' ? null : Number(d.id_cuota);
+      if (idCuota !== null && (!Number.isInteger(idCuota) || idCuota <= 0)) return res.status(400).json({ error: 'Cuota inválida' });
+      data.id_cuota = idCuota;
+    }
+    if (d.estado_factura !== undefined) {
+      if (!esEstadoFacturaValido(d.estado_factura)) {
+        return res.status(400).json({ error: `Estado inválido. Permitidos: ${ESTADOS_FACTURA.join(', ')}` });
+      }
+      if (d.estado_factura === ESTADO_FACTURA_ANULADA && previo.estado_factura !== ESTADO_FACTURA_ANULADA) {
+        return res.status(400).json({ error: 'Para anular la factura usa la acción «Anular», que registra el motivo.' });
+      }
+      data.estado_factura = d.estado_factura;
+    }
+
+    const cambios = Object.fromEntries(Object.entries(data).filter(([k, v]) => !mismoValor(k, previo[k], v)));
+    if (Object.keys(cambios).length === 0) return res.json({ data: previo });
+
+    const cambiaCobertura = 'id_cuota' in cambios;
+    const cambiaEstado = 'estado_factura' in cambios;
+    if (previo.estado_factura === ESTADO_FACTURA_ANULADA && (cambiaCobertura || cambiaEstado)) {
+      return res.status(400).json({
+        error: 'La factura está anulada: se pueden corregir sus datos y archivos, pero no su cobertura ni su estado. Emite una nueva desde el cobro.'
+      });
+    }
+    if (previo.estado_factura !== ESTADO_FACTURA_ANULADA && (cambiaCobertura || 'monto' in cambios)) {
+      const ctx = await contextoCoberturaDeFactura(previo);
+      if (!ctx) return res.status(400).json({ error: 'La factura no está ligada a un servicio ni a un plan.' });
+      const error = await validarCoberturaFactura({
+        ...ctx,
+        idCuota: cambiaCobertura ? cambios.id_cuota : previo.id_cuota,
+        monto: 'monto' in cambios ? cambios.monto : previo.monto,
+        excluirId: id
+      });
+      if (error) return res.status(400).json({ error });
+    }
+
+    const factura = await prisma.tbl_facturas.update({
+      where: { id },
+      data: { ...cambios, user_id_modification: req.user.id, date_time_modification: new Date() }
+    });
+
+    // Lo que mueve la facturación del servicio (o de los mantenimientos del mes
+    // del plan): qué cubre la factura, su estado y su monto.
+    if (cambiaCobertura || cambiaEstado || 'monto' in cambios) {
+      if (previo.id_servicio) {
+        await sincronizarServicioTrasFactura(previo.id_servicio, req.user.id, `Factura ${factura.numero_factura} editada`);
+      }
+      if (previo.id_mantenimiento_plan) await sincronizarServiciosDelPlan(previo.id_mantenimiento_plan, req.user.id);
+    }
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: id, accion: 'UPDATE',
+      valor_anterior: Object.fromEntries(Object.keys(cambios).map(k => [k, previo[k]])),
+      valor_nuevo: cambios,
+      ip: req.ip
+    });
+    res.json({ data: factura });
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[facturas.actualizar]', err);
+    res.status(500).json({ error: 'Error al editar la factura' });
+  }
+};
+
 module.exports = {
-  listar, obtener, crear, cambiarEstado, eliminar,
-  listarDocumentos, agregarDocumentos, eliminarDocumento, adjuntarComprobante
+  listar, obtener, crear, cambiarEstado, eliminar, actualizar, contextoEdicion,
+  listarDocumentos, agregarDocumentos, editarDocumento, eliminarDocumento,
+  adjuntarComprobante, quitarComprobante
 };

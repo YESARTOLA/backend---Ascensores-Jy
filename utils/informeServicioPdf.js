@@ -1,7 +1,7 @@
 /**
  * Genera el informe de finalización de servicio en PDF.
  *
- * Incluye: datos de empresa (de tbl_configuracion), datos del cliente y
+ * Incluye: datos de empresa (la empresa emisora predeterminada), datos del cliente y
  * edificio, ascensores, técnicos asignados, observaciones técnicas
  * registradas durante el servicio, las respuestas del checklist de
  * finalización (Sí / No / N/A + nota) renderizadas bajo el título
@@ -14,7 +14,7 @@
  * dice nada del trabajo. Lo arma `pieDeFoto` en checklistFinalizacionController.
  */
 const PDFDocument = require('pdfkit');
-const configuracion = require('./configuracion');
+const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const { obtenerStream, keyDesdeRuta } = require('./storage');
 
 function streamToBuffer(stream) {
@@ -66,10 +66,7 @@ function fechaFmt(d) {
 
 async function generarInformeFinalizacionPdf(ctx) {
   const { servicio, plantilla, respuestasPorItem, observacionesTecnicas, ejecucion, fotos } = ctx;
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION',
-    'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
-  ]);
+  const empresa = await obtenerDatosEmpresa();
 
   const doc = new PDFDocument({ size: 'A4', margin: 40 });
   const chunks = [];

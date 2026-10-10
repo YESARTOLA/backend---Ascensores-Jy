@@ -113,6 +113,7 @@ app.use('/api/entregas', require('./routes/entregasRoutes'));
 app.use('/api/archivos', require('./routes/archivosRoutes'));
 app.use('/api/cotizaciones', require('./routes/cotizacionesRoutes'));
 app.use('/api/cuentas-bancarias', require('./routes/cuentasBancariasRoutes'));
+app.use('/api/empresas-emisoras', require('./routes/empresasEmisorasRoutes'));
 app.use('/api/configuracion', require('./routes/configuracionRoutes'));
 app.use('/api', require('./routes/evidenciasGuiasRoutes'));
 

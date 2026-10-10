@@ -8,8 +8,9 @@
  * cobro.
  *
  * Este script realinea ambas fechas con las de los abonos usando la regla única
- * de utils/fechaPagoCuotas.js (la cuota toma la fecha del abono que la terminó
- * de cubrir). Es IDEMPOTENTE: lo que ya coincide no se toca.
+ * de utils/fechaPagoCuotas.js (la cuota toma la fecha más reciente de los abonos
+ * que la cubren). Es IDEMPOTENTE: lo que ya coincide no se toca. Al abrir un
+ * cobro en la app se aplica la misma corrección para ese cobro.
  *
  * Uso (por defecto SOLO informa; no escribe nada):
  *   node scripts/sincronizarFechaPagoCuotas.js

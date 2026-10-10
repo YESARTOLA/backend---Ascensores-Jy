@@ -2,12 +2,13 @@
  * Generación de reportes de listado de clientes en Excel (XLSX) y PDF (A4 horizontal).
  *
  * Devuelven Buffer para que el controller los stremee en la respuesta HTTP.
- * Datos de cabecera (razón social, RUC, etc.) salen de tbl_configuracion — sin hardcodeo.
+ * Datos de cabecera (razón social, RUC, etc.) salen de la empresa emisora
+ * predeterminada (utils/empresaEmisora.js) — sin hardcodeo.
  */
 
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const configuracion = require('./configuracion');
+const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const { ymdLima } = require('./tiempo');
 const prisma = require('../config/prisma');
 const { mapaEtiquetasClasificacion } = require('./clasificacionesCliente');
@@ -105,7 +106,7 @@ function mapearFila(c, hoyISO, etiquetas = {}) {
 }
 
 async function generarExcelClientes(clientes) {
-  const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
   const etiquetas = await mapaEtiquetasClasificacion(prisma);
 
@@ -167,9 +168,7 @@ async function generarExcelClientes(clientes) {
 }
 
 async function generarPdfClientes(clientes) {
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION', 'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
-  ]);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
   const etiquetas = await mapaEtiquetasClasificacion(prisma);
 

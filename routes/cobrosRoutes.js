@@ -14,8 +14,9 @@ router.get('/cuotas-no-facturadas', c.cuotasNoFacturadas);
 router.get('/:id', c.obtener);
 router.put('/:id/plan-cuotas', c.actualizarPlanCuotas);
 router.post('/:id/pagos', c.registrarPago);
-// Fecha real de cobro de un abono: la corrigen solo Super Admin y Contabilidad.
-router.patch('/:id/pagos/:idPago/fecha', permitirRoles('super_admin', 'contabilidad'), c.editarFechaPago);
+// Corrección de un abono ya registrado (monto, fecha, método, cuenta,
+// comprobante, notas): solo Super Admin y Contabilidad.
+router.put('/:id/pagos/:idPago', permitirRoles('super_admin', 'contabilidad'), c.editarPago);
 router.post('/:id/recordatorio', c.enviarRecordatorio);
 router.patch('/:id/cerrar', c.cerrarCobro);
 router.patch('/:id/incobrable', c.marcarIncobrable);

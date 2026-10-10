@@ -15,6 +15,8 @@ const cache = new Map(); // clave -> { valor, hasta }
 const DEFAULTS = Object.freeze({
   IGV_RATE: '0.18',
   COTIZACION_TERMINOS: 'Precios en soles, incluyen IGV. Forma de pago se acuerda al confirmar el servicio.',
+  // Datos de empresa: solo respaldo. La fuente es tbl_empresas_emisoras
+  // (Configuración › Empresas emisoras, ver utils/empresaEmisora.js).
   EMPRESA_RAZON_SOCIAL: 'Ascensores Jy S.A.C.',
   EMPRESA_RUC: '20000000000',
   EMPRESA_DIRECCION: 'Lima, Perú',

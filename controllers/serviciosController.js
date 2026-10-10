@@ -40,8 +40,10 @@ const {
 const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { whereRealizadoConMonto } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
+const { INCLUDE_COTIZACION_APROBACION, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
+const { facturacionDeServiciosPlan, sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
 const {
   sincronizarRecordatorioServicio,
   sincronizarRecordatorioRevisarServicio,
@@ -1355,11 +1357,17 @@ const finalizarServicio = async (req, res) => {
     // porque no se le crea cobro (ver fallback más abajo). Si por error legacy
     // existiera un cobroPrevio para este servicio, su estado tampoco aplica.
     const esGratuito = servicio.sin_cobro === 1;
+    // Mantenimiento de plan: factura y cobro son los de SU MES del plan (la
+    // cuota del cobro único), que pudo aprobarse, facturarse o pagarse antes de
+    // ejecutar las visitas (utils/facturacionServiciosPlan).
+    const mesDelPlan = esServicioDePlan
+      ? (await facturacionDeServiciosPlan(prisma, [id])).get(id)
+      : null;
     const estadoCobroInicial = (esServicioDePlan || esGratuito)
-      ? 'Sin cobro'
+      ? (mesDelPlan?.estado_cobro ?? 'Sin cobro')
       : (cobroPrevio?.estado_cobro || 'Pendiente de iniciar');
     const estadoFacturacionInicial = esServicioDePlan
-      ? ESTADO_FACTURACION_SIN
+      ? (mesDelPlan?.estado_facturacion ?? ESTADO_FACTURACION_SIN)
       : calcularEstadoFacturacion({
           facturas: cobroPrevio?.facturas || [],
           cuotas: cobroPrevio?.cuotas || []
@@ -1607,23 +1615,32 @@ const cancelar = async (req, res) => {
  *
  * El importe de cada servicio es su total cobrable: el monto del cobro si ya
  * existe y, si no, el precio del servicio (mismo criterio que la columna
- * "Total" de la tabla y que el tope del modal de emisión). Los montos se
- * agrupan POR MONEDA: la cartera tiene servicios en PEN y en USD, y sumarlos
- * en un único número daría un total falso.
+ * "Total" de la tabla y que el tope del modal de emisión). Los mantenimientos
+ * de plan nacen con precio 0: su importe es la factura de su MES, que se suma
+ * UNA vez aunque cubra varias visitas. Los montos se agrupan POR MONEDA: la
+ * cartera tiene servicios en PEN y en USD, y sumarlos en un único número daría
+ * un total falso.
  */
 async function resumenFacturacion(where) {
   const filas = await prisma.tbl_servicios_realizados.findMany({
     where,
     select: {
+      id_servicio: true,
       estado_facturacion: true,
       servicio: {
         select: {
           moneda: true, precio_interno: true, sin_cobro: true, requiere_factura: true,
+          id_mantenimiento_plan: true,
           cobro: { select: { monto_total: true } }
         }
       }
     }
   });
+  const facturacionPlan = await facturacionDeServiciosPlan(
+    prisma,
+    filas.filter(f => f.servicio?.id_mantenimiento_plan).map(f => f.id_servicio)
+  );
+  const facturasPlanSumadas = new Set();
 
   const grupos = {
     por_facturar: { cantidad: 0, montos: new Map() },
@@ -1637,7 +1654,14 @@ async function resumenFacturacion(where) {
     const g = grupos[destino];
     g.cantidad++;
     const moneda = f.servicio?.moneda || MONEDA_POR_DEFECTO;
-    const total = Number(f.servicio?.cobro?.monto_total ?? f.servicio?.precio_interno ?? 0);
+    const facturaMes = facturacionPlan.get(f.id_servicio)?.factura;
+    let total;
+    if (facturaMes) {
+      total = facturasPlanSumadas.has(facturaMes.id) ? 0 : Number(facturaMes.monto);
+      facturasPlanSumadas.add(facturaMes.id);
+    } else {
+      total = Number(f.servicio?.cobro?.monto_total ?? f.servicio?.precio_interno ?? 0);
+    }
     g.montos.set(moneda, (g.montos.get(moneda) || 0) + (Number.isFinite(total) ? total : 0));
   }
 
@@ -1652,16 +1676,6 @@ async function resumenFacturacion(where) {
   return { por_facturar: aSalida(grupos.por_facturar), facturado: aSalida(grupos.facturado) };
 }
 
-// Mantenimiento con fecha programada: servicio de un plan o de un subtipo del
-// módulo de mantenimiento (mismo criterio que el filtro "Preventivo"). Para
-// Contabilidad su "fecha de servicio" es la PROGRAMADA, no la de ejecución.
-const WHERE_MANTENIMIENTO_PROGRAMADO = {
-  AND: [
-    { OR: [{ id_mantenimiento_plan: { not: null } }, { tipo_servicio: { modulo_asociado: 'mantenimiento' } }] },
-    { fecha_programada: { not: null } }
-  ]
-};
-
 const realizados = async (req, res) => {
   try {
     const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda, rango_fecha, aprobacion_desde, aprobacion_hasta } = req.query;
@@ -1674,27 +1688,15 @@ const realizados = async (req, res) => {
     }
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (estado_facturacion) where.estado_facturacion = estado_facturacion;
-    if (desde || hasta) {
-      const rangoRealizacion = {};
-      if (desde) rangoRealizacion.gte = parseYMDLima(desde);
-      if (hasta) rangoRealizacion.lte = parseYMDFinDiaLima(hasta);
-      if (rango_fecha === 'servicio') {
-        // Contabilidad filtra por "Fecha servicio": los mantenimientos caen en
-        // su fecha programada (la visita de agosto es de agosto aunque se haya
-        // ejecutado en septiembre); el resto, en su fecha de realización.
-        // fecha_programada es @db.Date: límites a medianoche UTC (parseYMDUTC).
-        const rangoProgramada = {};
-        if (desde) rangoProgramada.gte = parseYMDUTC(desde);
-        if (hasta) rangoProgramada.lte = parseYMDUTC(hasta);
-        where.AND = [...(where.AND || []), {
-          OR: [
-            { servicio: { AND: [WHERE_MANTENIMIENTO_PROGRAMADO, { fecha_programada: rangoProgramada }] } },
-            { fecha_realizacion: rangoRealizacion, servicio: { NOT: WHERE_MANTENIMIENTO_PROGRAMADO } }
-          ]
-        }];
-      } else {
-        where.fecha_realizacion = rangoRealizacion;
-      }
+    if (rango_fecha === 'servicio') {
+      // Contabilidad filtra por su "Fecha servicio": ejecución en los
+      // mantenimientos, aprobación de la cotización en el resto.
+      const fechaServicioEnRango = whereFechaServicioEnRango({ desde, hasta });
+      if (fechaServicioEnRango) where.AND = [...(where.AND || []), fechaServicioEnRango];
+    } else if (desde || hasta) {
+      where.fecha_realizacion = {};
+      if (desde) where.fecha_realizacion.gte = parseYMDLima(desde);
+      if (hasta) where.fecha_realizacion.lte = parseYMDFinDiaLima(hasta);
     }
     // Filtros sobre el servicio relacionado (cliente y búsqueda por código/cliente).
     const servicioWhere = {};
@@ -1778,6 +1780,8 @@ const realizados = async (req, res) => {
               // servicios de plan no llevan precio propio, así que sin esto la
               // columna "Total" mostraba S/ 0.00 en cada visita.
               mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } },
+              // Fecha de aprobación: es la "Fecha servicio" de los no mantenimientos.
+              cotizacion: INCLUDE_COTIZACION_APROBACION,
                     cobro: { include: { facturas: true } }
             }
           }
@@ -1792,16 +1796,48 @@ const realizados = async (req, res) => {
       ? await resumenFacturacion(where)
       : undefined;
 
+    // Mantenimientos de plan (sin cobro propio): su factura y su cobro son los
+    // de la cuota de su MES del plan. Se adjuntan a la fila (fecha de
+    // comprobante, acción: "Facturar mes" solo con el mes aprobado y sin
+    // factura) y los estados salen de la misma regla que los sincroniza.
+    const facturacionPlan = await facturacionDeServiciosPlan(
+      prisma,
+      result.data.filter(r => r.servicio?.id_mantenimiento_plan).map(r => r.id_servicio)
+    );
+    const verFinanzas = ROLES_PRECIO.includes(req.user.rol_codigo);
+    // Lo guardado (de lo que tiran filtros y tarjetas) pudo quedar atrás — una
+    // cuota que venció desde el último movimiento, o datos de antes de esta
+    // regla —: se realinea el plan en segundo plano, como hace Gestión de
+    // cobros con la mora de sus cobros.
+    const planesDesalineados = new Set(result.data
+      .filter(r => {
+        const p = facturacionPlan.get(r.id_servicio);
+        return p && (p.estado_facturacion !== r.estado_facturacion || p.estado_cobro !== r.estado_cobro);
+      })
+      .map(r => facturacionPlan.get(r.id_servicio).id_mantenimiento_plan));
+    for (const idPlan of planesDesalineados) {
+      sincronizarFacturacionServiciosPlan(prisma, idPlan, null)
+        .catch(err => console.error(`[realizados] sincronizar plan #${idPlan}:`, err));
+    }
+
     // El bloque de cobro/facturas del servicio solo viaja a los roles con
     // visibilidad financiera; al resto se le quita entero (no basta con anular
     // el precio: el cobro trae monto_total, saldo y las facturas sus importes).
     res.json({
       ...result,
       ...(resumen_facturacion ? { resumen_facturacion } : {}),
-      data: result.data.map(r => ({
-        ...r,
-        servicio: sanitizarEconomico(sanitizarPrecio(r.servicio, req.user.rol_codigo), req.user.rol_codigo)
-      }))
+      data: result.data.map(r => {
+        const { fecha, origen } = fechaServicioContable(r);
+        const plan = facturacionPlan.get(r.id_servicio);
+        return {
+          ...r,
+          ...(plan ? { estado_facturacion: plan.estado_facturacion, estado_cobro: plan.estado_cobro } : {}),
+          ...(plan && verFinanzas ? { facturacion_plan: plan } : {}),
+          fecha_servicio: fecha,
+          fecha_servicio_origen: origen,
+          servicio: sanitizarEconomico(sanitizarPrecio(r.servicio, req.user.rol_codigo), req.user.rol_codigo)
+        };
+      })
     });
   } catch (err) {
     console.error(err);

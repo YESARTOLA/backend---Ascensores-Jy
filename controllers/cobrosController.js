@@ -10,10 +10,12 @@ const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionElim
 const { INCLUDE_DOCUMENTOS, bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualPorCuota } = require('../utils/planMantenimientoMensual');
+const { sincronizarServiciosDeCobroPlan } = require('../utils/facturacionServiciosPlan');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { whereCobroConMonto, whereCuotaConMonto } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
-const { sincronizarFechasPagoCuotas } = require('../utils/fechaPagoCuotas');
+const { fechaUltimoAbono, sincronizarFechasPagoCuotas } = require('../utils/fechaPagoCuotas');
+const { aplicarCambioMontoAbono } = require('../utils/recalculoCobro');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -385,6 +387,10 @@ const obtener = async (req, res) => {
     });
     if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
     await persistirEstadoMora(cobro);
+    // La "Fecha pago" de las cuotas y el "último abono" se derivan de los
+    // abonos (regla única en utils/fechaPagoCuotas.js). Si lo guardado quedó
+    // desfasado (histórico anterior a la regla) se corrige aquí mismo.
+    await sincronizarFechasPagoCuotas(prisma, cobro, null);
 
     const aprobacionCotizacion = await obtenerAprobacionCotizacion(cobro.servicio?.id_cotizacion);
     // Cobro de PLAN de mantenimiento: cada cuota es UN MES y se paga una sola
@@ -761,7 +767,10 @@ const registrarPago = async (req, res) => {
       });
       cu.monto_pagado = nuevoMontoPagado;
       cu.estado_cuota = estadoCu;
-      if (estadoCu === 'Pagada') cuotasPagadas++;
+      if (estadoCu === 'Pagada') {
+        cu.fecha_pago = fechaAbono;
+        cuotasPagadas++;
+      }
       restanteCents -= aplicarCents;
     }
 
@@ -786,46 +795,28 @@ const registrarPago = async (req, res) => {
         saldo_pendiente: nuevoSaldo,
         cuotas_pagadas: cuotasPagadas,
         cuotas_faltantes: Math.max(0, cobro.numero_cuotas - cuotasPagadas),
-        // Un abono con fecha anterior a otro ya registrado no retrocede el "último abono".
-        fecha_ultimo_abono: cobro.pagos.reduce((max, p) => (p.fecha_pago > max ? p.fecha_pago : max), fechaAbono),
+        // Regla única (utils/fechaPagoCuotas.js): la fecha de cobro más reciente
+        // de los abonos; un abono con fecha anterior no retrocede el último abono.
+        fecha_ultimo_abono: fechaUltimoAbono([...cobro.pagos, { fecha_pago: fechaAbono }]),
         fecha_proximo_abono: nuevaFechaProximo,
         estado_cobro: nuevoEstado,
         user_id_modification: req.user.id, date_time_modification: new Date()
       }
     });
 
+    // La "Fecha pago" de una cuota es la del abono más reciente entre los que la
+    // cubren: si este abono completó una cuota que otro abono con fecha posterior
+    // había cubierto en parte, la cuota debe quedar con esa fecha posterior.
+    await sincronizarFechasPagoCuotas(prisma, id, req.user.id);
+
     // Side-effects sobre el servicio: solo para cobros por servicio. Los cobros
     // de plan no tienen servicio asociado (facturación única del plan).
-    if (!esCobroDePlan && cobro.id_servicio) {
-      // Actualizar estado en servicio realizado
-      await prisma.tbl_servicios_realizados.updateMany({
-        where: { id_servicio: cobro.id_servicio },
-        data: {
-          estado_cobro: nuevoEstado,
-          user_id_modification: req.user.id, date_time_modification: new Date()
-        }
-      });
-
-      // Transición del estado del servicio según cobro.
-      // Solo aplica si el servicio ya está en post-ejecución (admin/cobro). Si
-      // el cobro nació al aprobar la cotización (adelanto pagado antes de
-      // ejecutar el servicio), el servicio permanece en su estado operativo y
-      // las cuotas siguen su ciclo en paralelo.
-      const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({
-        where: { id: cobro.id_servicio },
-        select: { estado_servicio: true }
-      });
-      if (estaServicioFinalizado(servicioActual?.estado_servicio)) {
-        const facturas = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
-        const nuevoEstadoServ = estadoServicioDesdeCobro({
-          estado_cobro: nuevoEstado,
-          total_abonado: totalAbonado,
-          saldo_pendiente: nuevoSaldo,
-          facturado: !!facturas
-        });
-        await cambiarEstadoServicio(cobro.id_servicio, nuevoEstadoServ, req.user.id, `Abono registrado: ${monto}`);
-      }
-    }
+    await propagarCobroAlServicio(
+      cobro,
+      { estado_cobro: nuevoEstado, total_abonado: totalAbonado, saldo_pendiente: nuevoSaldo },
+      req.user.id,
+      `Abono registrado: ${monto}`
+    );
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_pagos', id_entidad: id,
@@ -840,47 +831,175 @@ const registrarPago = async (req, res) => {
 };
 
 /**
- * PATCH /:id/pagos/:idPago/fecha — corrige la fecha REAL de cobro de un abono
- * (Super Admin y Contabilidad). Solo cambia la fecha: monto, cuenta y cuotas
- * cubiertas quedan igual. Las cuotas que ese abono terminó de cubrir y el
- * "último abono" del cobro se realinean con la nueva fecha.
- *
- * Body: { fecha_pago: 'YYYY-MM-DD' }
+ * 'YYYY-MM-DD' de un valor de fecha recibido en el body, o null si no es un
+ * día válido. La ida y vuelta por Date descarta también días inexistentes
+ * (2026-02-31) sin lanzar (toISOString explota con un Date inválido).
  */
-const editarFechaPago = async (req, res) => {
+function fechaYMDValida(valor) {
+  const s = String(valor || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T00:00:00Z`);
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : null;
+}
+
+/**
+ * Efectos de un movimiento de cobro sobre su servicio (solo cobros por
+ * servicio; los de plan no tienen servicio asociado): copia del estado al
+ * realizado y transición del estado del servicio. La transición solo aplica si
+ * el servicio ya está en post-ejecución (admin/cobro): si el cobro nació al
+ * aprobar la cotización (adelanto pagado antes de ejecutar), el servicio
+ * permanece en su estado operativo y las cuotas siguen su ciclo en paralelo.
+ * El estado global de la cotización depende del saldo, así que se recalcula.
+ */
+async function propagarCobroAlServicio(cobro, { estado_cobro, total_abonado, saldo_pendiente }, userId, motivo) {
+  // Cobro de plan: sus mantenimientos toman el estado de la cuota de su mes
+  // (utils/facturacionServiciosPlan.js).
+  if (cobro.id_mantenimiento_plan) return sincronizarServiciosDeCobroPlan(prisma, cobro, userId);
+  if (!cobro.id_servicio) return;
+  await prisma.tbl_servicios_realizados.updateMany({
+    where: { id_servicio: cobro.id_servicio },
+    data: { estado_cobro, user_id_modification: userId, date_time_modification: new Date() }
+  });
+  const servicioActual = await prisma.tbl_servicios_proyectos.findUnique({
+    where: { id: cobro.id_servicio },
+    select: { estado_servicio: true, id_cotizacion: true }
+  });
+  if (estaServicioFinalizado(servicioActual?.estado_servicio)) {
+    const facturas = await prisma.tbl_facturas.findFirst({ where: { id_servicio: cobro.id_servicio, estado: 1 } });
+    const nuevoEstadoServ = estadoServicioDesdeCobro({ estado_cobro, total_abonado, saldo_pendiente, facturado: !!facturas });
+    await cambiarEstadoServicio(cobro.id_servicio, nuevoEstadoServ, userId, motivo);
+  }
+  if (servicioActual?.id_cotizacion) {
+    // Require perezoso: cotizacionesController también depende de este módulo.
+    const { sincronizarEstadoGlobal } = require('./cotizacionesController');
+    await sincronizarEstadoGlobal(servicioActual.id_cotizacion);
+  }
+}
+
+/**
+ * PUT /:id/pagos/:idPago — corrige un abono ya registrado (Super Admin y
+ * Contabilidad): monto, fecha real de cobro, método, cuenta, comprobante y
+ * observaciones. El body es el contenido completo del abono.
+ *
+ *  - Monto: las cuotas se ajustan por diferencia (utils/recalculoCobro.js) y
+ *    se recalculan totales, saldo y estado del cobro, con los mismos efectos
+ *    sobre el servicio que un abono nuevo. No se admite en cobros cerrados o
+ *    incobrables ni, salvo Super Admin, por encima del precio total.
+ *  - Fecha: la "Fecha pago" de las cuotas y el "último abono" se recalculan a
+ *    partir de los abonos (regla única en utils/fechaPagoCuotas.js).
+ *  - Comprobante: el archivo reemplazado o quitado se da de baja.
+ *  - Todo queda en auditoría con los valores anteriores.
+ *
+ * Body: { monto, fecha_pago: 'YYYY-MM-DD', metodo_pago, id_cuenta_bancaria?,
+ *         id_archivo_comprobante?, observaciones? }
+ */
+const editarPago = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const idPago = Number(req.params.idPago);
-    const fechaYMD = String(req.body.fecha_pago || '').slice(0, 10);
-    // Ida y vuelta por Date: descarta también días inexistentes (2026-02-31).
-    const fechaValida = /^\d{4}-\d{2}-\d{2}$/.test(fechaYMD)
-      && new Date(`${fechaYMD}T00:00:00Z`).toISOString().slice(0, 10) === fechaYMD;
-    if (!fechaValida) {
-      return res.status(400).json({ error: 'Fecha de cobro inválida' });
-    }
-    const pago = await prisma.tbl_pagos.findFirst({ where: { id: idPago, id_cobro: id, estado: 1 } });
+    const d = req.body || {};
+    const cobro = await prisma.tbl_cobros.findUnique({
+      where: { id },
+      include: {
+        pagos: { where: { estado: 1 }, orderBy: [{ numero_abono: 'asc' }, { id: 'asc' }] },
+        cuotas: { where: { estado: 1 }, orderBy: { numero_cuota: 'asc' } }
+      }
+    });
+    if (!cobro) return res.status(404).json({ error: 'Cobro no encontrado' });
+    const pago = cobro.pagos.find(p => p.id === idPago);
     if (!pago) return res.status(404).json({ error: 'Abono no encontrado' });
 
-    const anterior = pago.fecha_pago.toISOString().slice(0, 10);
-    if (anterior === fechaYMD) return res.json({ ok: true, cuotas_actualizadas: 0 });
+    // Mismas reglas que registrarPago.
+    const monto = Number(d.monto);
+    if (!monto || monto <= 0) return res.status(400).json({ error: 'Monto debe ser mayor a cero' });
+    const fechaYMD = fechaYMDValida(d.fecha_pago);
+    if (!fechaYMD) return res.status(400).json({ error: 'Fecha de cobro inválida' });
+    const metodoPago = String(d.metodo_pago || pago.metodo_pago);
+    if (!METODOS_PAGO_CODIGOS.includes(metodoPago)) {
+      return res.status(400).json({ error: `Método de pago inválido. Valores permitidos: ${METODOS_PAGO_CODIGOS.join(', ')}` });
+    }
+    const idCuentaBancaria = d.id_cuenta_bancaria ? Number(d.id_cuenta_bancaria) : null;
+    if (METODOS_REQUIEREN_CUENTA.includes(metodoPago) && !idCuentaBancaria) {
+      return res.status(400).json({ error: `El método "${metodoPago}" requiere seleccionar una cuenta bancaria` });
+    }
+    if (idCuentaBancaria) {
+      const cuenta = await prisma.tbl_cuentas_bancarias.findFirst({ where: { id: idCuentaBancaria, estado: 1 } });
+      if (!cuenta) return res.status(400).json({ error: 'Cuenta bancaria no encontrada o inactiva' });
+    }
+    const idArchivo = d.id_archivo_comprobante ? Number(d.id_archivo_comprobante) : null;
+    if (idArchivo && idArchivo !== pago.id_archivo_comprobante) {
+      const archivo = await prisma.tbl_archivos.findFirst({ where: { id: idArchivo, estado: 1 } });
+      if (!archivo) return res.status(400).json({ error: 'Comprobante no encontrado' });
+    }
+    const observaciones = d.observaciones ? String(d.observaciones).trim() || null : null;
 
-    const cambios = await prisma.$transaction(async (tx) => {
+    const deltaCents = aCentavos(monto) - aCentavos(pago.monto);
+    if (deltaCents !== 0) {
+      if (['Cerrado', 'Incobrable'].includes(cobro.estado_cobro)) {
+        return res.status(409).json({ error: `El cobro está ${cobro.estado_cobro.toLowerCase()}: no se puede cambiar el monto de un abono` });
+      }
+      const totalCents = cobro.pagos.reduce((acc, p) => acc + aCentavos(p.monto), 0) + deltaCents;
+      if (totalCents > aCentavos(cobro.monto_total) && req.user.rol_codigo !== 'super_admin') {
+        return res.status(400).json({ error: 'El abono excede el saldo. Solo Super Admin puede sobrepasarlo' });
+      }
+    }
+
+    const fechaAnterior = pago.fecha_pago.toISOString().slice(0, 10);
+    const fechaAbono = parseYMDLima(fechaYMD);
+    const anterior = {
+      monto: Number(pago.monto), fecha_pago: fechaAnterior, metodo_pago: pago.metodo_pago,
+      id_cuenta_bancaria: pago.id_cuenta_bancaria, id_archivo_comprobante: pago.id_archivo_comprobante,
+      observaciones: pago.observaciones
+    };
+    const nuevo = {
+      monto, fecha_pago: fechaYMD, metodo_pago: metodoPago, id_cuenta_bancaria: idCuentaBancaria,
+      id_archivo_comprobante: idArchivo, observaciones
+    };
+    const archivoReemplazado = pago.id_archivo_comprobante && pago.id_archivo_comprobante !== idArchivo
+      ? pago.id_archivo_comprobante
+      : null;
+
+    const r = await prisma.$transaction(async (tx) => {
       await tx.tbl_pagos.update({
         where: { id: idPago },
-        data: { fecha_pago: parseYMDLima(fechaYMD), user_id_modification: req.user.id, date_time_modification: new Date() }
+        data: {
+          monto, fecha_pago: fechaAbono, metodo_pago: metodoPago, id_cuenta_bancaria: idCuentaBancaria,
+          id_archivo_comprobante: idArchivo, observaciones,
+          user_id_modification: req.user.id, date_time_modification: new Date()
+        }
       });
-      return sincronizarFechasPagoCuotas(tx, id, req.user.id);
+      // El abono editado forma parte de cobro.pagos: el ajuste lee el monto nuevo.
+      pago.monto = monto;
+      pago.fecha_pago = fechaAbono;
+      const out = { ajuste: null, cuotasFecha: [], ultimoAbono: null, wasabiKey: null };
+      if (deltaCents !== 0) out.ajuste = await aplicarCambioMontoAbono(tx, cobro, deltaCents, fechaAbono, req.user.id);
+      // Fechas de pago de las cuotas y último abono: derivadas de los abonos.
+      const sync = await sincronizarFechasPagoCuotas(tx, id, req.user.id);
+      out.cuotasFecha = sync.cuotas;
+      out.ultimoAbono = sync.ultimoAbono;
+      if (archivoReemplazado) out.wasabiKey = await bajaArchivoEnTx(tx, archivoReemplazado, req.user.id);
+      return out;
     });
 
+    if (r.ajuste) {
+      await propagarCobroAlServicio(cobro, r.ajuste, req.user.id, `Abono #${pago.numero_abono} corregido: S/ ${anterior.monto} → S/ ${monto}`);
+    }
+    if (r.wasabiKey) await purgarObjetosWasabi([r.wasabiKey]);
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_pagos', id_entidad: idPago,
-      accion: 'UPDATE', valor_anterior: { fecha_pago: anterior },
-      valor_nuevo: { fecha_pago: fechaYMD, cuotas: cambios.cuotas }, ip: req.ip
+      accion: 'UPDATE', valor_anterior: anterior,
+      valor_nuevo: { ...nuevo, cuotas: r.ajuste?.cuotas || [], cuotas_fecha: r.cuotasFecha, ultimo_abono: r.ultimoAbono },
+      ip: req.ip
     });
-    res.json({ ok: true, cuotas_actualizadas: cambios.cuotas.length });
+    sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
+    res.json({
+      ok: true,
+      saldo: r.ajuste ? r.ajuste.saldo_pendiente : Number(cobro.saldo_pendiente),
+      estado: r.ajuste ? r.ajuste.estado_cobro : cobro.estado_cobro
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Error al editar la fecha del abono: ' + err.message });
+    res.status(500).json({ error: 'Error al editar el abono: ' + err.message });
   }
 };
 
@@ -930,8 +1049,10 @@ const cerrarCobro = async (req, res) => {
     await prisma.tbl_cobros.update({
       where: { id }, data: { estado_cobro: 'Cerrado', user_id_modification: req.user.id, date_time_modification: new Date() }
     });
-    // Cobro de plan: no hay servicio que transicionar; cerrar el cobro basta.
+    // Cobro de plan: no hay servicio que transicionar; sus mantenimientos toman
+    // el estado del cobro cerrado.
     if (cobro.id_mantenimiento_plan || !cobro.id_servicio) {
+      await sincronizarServiciosDeCobroPlan(prisma, cobro, req.user.id);
       sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
       return res.json({ ok: true });
     }
@@ -985,6 +1106,7 @@ const marcarIncobrable = async (req, res) => {
       id_usuario: req.user.id, entidad: 'tbl_cobros', id_entidad: id,
       accion: 'STATUS_CHANGE', valor_nuevo: { estado: 'Incobrable', motivo }, ip: req.ip
     });
+    await sincronizarServiciosDeCobroPlan(prisma, cobro, req.user.id);
     sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
     // Un saldo dado por perdido ya no queda "por cobrar": la cotización termina.
     resincronizarServicioConCobro(cobro.id_servicio, req.user.id, 'Cobro marcado incobrable')
@@ -1308,11 +1430,26 @@ const eliminar = async (req, res) => {
       }
 
       await tx.tbl_cobros.update({ where: { id }, data: { estado: 0, ...stamp } });
-      // El folder contable del servicio queda sin cobro ni facturación. Los cobros
-      // de plan no tienen folder de servicio que actualizar.
+      // El folder contable del servicio queda sin cobro ni facturación.
       if (!esCobroDePlan && idServicio) {
         await tx.tbl_servicios_realizados.updateMany({
           where: { id_servicio: idServicio },
+          data: { estado_cobro: 'Sin cobro', estado_facturacion: ESTADO_FACTURACION_SIN, ...stamp }
+        });
+      }
+      // Cobro de plan: sus mantenimientos (sin cobro propio) colgaban de este
+      // cobro y de las facturas del plan que acaban de darse de baja
+      // (utils/facturacionServiciosPlan.js).
+      if (esCobroDePlan) {
+        await tx.tbl_servicios_realizados.updateMany({
+          where: {
+            servicio: {
+              is: {
+                id_mantenimiento_plan: cobro.id_mantenimiento_plan,
+                OR: [{ cobro: { is: null } }, { cobro: { is: { estado: { not: 1 } } } }]
+              }
+            }
+          },
           data: { estado_cobro: 'Sin cobro', estado_facturacion: ESTADO_FACTURACION_SIN, ...stamp }
         });
       }
@@ -1331,4 +1468,4 @@ const eliminar = async (req, res) => {
   }
 };
 
-module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, editarFechaPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, cuotasNoFacturadas, listarProyectos, eliminar };
+module.exports = { listar, obtener, actualizarPlanCuotas, registrarPago, editarPago, enviarRecordatorio, cerrarCobro, marcarIncobrable, cuotasCalendario, cuotasNoFacturadas, listarProyectos, eliminar };

@@ -8,10 +8,15 @@
  *      por visita, respetando la frecuencia PROPIA de cada ascensor.
  *
  *   2. QUÉ se cobra     → `mesesDelPlan` agrupa ese cronograma por MES DEL PLAN
- *      y devuelve, para cada mes, el detalle de visitas y el importe. Un mes
- *      con mantenimiento se cobra `plan.monto_mensual` —no depende de cuántas
- *      visitas caigan en él ni de que alguna se omita—; un mes sin ningún
- *      mantenimiento programado no se cobra (ver `totalesDelPlan`).
+ *      y devuelve, para cada mes, el detalle de visitas y el importe
+ *      (`montoDelMes`). Según la forma de cobro del plan (`modo_precio`):
+ *        · 'mensual': un mes con mantenimiento se cobra `plan.monto_mensual`
+ *          —no depende de cuántas visitas caigan en él ni de que alguna se
+ *          omita—;
+ *        · 'por_ascensor': el mes cobra la suma del precio de los ascensores
+ *          que se atienden en él según su frecuencia.
+ *      Un mes sin ningún mantenimiento programado no se cobra (ver
+ *      `totalesDelPlan`).
  *
  * Contabilidad, Gestión de cobros y Facturas leen de aquí (vía el cobro único
  * del plan y sus cuotas, una por mes) — no recalculan nada por su cuenta.
@@ -38,6 +43,134 @@ function etiquetaMes(numeroMes, desdeYMD) {
   return `Mes ${numeroMes} · ${MESES_ES[m - 1]} ${y}`;
 }
 
+// Formas de cobro del plan (tbl_mantenimientos_planes.modo_precio).
+const MODO_PRECIO_MENSUAL = 'mensual';
+const MODO_PRECIO_POR_ASCENSOR = 'por_ascensor';
+const MODOS_PRECIO = [MODO_PRECIO_MENSUAL, MODO_PRECIO_POR_ASCENSOR];
+
+function esPlanPorAscensor(plan) {
+  return plan?.modo_precio === MODO_PRECIO_POR_ASCENSOR;
+}
+
+/** Precio de cada ascensor del plan (modo 'por_ascensor'): id_ascensor → monto. */
+function preciosDelPlan(filasJunction) {
+  return new Map((filasJunction || []).map(f => [Number(f.id_ascensor), round2(f.monto || 0)]));
+}
+
+/**
+ * Importe de UN ascensor dentro de su mes:
+ *   · 'por_ascensor': su precio;
+ *   · 'mensual': su parte del monto mensual (monto ÷ ascensores del mes).
+ * Informativo (foto de la cuota y desglose); el importe del mes lo decide
+ * `montoDelMes`.
+ */
+function importeDeAscensorEnMes({ modo, montoMensual, precios, idAscensor, cantidadDelMes }) {
+  if (modo === MODO_PRECIO_POR_ASCENSOR) return round2(precios?.get(Number(idAscensor)) || 0);
+  return cantidadDelMes > 0 ? round2(Number(montoMensual || 0) / cantidadDelMes) : round2(montoMensual || 0);
+}
+
+/**
+ * IMPORTE DE UN MES — SSoT de cuánto se cobra un mes con mantenimiento según
+ * los ascensores que se facturan.
+ *
+ *   · 'mensual': el monto mensual del plan. Si al aprobar el mes se excluyen
+ *     ascensores, se cobra la parte proporcional de los que quedan:
+ *     3 ascensores y S/ 900, se excluye uno → 900 × 2/3 = S/ 600.
+ *   · 'por_ascensor': la suma del precio de los ascensores facturados.
+ *     Ascensor 1 a S/ 200 y ascensor 2 a S/ 300 en el mes → S/ 500; sin el 2,
+ *     S/ 200.
+ *
+ * No aplica meses gratuitos ni meses sin mantenimiento: eso lo decide quien
+ * llama (valen 0). Espejo en cliente: frontend/src/utils/planMantenimiento.js.
+ *
+ * @param {object} args
+ * @param {string} args.modo                  modo_precio del plan
+ * @param {number} args.montoMensual          monto_mensual del plan
+ * @param {Map<number,number>} [args.precios] id_ascensor → precio ('por_ascensor')
+ * @param {number[]} args.idsDelMes           ascensores que se atienden en el mes
+ * @param {number[]|null} [args.idsFacturados] los que se facturan; null = todos
+ */
+function montoDelMes({ modo, montoMensual, precios, idsDelMes, idsFacturados = null }) {
+  const delMes = [...new Set((idsDelMes || []).map(Number))];
+  const marcados = idsFacturados == null ? null : new Set(idsFacturados.map(Number));
+  const facturados = marcados ? delMes.filter(id => marcados.has(id)) : delMes;
+  if (modo === MODO_PRECIO_POR_ASCENSOR) {
+    return round2(facturados.reduce((acc, id) => acc + Number(precios?.get(id) || 0), 0));
+  }
+  const mensual = round2(montoMensual || 0);
+  // Sin detalle de ascensores (plan sin cronograma) o sin exclusiones: el
+  // monto mensual completo, como siempre.
+  if (delMes.length === 0 || facturados.length === delMes.length) return mensual;
+  return round2(mensual * facturados.length / delMes.length);
+}
+
+/**
+ * Foto de los ascensores de un mes para guardar en la cuota al aprobarlo
+ * (tbl_cobros_cuotas.ascensores_mes): cuáles se facturan y el importe de cada
+ * uno.
+ *
+ * @param {Array<{id_ascensor:number, codigo?:string}>} ascensores  los del mes
+ * @returns {Array<{id_ascensor:number, codigo:string|null, facturado:boolean, monto:number}>}
+ */
+function fotoAscensoresMes({ modo, montoMensual, precios, ascensores, idsFacturados = null }) {
+  const lista = ascensores || [];
+  const marcados = idsFacturados == null ? null : new Set(idsFacturados.map(Number));
+  return lista.map(a => ({
+    id_ascensor: Number(a.id_ascensor),
+    codigo: a.codigo || null,
+    facturado: marcados ? marcados.has(Number(a.id_ascensor)) : true,
+    monto: importeDeAscensorEnMes({
+      modo, montoMensual, precios, idAscensor: a.id_ascensor, cantidadDelMes: lista.length
+    })
+  }));
+}
+
+/**
+ * Importe de cada mes del plan (1-based) según su forma de cobro, antes de
+ * aplicar meses gratuitos. Los ascensores de cada mes salen del cronograma
+ * (visitas activas u omitidas: omitir no cambia el cobro); sin cronograma
+ * (planes antiguos), de la serie teórica de sus ascensores.
+ *
+ * @param {object} plan           Con modo_precio, monto_mensual, fecha_inicio,
+ *                                duracion_meses, tipo_plan y frecuencia.
+ * @param {Array<{numero_mes:number, id_ascensor:number}>} visitas  cronograma
+ * @param {Array} filasJunction   Ascensores del plan (id_ascensor, monto, frecuencia)
+ * @returns {Map<number, number>}  numero_mes → importe
+ */
+function montosPorMesDelPlan(plan, visitas, filasJunction) {
+  let filas = (visitas || []).map(v => ({ numero_mes: Number(v.numero_mes), id_ascensor: Number(v.id_ascensor) }));
+  if (filas.length === 0) {
+    if (plan?.tipo_plan === 'eventual') {
+      filas = (filasJunction || []).map(f => ({ numero_mes: 1, id_ascensor: Number(f.id_ascensor) }));
+    } else {
+      try {
+        filas = programacionDelPlan({
+          fechaInicioYMD: ymdDeFecha(plan.fecha_inicio),
+          duracionMeses: Number(plan.duracion_meses || 0),
+          ascensores: (filasJunction || [])
+            .map(f => ({ id_ascensor: f.id_ascensor, ...frecuenciaDeAscensor(f, plan) }))
+            .filter(a => a.frecuencia)
+        }).map(v => ({ numero_mes: v.numero_mes, id_ascensor: Number(v.id_ascensor) }));
+      } catch {
+        filas = [];
+      }
+    }
+  }
+  const porMes = new Map();
+  for (const f of filas) {
+    if (!porMes.has(f.numero_mes)) porMes.set(f.numero_mes, new Set());
+    porMes.get(f.numero_mes).add(f.id_ascensor);
+  }
+  const precios = preciosDelPlan(filasJunction);
+  const salida = new Map();
+  for (const [mes, ids] of porMes) {
+    salida.set(mes, montoDelMes({
+      modo: plan?.modo_precio, montoMensual: plan?.monto_mensual, precios, idsDelMes: [...ids]
+    }));
+  }
+  return salida;
+}
+
 /**
  * ECONOMÍA DEL PLAN — SSoT del importe total.
  *
@@ -61,27 +194,40 @@ function etiquetaMes(numeroMes, desdeYMD) {
  * Ej.: 24 meses mensual a S/ 3.000 con 2 gratuitos → 22 × 3.000 = S/ 66.000.
  *      12 meses trimestral a S/ 200                 →  4 ×   200 = S/    800.
  *
+ * En un plan 'por_ascensor' cada mes vale lo suyo (la suma de los ascensores
+ * que se atienden en él), así que el total suma el importe de cada mes
+ * facturable (`montosPorMes`, ver `montosPorMesDelPlan`):
+ *
+ *     total = Σ importe del mes (meses con mantenimiento fuera del cupo gratuito)
+ *
  * Toda la aplicación (formulario, detalle del plan, reportes y export) debe
  * calcular el total por aquí; el espejo en cliente vive en
  * frontend/src/utils/planMantenimiento.js.
  *
  * @param {object} plan  Con monto_mensual, duracion_meses,
- *                       cantidad_mantenimientos_gratuitos y tipo_plan.
+ *                       cantidad_mantenimientos_gratuitos, tipo_plan y modo_precio.
  * @param {Iterable<number>} mesesConMant  Números de mes (1-based) en que cae al
  *        menos una visita; ver `mesesConMantenimiento`.
+ * @param {Map<number,number>} [montosPorMes]  Importe de cada mes; solo lo usan
+ *        los planes 'por_ascensor'.
  */
-function totalesDelPlan(plan, mesesConMant) {
+function totalesDelPlan(plan, mesesConMant, montosPorMes = null) {
   const meses = plan?.tipo_plan === 'eventual' ? 1 : Number(plan?.duracion_meses || 0);
   // El cupo nunca puede exceder la duración (el formulario ya lo acota, pero un
   // plan acortado después podría dejarlo por encima).
   const gratuitos = Math.min(Math.max(0, Number(plan?.cantidad_mantenimientos_gratuitos || 0)), meses);
   const conMantenimiento = new Set([...(mesesConMant || [])].map(Number));
+  const porAscensor = esPlanPorAscensor(plan);
   let conteoConMant = 0;
   let facturables = 0;
+  let sumaMeses = 0;
   for (let m = 1; m <= meses; m++) {
     if (!conMantenimiento.has(m)) continue;
     conteoConMant += 1;
-    if (m > gratuitos) facturables += 1;
+    if (m > gratuitos) {
+      facturables += 1;
+      if (porAscensor) sumaMeses += Number(montosPorMes?.get(m) || 0);
+    }
   }
   const mensual = round2(plan?.monto_mensual || 0);
   return {
@@ -90,8 +236,9 @@ function totalesDelPlan(plan, mesesConMant) {
     meses_gratuitos: gratuitos,
     meses_facturables: facturables,
     monto_mensual: mensual,
-    total: round2(mensual * facturables),
-    moneda: plan?.moneda || null
+    total: porAscensor ? round2(sumaMeses) : round2(mensual * facturables),
+    moneda: plan?.moneda || null,
+    modo_precio: porAscensor ? MODO_PRECIO_POR_ASCENSOR : MODO_PRECIO_MENSUAL
   };
 }
 
@@ -286,11 +433,13 @@ async function liberarVisitasDeServicio(client, idServicio, userId) {
  * Estado de facturación del plan agrupado por MES DEL PLAN — la unidad de cobro.
  *
  * Por cada mes devuelve el detalle de visitas (qué ascensor, cuántas veces y en
- * qué fechas), el avance de ejecución, la cuota asociada del cobro único del
- * plan y el estado del periodo. El importe de un mes con mantenimiento es
- * `plan.monto_mensual`: omitir visitas o ejecutar de menos NO lo cambia. Un mes
- * sin mantenimiento programado (p. ej. los intermedios de un plan trimestral)
- * va en 0 y no se aprueba.
+ * qué fechas), los ascensores que se atienden en él (`ascensores_mes`, los que
+ * se eligen al aprobarlo), el avance de ejecución, la cuota asociada del cobro
+ * único del plan y el estado del periodo. El importe de un mes con
+ * mantenimiento sale de `montoDelMes` (monto mensual o suma de precios por
+ * ascensor): omitir visitas o ejecutar de menos NO lo cambia. Un mes sin
+ * mantenimiento programado (p. ej. los intermedios de un plan trimestral) va en
+ * 0 y no se aprueba.
  *
  * Estados: pendiente → completo → aprobado → facturado → pagado.
  *
@@ -302,7 +451,7 @@ async function mesesDelPlan(client, idPlan) {
     where: { id: Number(idPlan) },
     select: {
       id: true, fecha_inicio: true, duracion_meses: true, tipo_plan: true,
-      frecuencia: true, frecuencia_dias_custom: true,
+      frecuencia: true, frecuencia_dias_custom: true, modo_precio: true,
       monto_mensual: true, moneda: true, cantidad_mantenimientos_gratuitos: true,
       cobro: { select: { id: true } }
     }
@@ -323,7 +472,7 @@ async function mesesDelPlan(client, idPlan) {
   const cuotas = plan.cobro
     ? await client.tbl_cobros_cuotas.findMany({
         where: { id_cobro: plan.cobro.id, estado: 1 },
-        select: { id: true, numero_cuota: true, numero_mes: true, fecha_vencimiento: true, monto: true, monto_pagado: true, estado_cuota: true }
+        select: { id: true, numero_cuota: true, numero_mes: true, fecha_vencimiento: true, monto: true, monto_pagado: true, estado_cuota: true, ascensores_mes: true }
       })
     : [];
   // Una factura ANULADA no cubre el mes: la cuota vuelve a "Por facturar" y el
@@ -346,11 +495,15 @@ async function mesesDelPlan(client, idPlan) {
 
   // Meses que se cobran: los que tienen algún mantenimiento programado. Sin
   // cronograma (plan antiguo), los de la serie teórica de sus ascensores.
-  const filasJunction = visitas.length > 0 ? [] : await client.tbl_mantenimientos_planes_ascensores.findMany({
+  const filasJunction = await client.tbl_mantenimientos_planes_ascensores.findMany({
     where: { id_plan: Number(idPlan), estado: 1 },
-    select: { id_ascensor: true, frecuencia: true, frecuencia_dias_custom: true }
+    select: { id_ascensor: true, frecuencia: true, frecuencia_dias_custom: true, monto: true }
   });
   const mesesCobrables = mesesConMantenimiento(plan, visitas, filasJunction);
+  // Importe de cada mes según la forma de cobro del plan.
+  const cobraPorAscensor = esPlanPorAscensor(plan);
+  const precios = preciosDelPlan(filasJunction);
+  const montosPorMes = montosPorMesDelPlan(plan, visitas, filasJunction);
 
   // Meses con visitas + los declarados por la duración: un mes sin visitas
   // sigue siendo un mes del contrato y se lista, pero solo se cobra si tiene
@@ -399,6 +552,28 @@ async function mesesDelPlan(client, idPlan) {
       String(a.codigo || '').localeCompare(String(b.codigo || ''))
     );
 
+    // Ascensores que se atienden este mes según su frecuencia (visitas activas
+    // u omitidas): son los que se facturan y los que se eligen al aprobar el mes.
+    const ascensoresDelMes = new Map();
+    for (const v of delMes) {
+      if (!ascensoresDelMes.has(v.id_ascensor)) {
+        ascensoresDelMes.set(v.id_ascensor, {
+          id_ascensor: v.id_ascensor,
+          codigo: v.ascensor?.codigo || null,
+          ubicacion: v.ascensor?.ubicacion || null,
+          edificio: v.ascensor?.edificio?.nombre || null,
+          visitas: 0,
+          omitidas: 0,
+          precio: cobraPorAscensor ? (precios.get(v.id_ascensor) || 0) : null
+        });
+      }
+      const a = ascensoresDelMes.get(v.id_ascensor);
+      if (v.activo === 1) a.visitas += 1; else a.omitidas += 1;
+    }
+    const ascensores_mes = [...ascensoresDelMes.values()].sort((a, b) =>
+      String(a.codigo || '').localeCompare(String(b.codigo || ''))
+    );
+
     const total_visitas = activas.length;
     const realizadas = detalle.reduce((a, d) => a + d.realizadas, 0);
     const completo = total_visitas > 0 && realizadas === total_visitas;
@@ -406,6 +581,9 @@ async function mesesDelPlan(client, idPlan) {
     const con_mantenimiento = mesesCobrables.has(numeroMes);
 
     const cuota = cuotas.find(c => c.numero_mes === numeroMes) || null;
+    // Ascensores excluidos al aprobar (foto de la cuota). Sin foto → ninguno.
+    const fotoCuota = cuota && Array.isArray(cuota.ascensores_mes) ? cuota.ascensores_mes : null;
+    const excluidos = fotoCuota ? fotoCuota.filter(a => !a.facturado).map(a => Number(a.id_ascensor)) : [];
     let estado_periodo = completo ? 'completo' : 'pendiente';
     if (cuota) {
       estado_periodo = 'aprobado';
@@ -422,13 +600,14 @@ async function mesesDelPlan(client, idPlan) {
       hasta: ventana.hasta,
       etiqueta: etiquetaMes(numeroMes, ventana.desde),
       detalle,
+      ascensores_mes,
       omitidas: omitidas.length,
       total_visitas,
       realizadas,
       completo,
       es_gratuito,
       con_mantenimiento,
-      monto: es_gratuito || !con_mantenimiento ? 0 : montoMensual,
+      monto: es_gratuito || !con_mantenimiento ? 0 : (montosPorMes.get(numeroMes) ?? montoMensual),
       moneda: plan.moneda,
       cuota: cuota
         ? {
@@ -440,7 +619,10 @@ async function mesesDelPlan(client, idPlan) {
             estado_cuota: cuota.estado_cuota,
             // Aparte de estado_periodo: un mes 'pagado' puede seguir sin factura
             // si el abono se registró antes que el comprobante.
-            facturada: cuotaFacturada.has(cuota.id)
+            facturada: cuotaFacturada.has(cuota.id),
+            // Con qué ascensores se aprobó (null = todos, cuota anterior a la opción).
+            ascensores_mes: fotoCuota,
+            ascensores_excluidos: excluidos
           }
         : null,
       estado_periodo
@@ -449,6 +631,7 @@ async function mesesDelPlan(client, idPlan) {
 
   return {
     id_cobro: plan.cobro?.id || null,
+    modo_precio: cobraPorAscensor ? MODO_PRECIO_POR_ASCENSOR : MODO_PRECIO_MENSUAL,
     monto_mensual: montoMensual,
     moneda: plan.moneda,
     duracion_meses: duracion,
@@ -459,9 +642,27 @@ async function mesesDelPlan(client, idPlan) {
       duracion_meses: duracion,
       cantidad_mantenimientos_gratuitos: cupoGratuito,
       tipo_plan: plan.tipo_plan,
+      modo_precio: plan.modo_precio,
       moneda: plan.moneda
-    }, mesesCobrables),
+    }, mesesCobrables, montosPorMes),
     meses
+  };
+}
+
+/**
+ * Desglose de un mes tal como se facturó: deja fuera los ascensores excluidos
+ * al aprobarlo (cuota.ascensores_excluidos) y recuenta las visitas.
+ */
+function desgloseFacturado(mes) {
+  const excluidos = new Set(mes.cuota?.ascensores_excluidos || []);
+  if (excluidos.size === 0) {
+    return { detalle: mes.detalle, total_visitas: mes.total_visitas, realizadas: mes.realizadas };
+  }
+  const detalle = mes.detalle.filter(d => !excluidos.has(Number(d.id_ascensor)));
+  return {
+    detalle,
+    total_visitas: detalle.reduce((a, d) => a + d.visitas, 0),
+    realizadas: detalle.reduce((a, d) => a + d.realizadas, 0)
   };
 }
 
@@ -498,9 +699,7 @@ async function detalleMensualDeCuota(client, idCuota) {
     hasta: mes.hasta,
     monto: Number(cuota.monto),
     moneda: info.moneda,
-    total_visitas: mes.total_visitas,
-    realizadas: mes.realizadas,
-    detalle: mes.detalle
+    ...desgloseFacturado(mes)
   };
 }
 
@@ -526,9 +725,7 @@ async function detalleMensualPorCuota(client, idPlan) {
       hasta: mes.hasta,
       monto: mes.cuota.monto,
       moneda: info.moneda,
-      total_visitas: mes.total_visitas,
-      realizadas: mes.realizadas,
-      detalle: mes.detalle
+      ...desgloseFacturado(mes)
     });
   }
   return salida;
@@ -537,6 +734,14 @@ async function detalleMensualPorCuota(client, idPlan) {
 module.exports = {
   round2,
   etiquetaMes,
+  MODO_PRECIO_MENSUAL,
+  MODO_PRECIO_POR_ASCENSOR,
+  MODOS_PRECIO,
+  esPlanPorAscensor,
+  preciosDelPlan,
+  montoDelMes,
+  fotoAscensoresMes,
+  montosPorMesDelPlan,
   totalesDelPlan,
   mesesConMantenimiento,
   frecuenciaDeAscensor,

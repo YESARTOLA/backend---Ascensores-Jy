@@ -4,11 +4,25 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdLima, ymdDeFecha, finDelDiaLima, inicioDelDiaLima } = require('../utils/tiempo');
-const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, COLORES } = require('../utils/recordatoriosAuto');
+const { sincronizarRecordatorioMantenimientoPlan, sincronizarRecordatorioServicio, sincronizarRecordatorioCobro, COLORES } = require('../utils/recordatoriosAuto');
+const { esFacturaActiva } = require('../utils/estadoFactura');
+const { sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
+
+// Los mantenimientos del plan toman factura y cobro de la cuota de su mes
+// (utils/facturacionServiciosPlan.js): se realinean tras todo lo que mueve las
+// cuotas o el cronograma. Nunca lanza: el cambio del plan ya quedó grabado.
+async function sincronizarContabilidadDelPlan(idPlan, userId) {
+  try {
+    await sincronizarFacturacionServiciosPlan(prisma, idPlan, userId);
+  } catch (err) {
+    console.error(`[plan #${idPlan}] sincronizar mantenimientos:`, err);
+  }
+}
 const { paginar, paginarArray } = require('../utils/paginacion');
 const { FRECUENCIAS, obtenerFrecuencia, calcularFechasProgramacion, visitasEnMeses } = require('../utils/frecuenciaMantenimiento');
 const {
-  generarProgramacion, mesesDelPlan, mesesConMantenimiento, tituloBasePlan, eventoDeVisita, frecuenciaDeAscensor
+  generarProgramacion, mesesDelPlan, mesesConMantenimiento, tituloBasePlan, eventoDeVisita, frecuenciaDeAscensor,
+  MODO_PRECIO_MENSUAL, MODO_PRECIO_POR_ASCENSOR, preciosDelPlan, montoDelMes, fotoAscensoresMes, montosPorMesDelPlan
 } = require('../utils/planMantenimientoMensual');
 // Cálculo de las fechas teóricas del plan. Lo usa `_regenerarProgramacion` al
 // recalcular el cronograma tras editar duración, frecuencias o fecha de inicio.
@@ -332,9 +346,13 @@ function _frecuenciaPlanDesdeAscensores(entradas) {
  * `tipoServicio` se usa para validar el cupo gratuito (solo permitido en planes
  * cuyo subtipo pertenece al módulo Mantenimientos). En el modelo mensual el
  * cupo cuenta MESES gratuitos, no visitas sueltas.
+ *
+ * `modo_precio` = 'por_ascensor': quien llama ya validó el precio de cada
+ * ascensor y manda en `monto_mensual` la suma de todos (ver _preciosDeEntradas).
  */
 function _normalizarPlanInput(d, tipoServicio) {
   const tipo_plan = d.tipo_plan === 'eventual' ? 'eventual' : 'continuo';
+  const modo_precio = d.modo_precio === MODO_PRECIO_POR_ASCENSOR ? MODO_PRECIO_POR_ASCENSOR : MODO_PRECIO_MENSUAL;
   const esPreventivo = esModuloMantenimiento(tipoServicio);
 
   const gratuitosRaw = d.cantidad_mantenimientos_gratuitos;
@@ -370,7 +388,8 @@ function _normalizarPlanInput(d, tipoServicio) {
       duracion_meses: 1,
       cantidad_mantenimientos: null,
       cantidad_mantenimientos_gratuitos,
-      monto_mensual
+      monto_mensual,
+      modo_precio
     };
   }
 
@@ -394,8 +413,42 @@ function _normalizarPlanInput(d, tipoServicio) {
     duracion_meses: meses,
     cantidad_mantenimientos: null,  // derivado: lo fija la programación generada
     cantidad_mantenimientos_gratuitos,
-    monto_mensual
+    monto_mensual,
+    modo_precio
   };
+}
+
+/**
+ * Precio de cada ascensor de un plan 'por_ascensor': lo que se cobra por él en
+ * cada mes en que se le atiende según su frecuencia. Lee `monto` de cada
+ * entrada del body; si no viene, usa el vigente (`previos`, al editar).
+ *
+ * @param {number[]} idsAscensores           conjunto final del plan
+ * @param {Map<number,object>} entradasPorId id_ascensor → entrada del body
+ * @param {Map<number,string>} codigoDe      id_ascensor → código (mensajes)
+ * @param {Map<number,number>} [previos]     id_ascensor → precio vigente
+ * @returns {{precios: Map<number,number>, suma: number}}
+ * @throws {Error} si falta o es inválido el precio de algún ascensor
+ */
+function _preciosDeEntradas(idsAscensores, entradasPorId, codigoDe, previos = new Map()) {
+  const precios = new Map();
+  for (const idAsc of idsAscensores) {
+    const crudo = entradasPorId.get(idAsc)?.monto;
+    const etiqueta = codigoDe.get(idAsc) || idAsc;
+    let precio;
+    if (crudo === undefined || crudo === null || crudo === '') {
+      if (!previos.has(idAsc)) throw new Error(`Indique el precio del ascensor ${etiqueta}`);
+      precio = previos.get(idAsc);
+    } else {
+      precio = Number(crudo);
+      if (!Number.isFinite(precio) || precio < 0) {
+        throw new Error(`El precio del ascensor ${etiqueta} debe ser un número >= 0`);
+      }
+    }
+    precios.set(idAsc, round2(precio));
+  }
+  const suma = round2([...precios.values()].reduce((a, b) => a + b, 0));
+  return { precios, suma };
 }
 
 /**
@@ -427,8 +480,10 @@ const crear = async (req, res) => {
 
     // Cada entrada de `ascensores` trae el ascensor y SU frecuencia: un plan
     // admite frecuencias distintas por ascensor (uno mensual, otro trimestral…).
-    // El precio ya NO se toma del catálogo por ascensor: el importe del plan es
-    // el `monto_mensual` global, uno por mes.
+    // El precio no se toma del catálogo por ascensor. Según la forma de cobro:
+    //   · 'mensual'      → un `monto_mensual` global, uno por mes;
+    //   · 'por_ascensor' → el `monto` de cada entrada; el mes cobra la suma de
+    //                      los ascensores que se atienden en él.
     const entradas = Array.isArray(d.ascensores) ? d.ascensores : [];
     const idsAscensores = entradas.map(a => Number(a?.id_ascensor)).filter(Number.isFinite);
     if (idsAscensores.length === 0) {
@@ -443,16 +498,32 @@ const crear = async (req, res) => {
 
     let normalizado;
     const frecuenciasPorAscensor = new Map();
+    // Precio por ascensor (solo plan 'por_ascensor'). Elegir esa forma de cobro
+    // exige ver precios: sin ese permiso el plan nace 'mensual', como siempre.
+    const modoPrecio = d.modo_precio === MODO_PRECIO_POR_ASCENSOR && puedeVerPrecio(req)
+      ? MODO_PRECIO_POR_ASCENSOR : MODO_PRECIO_MENSUAL;
+    let preciosPorAscensor = null;
     try {
+      const codigos = await prisma.tbl_ascensores.findMany({
+        where: { id: { in: idsAscensores } }, select: { id: true, codigo: true }
+      });
+      const codigoDe = new Map(codigos.map(c => [c.id, c.codigo]));
+      let montoPorAscensor = {};
+      if (modoPrecio === MODO_PRECIO_POR_ASCENSOR) {
+        const entradasPorId = new Map(entradas.map(e => [Number(e.id_ascensor), e]));
+        const { precios, suma } = _preciosDeEntradas(idsAscensores, entradasPorId, codigoDe);
+        preciosPorAscensor = precios;
+        // `monto_mensual` guarda la suma de precios: un mes con todos atendidos.
+        montoPorAscensor = { monto_mensual: suma };
+      }
       // La frecuencia del plan sale de sus ascensores (la que traiga el body
       // solo cuenta si ninguno trae la suya).
-      normalizado = _normalizarPlanInput({ ...d, ..._frecuenciaPlanDesdeAscensores(entradas) }, tipoServicio);
+      normalizado = _normalizarPlanInput(
+        { ...d, ..._frecuenciaPlanDesdeAscensores(entradas), modo_precio: modoPrecio, ...montoPorAscensor },
+        tipoServicio
+      );
       // Un plan eventual no tiene serie: una sola visita por ascensor.
       if (normalizado.tipo_plan === 'continuo') {
-        const codigos = await prisma.tbl_ascensores.findMany({
-          where: { id: { in: idsAscensores } }, select: { id: true, codigo: true }
-        });
-        const codigoDe = new Map(codigos.map(c => [c.id, c.codigo]));
         for (const e of entradas) {
           const idAsc = Number(e.id_ascensor);
           frecuenciasPorAscensor.set(
@@ -492,6 +563,7 @@ const crear = async (req, res) => {
               id_ascensor: idAsc,
               frecuencia: frecuenciasPorAscensor.get(idAsc)?.frecuencia || null,
               frecuencia_dias_custom: frecuenciasPorAscensor.get(idAsc)?.frecuencia_dias_custom ?? null,
+              ...(preciosPorAscensor ? { monto: preciosPorAscensor.get(idAsc) } : {}),
               moneda,
               user_id_registration: req.user.id
             }))
@@ -525,7 +597,7 @@ const crear = async (req, res) => {
 
       // Cobro ÚNICO del plan que CRECE un mes por vez. Nace VACÍO (monto 0, sin
       // cuotas): cada MES que el admin aprueba desde `aprobarPeriodo` le añade
-      // una cuota por `monto_mensual` y sube el total del cobro. Así el cliente
+      // una cuota por el importe del mes y sube el total del cobro. Así el cliente
       // nunca aparece debiendo meses que aún no transcurrieron, y por mes se
       // genera una sola factura y un solo pago.
       await crearCobroInicial(tx, {
@@ -806,7 +878,7 @@ async function _validarCambioDeAlcance(d, previo) {
  * recalcula las fechas de los ascensores vigentes (las visitas sin servicio del
  * ascensor retirado se borran allí, porque ya no está entre los activos).
  */
-async function _aplicarCambioDeAlcance(tx, previo, cambio, entradasFrecuencia, normalizado, userId) {
+async function _aplicarCambioDeAlcance(tx, previo, cambio, entradasFrecuencia, normalizado, userId, precios = null) {
   const stamp = { user_id_modification: userId, date_time_modification: new Date() };
 
   // Ascensores que salen: sus mantenimientos pendientes se dan de baja (con su
@@ -829,16 +901,19 @@ async function _aplicarCambioDeAlcance(tx, previo, cambio, entradasFrecuencia, n
     const existente = await tx.tbl_mantenimientos_planes_ascensores.findFirst({
       where: { id_plan: previo.id, id_ascensor: idAsc }
     });
+    // Plan 'por_ascensor': el ascensor entra con su precio.
+    const precio = precios && precios.has(idAsc) ? { monto: precios.get(idAsc) } : {};
     if (existente) {
       await tx.tbl_mantenimientos_planes_ascensores.update({
         where: { id: existente.id },
-        data: { estado: 1, frecuencia: frec.frecuencia, frecuencia_dias_custom: frec.frecuencia_dias_custom, ...stamp }
+        data: { estado: 1, frecuencia: frec.frecuencia, frecuencia_dias_custom: frec.frecuencia_dias_custom, ...precio, ...stamp }
       });
     } else {
       await tx.tbl_mantenimientos_planes_ascensores.create({
         data: {
           id_plan: previo.id, id_ascensor: idAsc,
           frecuencia: frec.frecuencia, frecuencia_dias_custom: frec.frecuencia_dias_custom,
+          ...precio,
           moneda: previo.moneda, user_id_registration: userId
         }
       });
@@ -966,6 +1041,33 @@ const actualizar = async (req, res) => {
       : await prisma.tbl_tipos_servicio.findUnique({ where: { id: idTipoFinal } });
 
     const tipoPlanFinal = d.tipo_plan ?? previo.tipo_plan;
+
+    // Forma de cobro y, en 'por_ascensor', el precio de cada ascensor del
+    // conjunto FINAL (el que no lo trae en el body conserva el vigente).
+    const modoPrecioFinal = d.modo_precio === undefined || d.modo_precio === null || d.modo_precio === ''
+      ? (previo.modo_precio || MODO_PRECIO_MENSUAL)
+      : (d.modo_precio === MODO_PRECIO_POR_ASCENSOR ? MODO_PRECIO_POR_ASCENSOR : MODO_PRECIO_MENSUAL);
+    let preciosFinales = null;
+    if (modoPrecioFinal === MODO_PRECIO_POR_ASCENSOR) {
+      const entradasPrecio = Array.isArray(d.ascensores)
+        ? d.ascensores
+        : (Array.isArray(d.ascensores_frecuencias) ? d.ascensores_frecuencias : []);
+      const entradasPorId = new Map(entradasPrecio.map(e => [Number(e?.id_ascensor), e]));
+      // Un plan que pasa de 'mensual' a 'por_ascensor' no trae precios vigentes:
+      // su `monto` era legado informativo.
+      const previos = previo.modo_precio === MODO_PRECIO_POR_ASCENSOR
+        ? preciosDelPlan(previo.ascensores) : new Map();
+      const codigos = await prisma.tbl_ascensores.findMany({
+        where: { id: { in: cambioAscensores.idsFinal } }, select: { id: true, codigo: true }
+      });
+      try {
+        preciosFinales = _preciosDeEntradas(
+          cambioAscensores.idsFinal, entradasPorId, new Map(codigos.map(c => [c.id, c.codigo])), previos
+        );
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
     // Frecuencia del plan: se deriva del conjunto FINAL de ascensores con sus
     // frecuencias (ver _frecuenciaPlanDesdeAscensores).
     const entradasFinales = Array.isArray(d.ascensores)
@@ -981,7 +1083,9 @@ const actualizar = async (req, res) => {
         : (d.frecuencia_dias_custom ?? previo.frecuencia_dias_custom),
       duracion_meses: d.duracion_meses ?? previo.duracion_meses,
       cantidad_mantenimientos_gratuitos: d.cantidad_mantenimientos_gratuitos ?? previo.cantidad_mantenimientos_gratuitos,
-      monto_mensual: d.monto_mensual ?? previo.monto_mensual
+      modo_precio: modoPrecioFinal,
+      // 'por_ascensor': la suma de precios (un mes con todos atendidos).
+      monto_mensual: preciosFinales ? preciosFinales.suma : (d.monto_mensual ?? previo.monto_mensual)
     };
     let normalizado;
     // Frecuencia por ascensor: [{ id_ascensor, frecuencia, frecuencia_dias_custom }].
@@ -1047,13 +1151,27 @@ const actualizar = async (req, res) => {
       const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
       // Altas/bajas de ascensores y cambio de cliente, antes de recalcular nada.
       if (cambioAscensores.cambia) {
-        await _aplicarCambioDeAlcance(tx, previo, cambioAscensores, entradasFrecuencia, normalizado, req.user.id);
+        await _aplicarCambioDeAlcance(
+          tx, previo, cambioAscensores, entradasFrecuencia, normalizado, req.user.id, preciosFinales?.precios || null
+        );
       }
       for (const [idFila, f] of nuevasFrecuencias) {
         await tx.tbl_mantenimientos_planes_ascensores.update({
           where: { id: idFila },
           data: { frecuencia: f.frecuencia, frecuencia_dias_custom: f.frecuencia_dias_custom, ...stamp }
         });
+      }
+      // Precio de los ascensores que siguen en el plan (los que entran ya lo
+      // recibieron al aplicar el cambio de alcance).
+      if (preciosFinales) {
+        for (const fila of previo.ascensores) {
+          if (!preciosFinales.precios.has(fila.id_ascensor)) continue;
+          const precio = preciosFinales.precios.get(fila.id_ascensor);
+          if (round2(fila.monto) === precio) continue;
+          await tx.tbl_mantenimientos_planes_ascensores.update({
+            where: { id: fila.id }, data: { monto: precio, ...stamp }
+          });
+        }
       }
       const plan = await tx.tbl_mantenimientos_planes.update({
         where: { id },
@@ -1078,14 +1196,18 @@ const actualizar = async (req, res) => {
         ? await _regenerarProgramacion(tx, plan, req.user.id)
         : { creadas: 0, eliminadas: 0, total: previo.cantidad_mantenimientos };
 
-      // El importe de un mes depende del monto mensual Y del cupo gratuito
-      // (los meses gratuitos valen 0). Si cambia cualquiera de los dos hay que
-      // rehacer las cuotas aún no facturadas ni pagadas, y reetiquetar los
-      // mantenimientos pendientes de los meses afectados.
+      // El importe de un mes depende del monto mensual (o de los precios por
+      // ascensor), de la forma de cobro Y del cupo gratuito (los meses gratuitos
+      // valen 0). Si cambia cualquiera hay que rehacer las cuotas aún no
+      // facturadas ni pagadas, y reetiquetar los mantenimientos pendientes de
+      // los meses afectados.
       const cambioMonto = round2(normalizado.monto_mensual) !== round2(previo.monto_mensual);
       const cambioCupo = Number(normalizado.cantidad_mantenimientos_gratuitos) !== Number(previo.cantidad_mantenimientos_gratuitos);
-      const cuotas = (cambioMonto || cambioCupo)
-        ? await _reflejarMontoMensualEnCuotas(tx, id, normalizado.monto_mensual, req.user.id)
+      const cambioModo = modoPrecioFinal !== (previo.modo_precio || MODO_PRECIO_MENSUAL);
+      const cambioPrecios = !!preciosFinales && previo.ascensores.some(f =>
+        preciosFinales.precios.has(f.id_ascensor) && round2(f.monto) !== preciosFinales.precios.get(f.id_ascensor));
+      const cuotas = (cambioMonto || cambioCupo || cambioModo || cambioPrecios)
+        ? await _reflejarImporteEnCuotas(tx, id, req.user.id)
         : null;
       const servicios = cambioCupo
         ? await _sincronizarGratuitosDeServicios(tx, id, normalizado.cantidad_mantenimientos_gratuitos, req.user.id)
@@ -1108,6 +1230,7 @@ const actualizar = async (req, res) => {
       accion: 'UPDATE', valor_anterior: previo, valor_nuevo: resultado.plan, ip: req.ip
     });
     sincronizarRecordatorioMantenimientoPlan(id).catch(err => console.error('Sync rec mant:', err));
+    await sincronizarContabilidadDelPlan(id, req.user.id);
     res.json({
       data: {
         ...resultado.plan,
@@ -1720,12 +1843,14 @@ async function _construirDatasetReporte({ idsCliente, idsAscensor, estadoEjecuci
   // Meses con mantenimiento de cada plan (los que se cobran): el total del plan
   // en el export sale de ahí (utils/planMantenimientoMensual.totalesDelPlan).
   const mesesProgramados = planes.length === 0 ? [] : await prisma.tbl_mantenimientos_programacion.groupBy({
-    by: ['id_plan', 'numero_mes'],
+    by: ['id_plan', 'numero_mes', 'id_ascensor'],
     where: { id_plan: { in: planes.map(p => p.id) }, estado: 1 }
   });
   for (const plan of planes) {
     const visitas = mesesProgramados.filter(v => v.id_plan === plan.id);
     plan.meses_con_mantenimiento = [...mesesConMantenimiento(plan, visitas, plan.ascensores)];
+    // Planes 'por_ascensor': cada mes vale la suma de sus ascensores.
+    plan.montos_por_mes = montosPorMesDelPlan(plan, visitas, plan.ascensores);
   }
 
   // Mapa de claves "plan-fecha" para deduplicar con proyecciones teóricas.
@@ -2086,7 +2211,10 @@ const listarPeriodos = async (req, res) => {
           id_cobro: null,
           monto_mensual: null,
           totales: null,
-          meses: (data.meses || []).map(({ monto, cuota, ...resto }) => resto)
+          meses: (data.meses || []).map(({ monto, cuota, ascensores_mes, ...resto }) => ({
+            ...resto,
+            ascensores_mes: (ascensores_mes || []).map(({ precio, ...a }) => a)
+          }))
         }
       });
     }
@@ -2357,19 +2485,24 @@ const reconstruirProgramacion = async (req, res) => {
 /**
  * POST /:id/periodos/aprobar — aprueba un MES del plan para facturación.
  *
- * El mes es la unidad de cobro: se le crea UNA cuota por `monto_mensual` en el
- * cobro único del plan, y el cobro sube su total. El importe NO depende de
- * cuántas visitas se hayan ejecutado — por eso no hay modo "equivalente": un
- * mes incompleto se puede aprobar forzado, pero siempre por el monto pactado.
- * Un mes sin mantenimiento programado no se cobra y, por tanto, no se aprueba.
+ * El mes es la unidad de cobro: se le crea UNA cuota en el cobro único del
+ * plan, y el cobro sube su total. El importe NO depende de cuántas visitas se
+ * hayan ejecutado: un mes incompleto se puede aprobar forzado. Un mes sin
+ * mantenimiento programado no se cobra y, por tanto, no se aprueba.
  *
- * Body: { numero_mes: number, forzar?: bool }
+ * `ascensores` elige cuáles de los ascensores del mes se facturan. Sin él, se
+ * facturan todos (el importe del mes tal cual). Al excluir alguno, el importe
+ * baja según la forma de cobro (montoDelMes): en 'mensual', la parte
+ * proporcional de los que quedan; en 'por_ascensor', el precio del excluido.
+ * La cuota guarda la foto de los ascensores con que se aprobó.
+ *
+ * Body: { numero_mes: number, forzar?: bool, ascensores?: number[] }
  * Devuelve la cuota creada → el front abre el modal de factura con id_cuota.
  */
 const aprobarPeriodo = async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { numero_mes, ordinal, forzar } = req.body || {};
+    const { numero_mes, ordinal, forzar, ascensores } = req.body || {};
     const mesPedido = Number(numero_mes ?? ordinal);
 
     // Un plan cancelado o dado de baja no aprueba meses NUEVOS (sería cobrar
@@ -2404,8 +2537,31 @@ const aprobarPeriodo = async (req, res) => {
       });
     }
 
-    // El importe del mes es fijo: el monto mensual pactado (0 si es mes gratuito).
-    const monto = round2(p.monto);
+    // Ascensores que se facturan: los marcados entre los del mes (sin lista,
+    // todos). Un mes gratuito vale 0 igual.
+    const delMes = p.ascensores_mes || [];
+    let idsFacturados = null;
+    if (Array.isArray(ascensores)) {
+      const validos = new Set(delMes.map(a => a.id_ascensor));
+      idsFacturados = [...new Set(ascensores.map(Number))].filter(idAsc => validos.has(idAsc));
+      if (!p.es_gratuito && delMes.length > 0 && idsFacturados.length === 0) {
+        return res.status(400).json({
+          error: 'Marca al menos un ascensor para facturar el mes. Si este mes no se cobra, no lo apruebes.'
+        });
+      }
+      // Todos marcados = sin exclusiones.
+      if (idsFacturados.length === delMes.length) idsFacturados = null;
+    }
+    const precios = new Map(delMes.map(a => [a.id_ascensor, Number(a.precio || 0)]));
+    const idsDelMes = delMes.map(a => a.id_ascensor);
+    // Importe del mes (0 si es mes gratuito): el pactado, o el que queda tras
+    // excluir ascensores.
+    const monto = p.es_gratuito || idsFacturados == null
+      ? round2(p.monto)
+      : montoDelMes({ modo: info.modo_precio, montoMensual: info.monto_mensual, precios, idsDelMes, idsFacturados });
+    const fotoAscensores = delMes.length > 0
+      ? fotoAscensoresMes({ modo: info.modo_precio, montoMensual: info.monto_mensual, precios, ascensores: delMes, idsFacturados })
+      : null;
 
     const cobro = await prisma.tbl_cobros.findUnique({
       where: { id: info.id_cobro },
@@ -2422,6 +2578,7 @@ const aprobarPeriodo = async (req, res) => {
           // el vínculo estable con el cronograma del plan.
           numero_cuota: (cobro.numero_cuotas || 0) + 1,
           numero_mes: p.numero_mes,
+          ascensores_mes: fotoAscensores,
           fecha_vencimiento: fechaVenc,
           monto,
           estado_cuota: monto > 0 ? 'Pendiente' : 'Pagada',
@@ -2453,10 +2610,13 @@ const aprobarPeriodo = async (req, res) => {
         plan: id, numero_mes: p.numero_mes, etiqueta: p.etiqueta, monto,
         // Aprobado con mantenimientos pendientes (p. ej. facturado al recibir el
         // pago del mes, antes de las visitas).
-        forzado: !p.completo, realizadas: p.realizadas, total: p.total_visitas
+        forzado: !p.completo, realizadas: p.realizadas, total: p.total_visitas,
+        modo_precio: info.modo_precio,
+        ascensores_excluidos: (fotoAscensores || []).filter(a => !a.facturado).map(a => a.codigo || a.id_ascensor)
       },
       ip: req.ip
     });
+    await sincronizarContabilidadDelPlan(id, req.user.id);
 
     res.status(201).json({
       data: {
@@ -2468,6 +2628,134 @@ const aprobarPeriodo = async (req, res) => {
   } catch (err) {
     console.error('[mantenimientos.aprobarPeriodo]', err);
     res.status(500).json({ error: 'Error al aprobar el mes: ' + err.message });
+  }
+};
+
+/**
+ * POST /:id/periodos/revertir — deshace la aprobación de un MES (p. ej. se
+ * aprobó por error). Espejo exacto de `aprobarPeriodo`: da de baja la cuota del
+ * mes, le resta su monto al cobro único del plan y el mes vuelve a quedar sin
+ * aprobar (sale de Contabilidad → "Por facturar"). Se puede volver a aprobar.
+ *
+ * Solo mientras el mes no tenga consecuencias contables:
+ *   · sin factura vigente (una anulada no cuenta: anularla es el camino para
+ *     revertir un mes ya facturado);
+ *   · sin abonos aplicados a su cuota;
+ *   · con el cobro del plan abierto (ni Cerrado ni Incobrable).
+ * No exige plan activo: retirar un cobro aprobado por error nunca cobra de más.
+ *
+ * Body: { numero_mes: number, motivo?: string }
+ */
+const revertirPeriodo = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { numero_mes, motivo } = req.body || {};
+    const mesPedido = Number(numero_mes);
+
+    const plan = await prisma.tbl_mantenimientos_planes.findUnique({
+      where: { id }, select: { estado: true, cobro: { select: { id: true } } }
+    });
+    if (!plan || plan.estado !== 1) return res.status(404).json({ error: 'Plan no encontrado' });
+    if (!plan.cobro) return res.status(400).json({ error: 'El plan no tiene un cobro asociado' });
+    const idCobro = plan.cobro.id;
+
+    const cobro = await prisma.tbl_cobros.findUnique({
+      where: { id: idCobro },
+      include: {
+        cuotas: { where: { estado: 1 }, include: { facturas: true } },
+        facturas: { where: { estado: 1 } }
+      }
+    });
+    const cuota = cobro.cuotas.find(c => c.numero_mes === mesPedido);
+    if (!cuota) return res.status(404).json({ error: 'El mes no está aprobado' });
+
+    if (['Cerrado', 'Incobrable'].includes(cobro.estado_cobro)) {
+      return res.status(409).json({ error: `El cobro del plan está "${cobro.estado_cobro}": no se puede revertir la aprobación del mes.` });
+    }
+    const facturaMes = (cuota.facturas || []).find(esFacturaActiva);
+    if (facturaMes) {
+      return res.status(409).json({
+        error: `El mes ya tiene la factura ${facturaMes.numero_factura} emitida. Anúlela en Contabilidad para poder revertir la aprobación.`
+      });
+    }
+    // Una factura general (sin cuota) cubre todo el cobro, incluido este mes.
+    const facturaGeneral = cobro.facturas.find(f => f.id_cuota == null && esFacturaActiva(f));
+    if (facturaGeneral) {
+      return res.status(409).json({
+        error: `El cobro del plan tiene la factura general ${facturaGeneral.numero_factura}, que incluye este mes. Anúlela en Contabilidad para poder revertir la aprobación.`
+      });
+    }
+    if (Number(cuota.monto_pagado) > 0) {
+      return res.status(409).json({
+        error: `El mes ya tiene abonos aplicados (${Number(cuota.monto_pagado).toFixed(2)}${cobro.moneda ? ` ${cobro.moneda}` : ''}). No se puede revertir la aprobación.`
+      });
+    }
+
+    const monto = round2(cuota.monto);
+    const nuevoMontoTotal = round2(Math.max(0, Number(cobro.monto_total) - monto));
+    const totalAbonado = Number(cobro.total_abonado || 0);
+    const nuevoSaldo = round2(Math.max(0, nuevoMontoTotal - totalAbonado));
+    const restantes = cobro.cuotas.filter(c => c.id !== cuota.id);
+    // Próximo abono: el vencimiento más cercano entre las cuotas que siguen
+    // pendientes (mismo criterio que registrarPago).
+    const proximaPendiente = restantes
+      .filter(c => Number(c.monto_pagado) < Number(c.monto))
+      .sort((a, b) => new Date(a.fecha_vencimiento) - new Date(b.fecha_vencimiento))[0] || null;
+    // Estado del cobro: deshace lo que movió `aprobarPeriodo` ('Sin cobro' →
+    // 'Pendiente de iniciar' al aprobar el primer mes con importe) y, si lo que
+    // queda ya está pagado, lo cierra como 'Pagado' (criterio de registrarPago).
+    let nuevoEstado = cobro.estado_cobro;
+    const quedaImporte = restantes.some(c => Number(c.monto) > 0);
+    if (!quedaImporte && totalAbonado === 0 && cobro.estado_cobro === 'Pendiente de iniciar') nuevoEstado = 'Sin cobro';
+    else if (quedaImporte && nuevoSaldo === 0 && totalAbonado > 0) nuevoEstado = 'Pagado';
+
+    const stamp = { user_id_modification: req.user.id, date_time_modification: new Date() };
+    await prisma.$transaction(async (tx) => {
+      await tx.tbl_cobros_cuotas.update({ where: { id: cuota.id }, data: { estado: 0, ...stamp } });
+      // Correlativo visible sin huecos: las cuotas posteriores bajan un número
+      // (mantiene el orden FIFO de los abonos y `numero_cuotas + 1` para la
+      // próxima aprobación).
+      await tx.tbl_cobros_cuotas.updateMany({
+        where: { id_cobro: idCobro, estado: 1, numero_cuota: { gt: cuota.numero_cuota } },
+        data: { numero_cuota: { decrement: 1 }, ...stamp }
+      });
+      // Recordatorios automáticos de esa cuota: ya no hay nada que cobrar.
+      await tx.tbl_recordatorios.updateMany({
+        where: { id_cuota: cuota.id, estado: 1 },
+        data: { estado: 0, ...stamp }
+      });
+      await tx.tbl_cobros.update({
+        where: { id: idCobro },
+        data: {
+          monto_total: nuevoMontoTotal,
+          saldo_pendiente: nuevoSaldo,
+          numero_cuotas: { decrement: 1 },
+          // Una cuota gratuita nació 'Pagada' y no sumó a las faltantes.
+          cuotas_faltantes: monto > 0 && Number(cobro.cuotas_faltantes) > 0 ? { decrement: 1 } : undefined,
+          fecha_proximo_abono: nuevoSaldo === 0 ? null : (proximaPendiente?.fecha_vencimiento ?? cobro.fecha_proximo_abono),
+          estado_cobro: nuevoEstado,
+          ...stamp
+        }
+      });
+    });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_cobros_cuotas', id_entidad: cuota.id,
+      accion: 'DELETE',
+      valor_anterior: {
+        plan: id, numero_mes: cuota.numero_mes, numero_cuota: cuota.numero_cuota,
+        monto, estado_cuota: cuota.estado_cuota
+      },
+      valor_nuevo: { estado: 0, revertido: true, motivo: motivo ? String(motivo).trim() || null : null },
+      ip: req.ip
+    });
+    sincronizarRecordatorioCobro(idCobro).catch(err => console.error('Sync rec cobro:', err));
+    await sincronizarContabilidadDelPlan(id, req.user.id);
+
+    res.json({ data: { numero_mes: cuota.numero_mes, id_cobro: idCobro, monto } });
+  } catch (err) {
+    console.error('[mantenimientos.revertirPeriodo]', err);
+    res.status(500).json({ error: 'Error al revertir la aprobación del mes: ' + err.message });
   }
 };
 
@@ -2513,13 +2801,18 @@ async function _sincronizarGratuitosDeServicios(tx, idPlan, cupoGratuito, userId
 }
 
 /**
- * Propaga un nuevo monto mensual a las cuotas del cobro del plan que aún se
- * pueden tocar: las que no están facturadas ni tienen pagos. Los meses ya
- * cerrados conservan el importe con el que se emitieron.
+ * Recalcula el importe de las cuotas del cobro del plan que aún se pueden
+ * tocar —las que no están facturadas ni tienen pagos— tras cambiar el monto
+ * mensual, los precios por ascensor, la forma de cobro o el cupo gratuito. Los
+ * meses ya cerrados conservan el importe con el que se emitieron.
+ *
+ * Cada cuota conserva los ascensores con que se aprobó (su foto): si al
+ * aprobarla se excluyó alguno, sigue excluido con el importe nuevo. Las cuotas
+ * sin foto (anteriores a esa opción) facturan todos los ascensores del mes.
  *
  * @returns {Promise<{ajustadas:number, bloqueadas:number, delta:number}>}
  */
-async function _reflejarMontoMensualEnCuotas(tx, idPlan, montoMensual, userId) {
+async function _reflejarImporteEnCuotas(tx, idPlan, userId) {
   const cobro = await tx.tbl_cobros.findFirst({
     where: { id_mantenimiento_plan: idPlan, estado: 1 },
     select: { id: true }
@@ -2531,20 +2824,41 @@ async function _reflejarMontoMensualEnCuotas(tx, idPlan, montoMensual, userId) {
     include: { facturas: { where: { estado: 1 } } }
   });
   const plan = await tx.tbl_mantenimientos_planes.findUnique({
-    where: { id: idPlan }, select: { cantidad_mantenimientos_gratuitos: true }
+    where: { id: idPlan },
+    select: { cantidad_mantenimientos_gratuitos: true, modo_precio: true, monto_mensual: true }
   });
   const cupo = Number(plan?.cantidad_mantenimientos_gratuitos || 0);
+  const modo = plan?.modo_precio || MODO_PRECIO_MENSUAL;
+  const montoMensual = round2(plan?.monto_mensual || 0);
+  const precios = preciosDelPlan(await tx.tbl_mantenimientos_planes_ascensores.findMany({
+    where: { id_plan: idPlan, estado: 1 }, select: { id_ascensor: true, monto: true }
+  }));
+  // Ascensores de cada mes según el cronograma, para las cuotas sin foto.
+  const visitas = await tx.tbl_mantenimientos_programacion.findMany({
+    where: { id_plan: idPlan, estado: 1 }, select: { numero_mes: true, id_ascensor: true }
+  });
+  const ascensoresDelMes = (m) => [...new Set(visitas.filter(v => v.numero_mes === m).map(v => v.id_ascensor))];
 
   let ajustadas = 0, bloqueadas = 0, delta = 0;
   for (const c of cuotas) {
-    const objetivo = c.numero_mes <= cupo ? 0 : round2(montoMensual);
-    if (round2(c.monto) === objetivo) continue;
+    const foto = Array.isArray(c.ascensores_mes) && c.ascensores_mes.length > 0 ? c.ascensores_mes : null;
+    const idsDelMes = foto ? foto.map(a => Number(a.id_ascensor)) : ascensoresDelMes(c.numero_mes);
+    const idsFacturados = foto ? foto.filter(a => a.facturado).map(a => Number(a.id_ascensor)) : null;
+    const objetivo = c.numero_mes <= cupo
+      ? 0
+      : montoDelMes({ modo, montoMensual, precios, idsDelMes, idsFacturados });
+    const nuevaFoto = foto
+      ? fotoAscensoresMes({ modo, montoMensual, precios, ascensores: foto, idsFacturados })
+      : null;
+    const cambiaFoto = foto && JSON.stringify(nuevaFoto) !== JSON.stringify(foto);
+    if (round2(c.monto) === objetivo && !cambiaFoto) continue;
     if (c.facturas.length > 0 || Number(c.monto_pagado || 0) > 0) { bloqueadas++; continue; }
     delta = round2(delta + (objetivo - Number(c.monto)));
     await tx.tbl_cobros_cuotas.update({
       where: { id: c.id },
       data: {
         monto: objetivo,
+        ...(foto ? { ascensores_mes: nuevaFoto } : {}),
         estado_cuota: objetivo > 0 ? 'Pendiente' : 'Pagada',
         user_id_modification: userId, date_time_modification: new Date()
       }
@@ -2569,9 +2883,10 @@ async function _reflejarMontoMensualEnCuotas(tx, idPlan, montoMensual, userId) {
  *
  * Body: { monto_mensual: number, moneda?: string }
  *
- * Es el ÚNICO precio del plan: no hay montos por ascensor ni por visita. El
- * nuevo importe rige para los meses aún no facturados; los meses ya facturados
- * o con pagos conservan el suyo y se informan como bloqueados.
+ * Solo para planes 'mensual', donde es el ÚNICO precio del plan. Un plan
+ * 'por_ascensor' cambia el precio de cada ascensor desde la edición del plan.
+ * El nuevo importe rige para los meses aún no facturados; los meses ya
+ * facturados o con pagos conservan el suyo y se informan como bloqueados.
  */
 const actualizarMontoMensual = async (req, res) => {
   try {
@@ -2583,9 +2898,14 @@ const actualizarMontoMensual = async (req, res) => {
     }
 
     const plan = await prisma.tbl_mantenimientos_planes.findUnique({
-      where: { id }, select: { id: true, estado: true, monto_mensual: true, moneda: true }
+      where: { id }, select: { id: true, estado: true, monto_mensual: true, moneda: true, modo_precio: true }
     });
     if (!plan || plan.estado === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    if (plan.modo_precio === MODO_PRECIO_POR_ASCENSOR) {
+      return res.status(409).json({
+        error: 'Este plan cobra por ascensor: cambia el precio de cada ascensor desde «Editar plan».'
+      });
+    }
 
     const monedaFinal = _monedaDelBody(moneda, plan.moneda);
     if (!monedaFinal) return res.status(400).json({ error: 'Moneda no válida' });
@@ -2604,7 +2924,7 @@ const actualizarMontoMensual = async (req, res) => {
         data: { monto_mensual: round2(monto), moneda: monedaFinal, ...stamp }
       });
       if (cambioMoneda) await _propagarMonedaPlan(tx, id, monedaFinal, req.user.id);
-      const cuotas = await _reflejarMontoMensualEnCuotas(tx, id, round2(monto), req.user.id);
+      const cuotas = await _reflejarImporteEnCuotas(tx, id, req.user.id);
       return { plan: actualizado, cuotas };
     });
 
@@ -2615,6 +2935,7 @@ const actualizarMontoMensual = async (req, res) => {
       valor_nuevo: { monto_mensual: round2(monto), moneda: resultado.plan.moneda, cuotas: resultado.cuotas },
       ip: req.ip
     });
+    await sincronizarContabilidadDelPlan(id, req.user.id);
 
     res.json({
       data: {
@@ -2635,7 +2956,7 @@ module.exports = {
   actualizarMontoMensual,
   materializarSiguienteEventoDelPlan, listarInstancias, exportar,
   impactoEliminacion, eliminar,
-  listarPeriodos, aprobarPeriodo,
+  listarPeriodos, aprobarPeriodo, revertirPeriodo,
   listarProgramacion, cambiarActivoProgramacion, reconstruirProgramacion,
   // Reutilizado por el reporte "Mantenimientos por cliente" (reportesController)
   // para no duplicar la lógica de instancias + proyecciones por rango de fechas.

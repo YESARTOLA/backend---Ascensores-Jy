@@ -12,6 +12,7 @@ const { replicarEnModulo } = require('../utils/replicarEnModulo');
 const { clasificarTipoServicio } = require('../utils/clasificacionServicio');
 const { estaServicioFinalizado, ESTADO_SERVICIO_CANCELADO } = require('../utils/estadoServicio');
 const configuracion = require('../utils/configuracion');
+const { resolverIdEmpresaEmisora } = require('../utils/empresaEmisora');
 const { ESTADO_FACTURACION_SIN } = require('../utils/estadoFactura');
 const { ESTADO_LEAD_COTIZADO, ESTADO_LEAD_INGRESADO, ESTADO_LEAD_DESCARTADO } = require('../utils/estadoLead');
 const { bajaArchivoEnTx, purgarObjetosWasabi, bajaServicioCascadaEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
@@ -346,7 +347,9 @@ const obtener = async (req, res) => {
           include: {
             items: { where: { estado: 1 }, orderBy: { orden: 'asc' }, include: { archivo: true } },
             archivo_pdf: true,
-            archivo_respaldo: true
+            archivo_respaldo: true,
+            empresa_emisora: { select: { id: true, razon_social: true, ruc: true, estado: true } },
+            empresa_pdf: { select: { id: true, razon_social: true, ruc: true } }
           }
         },
         servicios: {
@@ -668,6 +671,9 @@ const crear = async (req, res) => {
     const igvIncluido = !sinIgv && Boolean(d.igv_incluido);
     const totales = calcularTotalesVersion(items, igvTasa, sinIgv, igvIncluido);
     const cuentasPdf = await normalizarCuentasPdf(d.cuentas_pdf);
+    // Razón social / RUC con que se emite (sin elegir → la predeterminada).
+    const empresaEmisora = await resolverIdEmpresaEmisora(d.id_empresa_emisora);
+    if (empresaEmisora.error) return res.status(400).json({ error: empresaEmisora.error });
 
     const tieneCuotas = Boolean(d.tiene_cuotas);
     let planCuotas = null;
@@ -762,6 +768,7 @@ const crear = async (req, res) => {
           sin_igv: sinIgv,
           igv_incluido: igvIncluido,
           cuentas_pdf: cuentasPdf,
+          id_empresa_emisora: empresaEmisora.id,
           user_id_registration: req.user.id
         }
       });
@@ -958,6 +965,17 @@ const actualizarVersion = async (req, res) => {
     const enviaCuentas = Object.prototype.hasOwnProperty.call(d, 'cuentas_pdf');
     if (enviaCuentas) nuevasCuentasPdf = await normalizarCuentasPdf(d.cuentas_pdf);
 
+    // Empresa emisora: solo se valida si cambia (la vigente puede haberse
+    // eliminado después y aun así la versión la conserva).
+    let nuevaEmpresaEmisora;
+    const cambiaEmpresa = Object.prototype.hasOwnProperty.call(d, 'id_empresa_emisora')
+      && Number(d.id_empresa_emisora) !== version.id_empresa_emisora;
+    if (cambiaEmpresa) {
+      const r = await resolverIdEmpresaEmisora(d.id_empresa_emisora);
+      if (r.error) return res.status(400).json({ error: r.error });
+      nuevaEmpresaEmisora = r.id;
+    }
+
     // Manejo del plan de cuotas: opcional. Solo se toca si el cliente envía el campo.
     let nuevoTieneCuotas = version.tiene_cuotas;
     let nuevoPlanCuotas = version.plan_cuotas;
@@ -1003,6 +1021,7 @@ const actualizarVersion = async (req, res) => {
         sin_igv: nuevoSinIgv,
         igv_incluido: nuevoIgvIncluido,
         ...(enviaCuentas ? { cuentas_pdf: nuevasCuentasPdf } : {}),
+        ...(cambiaEmpresa ? { id_empresa_emisora: nuevaEmpresaEmisora } : {}),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       };
@@ -1111,6 +1130,7 @@ const crearNuevaVersion = async (req, res) => {
           // editar la nueva versión se recalcularía con otra regla.
           sin_igv: ultima.sin_igv,
           igv_incluido: ultima.igv_incluido,
+          id_empresa_emisora: ultima.id_empresa_emisora,
           user_id_registration: req.user.id
         }
       });
@@ -2103,6 +2123,9 @@ const generarPdf = async (req, res) => {
       where: { id: version.id },
       data: {
         id_archivo_pdf: archivo.id,
+        // Empresa con que salió este PDF: si luego se cambia la de la versión,
+        // el detalle avisa que hay que regenerarlo.
+        id_empresa_pdf: version.id_empresa_emisora,
         fecha_envio: version.fecha_envio || hoyDate(),
         user_id_modification: req.user.id,
         date_time_modification: new Date()

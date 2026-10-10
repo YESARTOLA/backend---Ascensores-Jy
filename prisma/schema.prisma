@@ -778,8 +778,17 @@ model tbl_mantenimientos_planes {
   // Se mantiene por compatibilidad con listados y reportes que ya lo leen.
   cantidad_mantenimientos           Int?
   cantidad_mantenimientos_gratuitos Int                                    @default(0)
-  // ÚNICO importe facturable del plan: lo que se cobra cada mes, sin importar
-  // cuántas visitas caigan en él. No varía con el detalle del mes.
+  // Forma de cobro del plan:
+  //   'mensual'      → cada mes con mantenimiento cobra `monto_mensual`, sin
+  //                    importar qué ascensores se atiendan en él.
+  //   'por_ascensor' → cada ascensor tiene su precio (`monto` de la junction) y
+  //                    el mes cobra la suma de los ascensores que se atienden en
+  //                    él según su frecuencia. `monto_mensual` guarda entonces la
+  //                    suma de todos los precios (un mes con todos atendidos).
+  // SSoT del cálculo: utils/planMantenimientoMensual.js (montoDelMes).
+  modo_precio                       String                                 @default("mensual") @db.VarChar(20)
+  // Importe de un mes con mantenimiento (modo 'mensual'): lo que se cobra cada
+  // mes, sin importar cuántas visitas caigan en él.
   monto_mensual                     Decimal                                @default(0) @db.Decimal(12, 2)
   moneda                            String                                 @default("PEN") @db.VarChar(10)
   fecha_inicio                      DateTime                               @db.Date
@@ -813,8 +822,9 @@ model tbl_mantenimientos_planes {
 // qué ascensores cubre el plan y con qué periodicidad; de aquí sale el
 // cronograma de tbl_mantenimientos_programacion.
 //
-// `monto`/`moneda` son legado informativo: desde el modelo mensual el importe
-// facturable es `monto_mensual` del plan, no la suma por ascensor.
+// `monto`: precio del ascensor por cada mes en que se le atiende, solo en planes
+// con modo_precio = 'por_ascensor'. En los planes 'mensual' es legado
+// informativo: el importe facturable es `monto_mensual` del plan.
 model tbl_mantenimientos_planes_ascensores {
   id                     Int                               @id @default(autoincrement())
   id_plan                Int
@@ -1183,6 +1193,10 @@ model tbl_cobros_cuotas {
   // que esta cuota factura. Es el vínculo estable con el cronograma — no se usa
   // `numero_cuota` porque reestructurar el plan de cuotas lo reordena.
   numero_mes             Int?
+  // Solo en cuotas de plan: ascensores del mes con que se aprobó, cuáles se
+  // facturan y cuáles se excluyeron, con su importe:
+  // [{ id_ascensor, codigo, facturado, monto }]. NULL = se facturaron todos.
+  ascensores_mes         Json?
   fecha_vencimiento      DateTime            @db.Date
   monto                  Decimal             @default(0) @db.Decimal(12, 2)
   monto_pagado           Decimal             @default(0) @db.Decimal(12, 2)
@@ -1563,6 +1577,12 @@ model tbl_cotizaciones_versiones {
   // no aplica (no hay IGV que desglosar).
   igv_incluido           Boolean                  @default(false)
   cuentas_pdf            Json?
+  // Razón social / RUC con que se emite esta versión (cabecera del PDF). Se
+  // elige al crear la cotización; NULL = la empresa predeterminada.
+  id_empresa_emisora     Int?
+  // Empresa con la que se generó el PDF vigente (id_archivo_pdf). Si difiere
+  // de id_empresa_emisora, el PDF quedó desactualizado y hay que regenerarlo.
+  id_empresa_pdf         Int?
   estado                 Int                      @default(1)
   user_id_registration   Int?
   date_time_registration DateTime?                @default(now()) @db.Timestamptz(6)
@@ -1571,6 +1591,8 @@ model tbl_cotizaciones_versiones {
   cotizacion             tbl_cotizaciones         @relation(fields: [id_cotizacion], references: [id], onDelete: Cascade)
   archivo_pdf            tbl_archivos?            @relation("CotizacionVersionPdf", fields: [id_archivo_pdf], references: [id])
   archivo_respaldo       tbl_archivos?            @relation("CotizacionVersionRespaldo", fields: [id_archivo_respaldo], references: [id])
+  empresa_emisora        tbl_empresas_emisoras?   @relation("CotizacionVersionEmpresaEmisora", fields: [id_empresa_emisora], references: [id])
+  empresa_pdf            tbl_empresas_emisoras?   @relation("CotizacionVersionEmpresaPdf", fields: [id_empresa_pdf], references: [id])
   items                  tbl_cotizaciones_items[]
 
   @@unique([id_cotizacion, numero_version])
@@ -1641,6 +1663,30 @@ model tbl_cuentas_bancarias {
   user_id_modification   Int?
   date_time_modification DateTime?   @db.Timestamptz(6)
   pagos                  tbl_pagos[]
+}
+
+// ---------------------------------------------------------------------
+// EMPRESAS EMISORAS
+// Razones sociales (RUC, dirección, contacto) con las que se puede emitir una
+// cotización. Una es la predeterminada: la sugiere el formulario y la usan
+// los documentos que no eligen empresa. Ver utils/empresaEmisora.js.
+// ---------------------------------------------------------------------
+
+model tbl_empresas_emisoras {
+  id                     Int                          @id @default(autoincrement())
+  razon_social           String                       @db.VarChar(200)
+  ruc                    String                       @db.VarChar(20)
+  direccion              String?
+  telefono               String?                      @db.VarChar(50)
+  correo                 String?                      @db.VarChar(120)
+  es_predeterminada      Boolean                      @default(false)
+  estado                 Int                          @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?                    @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?                    @db.Timestamptz(6)
+  versiones_cotizacion   tbl_cotizaciones_versiones[] @relation("CotizacionVersionEmpresaEmisora")
+  versiones_pdf          tbl_cotizaciones_versiones[] @relation("CotizacionVersionEmpresaPdf")
 }
 
 // ---------------------------------------------------------------------

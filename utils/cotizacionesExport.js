@@ -2,12 +2,12 @@
  * Generación de reportes del listado de cotizaciones en Excel (XLSX) y PDF
  * (A4 horizontal). Devuelven Buffer para que el controller los streamee en la
  * respuesta HTTP. Datos de cabecera (razón social, RUC, etc.) salen de
- * tbl_configuracion — sin hardcodeo. Espejo del patrón de `clientesExport.js`.
+ * la empresa emisora predeterminada (utils/empresaEmisora.js) — sin hardcodeo. Espejo del patrón de `clientesExport.js`.
  */
 
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const configuracion = require('./configuracion');
+const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const { ymdLima } = require('./tiempo');
 const { etiquetaMoneda } = require('./catalogosBancarios');
 
@@ -80,7 +80,7 @@ function mapearFila(cot) {
  *   fila 3 para que el archivo diga qué recorte del listado contiene.
  */
 async function generarExcelCotizaciones(cotizaciones, { filtros = [] } = {}) {
-  const empresa = await configuracion.obtenerVarios(['EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC']);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
 
   const wb = new ExcelJS.Workbook();
@@ -147,9 +147,7 @@ async function generarExcelCotizaciones(cotizaciones, { filtros = [] } = {}) {
 }
 
 async function generarPdfCotizaciones(cotizaciones) {
-  const empresa = await configuracion.obtenerVarios([
-    'EMPRESA_RAZON_SOCIAL', 'EMPRESA_RUC', 'EMPRESA_DIRECCION', 'EMPRESA_TELEFONO', 'EMPRESA_CORREO'
-  ]);
+  const empresa = await obtenerDatosEmpresa();
   const hoy = ymdLima();
 
   const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 30 });
