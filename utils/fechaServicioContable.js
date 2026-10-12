@@ -4,17 +4,20 @@
 // columna dice.
 //
 //  - Mantenimiento (servicio de un plan o de un subtipo del módulo de
-//    mantenimiento): la fecha de EJECUCIÓN, `fecha_realizacion` del realizado
-//    (se fija cuando el técnico finaliza). Mientras siga 'En ejecución' no tiene.
+//    mantenimiento): la fecha REAL en que se ejecutó, la misma de la columna
+//    "Inicio" del módulo de Mantenimientos — el primer paso del servicio a
+//    "En curso" (`fechaInicioReal`, utils/ejecucionFechas.js). Si aún no
+//    arrancó, no tiene.
 //  - Correctivo y cualquier otro: la fecha de APROBACIÓN de su cotización. Sin
 //    cotización aprobada (servicio directo, emergencia no cotizada) no existe
-//    esa fecha y se usa la de ejecución.
+//    esa fecha y se usa la de ejecución (`fecha_realizacion` del realizado).
 
 const { parseYMDLima, parseYMDFinDiaLima } = require('./tiempo');
 const { ESTADOS_VERSION, whereAprobadaEnRango } = require('./estadoCotizacion');
 const { ESTADO_ADMIN_EN_EJECUCION } = require('./estadoServicio');
+const { fechaInicioReal, INCLUDE_HISTORIAL_INICIO, whereInicioEnRango } = require('./ejecucionFechas');
 
-const ORIGEN_EJECUCION = 'ejecucion';
+const ORIGEN_INICIO = 'inicio';
 const ORIGEN_APROBACION = 'aprobacion';
 const ORIGEN_SIN_COTIZACION = 'sin_cotizacion';
 
@@ -45,17 +48,18 @@ const INCLUDE_COTIZACION_APROBACION = {
 
 /**
  * @param {object} realizado  tbl_servicios_realizados con `servicio` (incluye
- *   tipo_servicio y cotizacion: INCLUDE_COTIZACION_APROBACION).
- * @returns {{ fecha: Date|null, origen: 'ejecucion'|'aprobacion'|'sin_cotizacion' }}
+ *   tipo_servicio, cotizacion: INCLUDE_COTIZACION_APROBACION e
+ *   historial_estados: INCLUDE_HISTORIAL_INICIO).
+ * @returns {{ fecha: Date|null, origen: 'inicio'|'aprobacion'|'sin_cotizacion' }}
  */
 function fechaServicioContable(realizado) {
   const servicio = realizado?.servicio;
+  if (esServicioMantenimiento(servicio)) return { fecha: fechaInicioReal(servicio), origen: ORIGEN_INICIO };
+  const aprobacion = servicio?.cotizacion?.versiones?.[0]?.fecha_aprobacion || null;
+  if (aprobacion) return { fecha: aprobacion, origen: ORIGEN_APROBACION };
   const ejecucion = realizado?.estado_administrativo === ESTADO_ADMIN_EN_EJECUCION
     ? null
     : (realizado?.fecha_realizacion || null);
-  if (esServicioMantenimiento(servicio)) return { fecha: ejecucion, origen: ORIGEN_EJECUCION };
-  const aprobacion = servicio?.cotizacion?.versiones?.[0]?.fecha_aprobacion || null;
-  if (aprobacion) return { fecha: aprobacion, origen: ORIGEN_APROBACION };
   return { fecha: ejecucion, origen: ORIGEN_SIN_COTIZACION };
 }
 
@@ -70,10 +74,14 @@ function whereFechaServicioEnRango({ desde, hasta }) {
   if (desde) fecha_realizacion.gte = parseYMDLima(desde);
   if (hasta) fecha_realizacion.lte = parseYMDFinDiaLima(hasta);
   const ejecutadoEnRango = { fecha_realizacion, estado_administrativo: { not: ESTADO_ADMIN_EN_EJECUCION } };
+  const inicioEnRango = whereInicioEnRango({
+    desde: desde ? parseYMDLima(desde) : null,
+    hasta: hasta ? parseYMDFinDiaLima(hasta) : null
+  });
   const noMantenimiento = { NOT: WHERE_SERVICIO_MANTENIMIENTO };
   return {
     OR: [
-      { ...ejecutadoEnRango, servicio: WHERE_SERVICIO_MANTENIMIENTO },
+      { servicio: { ...WHERE_SERVICIO_MANTENIMIENTO, ...inicioEnRango } },
       { servicio: { ...noMantenimiento, cotizacion: { is: whereAprobadaEnRango({ desde, hasta }) } } },
       {
         ...ejecutadoEnRango,
@@ -88,6 +96,7 @@ function whereFechaServicioEnRango({ desde, hasta }) {
 
 module.exports = {
   INCLUDE_COTIZACION_APROBACION,
+  INCLUDE_HISTORIAL_INICIO,
   fechaServicioContable,
   whereFechaServicioEnRango
 };

@@ -11,7 +11,7 @@
  *                                 `fecha_inicio_real`; un caso que aún no
  *                                 arrancó no tiene inicio y no entra.
  */
-const { ESTADOS_INICIO } = require('./ejecucionFechas');
+const { whereInicioEnRango } = require('./ejecucionFechas');
 const { parseYMDLima, parseYMDFinDiaLima } = require('./tiempo');
 
 const esYMD = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
@@ -31,14 +31,8 @@ function whereFiltrosAtencion(query = {}) {
 
   const desde = esYMD(query.inicio_desde) ? parseYMDLima(query.inicio_desde) : null;
   const hasta = esYMD(query.inicio_hasta) ? parseYMDFinDiaLima(query.inicio_hasta) : null;
-  if (desde || hasta) {
-    const inicio = { estado_nuevo: { in: ESTADOS_INICIO }, estado: 1 };
-    const rango = { ...(desde ? { gte: desde } : {}), ...(hasta ? { lte: hasta } : {}) };
-    condiciones.push({ historial_estados: { some: { ...inicio, fecha_cambio: rango } } });
-    // Cuenta el PRIMER arranque: un servicio que ya había empezado antes del
-    // rango no entra aunque se haya reanudado dentro de él.
-    if (desde) condiciones.push({ historial_estados: { none: { ...inicio, fecha_cambio: { lt: desde } } } });
-  }
+  const inicioEnRango = whereInicioEnRango({ desde, hasta });
+  if (inicioEnRango) condiciones.push(inicioEnRango);
 
   return condiciones.length ? { servicio: { is: { AND: condiciones } } } : null;
 }

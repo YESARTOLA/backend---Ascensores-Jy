@@ -40,7 +40,7 @@ const {
 const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { whereRealizadoConMonto } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
-const { INCLUDE_COTIZACION_APROBACION, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
+const { INCLUDE_COTIZACION_APROBACION, INCLUDE_HISTORIAL_INICIO, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { facturacionDeServiciosPlan, sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
@@ -1689,7 +1689,7 @@ const realizados = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (estado_facturacion) where.estado_facturacion = estado_facturacion;
     if (rango_fecha === 'servicio') {
-      // Contabilidad filtra por su "Fecha servicio": ejecución en los
+      // Contabilidad filtra por su "Fecha servicio": inicio real en los
       // mantenimientos, aprobación de la cotización en el resto.
       const fechaServicioEnRango = whereFechaServicioEnRango({ desde, hasta });
       if (fechaServicioEnRango) where.AND = [...(where.AND || []), fechaServicioEnRango];
@@ -1782,6 +1782,9 @@ const realizados = async (req, res) => {
               mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } },
               // Fecha de aprobación: es la "Fecha servicio" de los no mantenimientos.
               cotizacion: INCLUDE_COTIZACION_APROBACION,
+              // Inicio real (primer paso a "En curso"): es la "Fecha servicio"
+              // de los mantenimientos, la de la columna "Inicio" de Mantenimientos.
+              historial_estados: INCLUDE_HISTORIAL_INICIO,
                     cobro: { include: { facturas: true } }
             }
           }
