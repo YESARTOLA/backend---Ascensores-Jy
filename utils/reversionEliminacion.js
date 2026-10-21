@@ -23,6 +23,8 @@ const prisma = require('../config/prisma');
 const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 const { keyDesdeRuta, eliminarObjeto } = require('./storage');
 const { bajaDocumentosDeFacturasEnTx } = require('./documentosFactura');
+const { bajaDocumentosDeAbonosEnTx } = require('./documentosPago');
+const { bajaDocumentosDeEntregasEnTx } = require('./documentosEntrega');
 
 const ESTADOS_EN_CAMPO = ['En curso'];
 
@@ -118,6 +120,8 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
 
   await tx.tbl_servicios_guias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_evidencias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
+  // Documentos de las entregas: se purgan junto con el archivo de las antiguas.
+  for (const idArchivo of await bajaDocumentosDeEntregasEnTx(tx, idServicio, userId)) archivoIds.add(idArchivo);
   await tx.tbl_entregas.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_observaciones.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
   await tx.tbl_servicios_dias.updateMany({ where: { id_servicio: idServicio, estado: 1 }, data: { estado: 0, ...stamp } });
@@ -132,6 +136,8 @@ async function bajaServicioCascadaEnTx(tx, idServicio, userId) {
   // --- Cadena de cobro ---
   if (servicio.cobro) {
     const idCobro = servicio.cobro.id;
+    // Documentos adicionales de los abonos: se purgan junto con su comprobante.
+    for (const idArchivo of await bajaDocumentosDeAbonosEnTx(tx, [idCobro], userId)) archivoIds.add(idArchivo);
     await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: idCobro, estado: 1 }, data: { estado: 0, ...stamp } });
     await tx.tbl_pagos.updateMany({ where: { id_cobro: idCobro, estado: 1 }, data: { estado: 0, ...stamp } });
     await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: idCobro, estado: 1 }, data: { estado: 0, ...stamp } });

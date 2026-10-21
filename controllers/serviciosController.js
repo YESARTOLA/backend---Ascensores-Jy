@@ -32,15 +32,20 @@ const {
 const {
   ESTADO_FACTURA_ANULADA,
   ESTADO_FACTURACION_SIN,
-  calcularEstadoFacturacion,
-  whereGrupoFacturacion,
-  esPorFacturar,
-  esFacturado
+  calcularEstadoFacturacion
 } = require('../utils/estadoFactura');
-const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
-const { whereRealizadoConMonto } = require('../utils/montoACobrar');
+const {
+  GRUPOS_FACTURACION,
+  situacionesFacturacion,
+  enGrupoFacturacion,
+  resumirFacturacion
+} = require('../utils/situacionFacturacion');
+const { normalizarMoneda } = require('../utils/catalogosBancarios');
+const { whereRealizadoConMonto, whereTotalRealizadoEnRango } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
-const { INCLUDE_COTIZACION_APROBACION, INCLUDE_HISTORIAL_INICIO, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
+const { INCLUDE_HISTORIAL_INICIO, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
+const { fechaRegistroOt, whereRegistroOtEnRango, fechaComprobanteContable, idsServicioConComprobanteEnRango } = require('../utils/fechasContables');
+const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { facturacionDeServiciosPlan, sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
@@ -443,7 +448,7 @@ const obtener = async (req, res) => {
         dias: { where: { estado: 1 }, orderBy: { orden: 'asc' } },
         guias: { include: { archivo: true, tecnico: true } },
         evidencias: { where: { estado: 1 }, include: { archivo: true, tecnico: true } },
-        entregas: { include: { archivo: true } },
+        entregas: { include: { archivo: true, documentos: INCLUDE_DOCUMENTOS_ENTREGA } },
         cobro: { include: { pagos: { where: { estado: 1 }, include: { archivo: true } }, cuotas: { where: { estado: 1 } } } },
         facturas: { include: { archivo: true } },
         historial_estados: { orderBy: { fecha_cambio: 'desc' } },
@@ -1370,7 +1375,9 @@ const finalizarServicio = async (req, res) => {
       ? (mesDelPlan?.estado_facturacion ?? ESTADO_FACTURACION_SIN)
       : calcularEstadoFacturacion({
           facturas: cobroPrevio?.facturas || [],
-          cuotas: cobroPrevio?.cuotas || []
+          cuotas: cobroPrevio?.cuotas || [],
+          // Total cobrable: decide si una facturación general ya está completa.
+          total: Number(cobroPrevio?.monto_total ?? servicio.precio_interno ?? 0)
         });
 
     // Crear/actualizar folder contable. Caso típico: el folder ya fue creado
@@ -1603,82 +1610,13 @@ const cancelar = async (req, res) => {
   }
 };
 
-/**
- * Resumen de facturación sobre el conjunto de servicios realizados que cumple
- * `where` — el MISMO filtro que la tabla, sin paginar, para que los indicadores
- * cuadren con lo que el usuario está viendo.
- *
- * Dos grupos, los que pide Contabilidad:
- *   · por_facturar → emisión pendiente de verdad (ver `esPorFacturar`: excluye
- *     los marcados "no requiere factura" y los gratuitos).
- *   · facturado    → emisión completa ('Facturado' / 'Enviada').
- *
- * El importe de cada servicio es su total cobrable: el monto del cobro si ya
- * existe y, si no, el precio del servicio (mismo criterio que la columna
- * "Total" de la tabla y que el tope del modal de emisión). Los mantenimientos
- * de plan nacen con precio 0: su importe es la factura de su MES, que se suma
- * UNA vez aunque cubra varias visitas. Los montos se agrupan POR MONEDA: la
- * cartera tiene servicios en PEN y en USD, y sumarlos en un único número daría
- * un total falso.
- */
-async function resumenFacturacion(where) {
-  const filas = await prisma.tbl_servicios_realizados.findMany({
-    where,
-    select: {
-      id_servicio: true,
-      estado_facturacion: true,
-      servicio: {
-        select: {
-          moneda: true, precio_interno: true, sin_cobro: true, requiere_factura: true,
-          id_mantenimiento_plan: true,
-          cobro: { select: { monto_total: true } }
-        }
-      }
-    }
-  });
-  const facturacionPlan = await facturacionDeServiciosPlan(
-    prisma,
-    filas.filter(f => f.servicio?.id_mantenimiento_plan).map(f => f.id_servicio)
-  );
-  const facturasPlanSumadas = new Set();
-
-  const grupos = {
-    por_facturar: { cantidad: 0, montos: new Map() },
-    facturado: { cantidad: 0, montos: new Map() }
-  };
-  for (const f of filas) {
-    const destino = esPorFacturar(f) ? 'por_facturar'
-      : esFacturado(f.estado_facturacion) ? 'facturado'
-      : null;
-    if (!destino) continue;
-    const g = grupos[destino];
-    g.cantidad++;
-    const moneda = f.servicio?.moneda || MONEDA_POR_DEFECTO;
-    const facturaMes = facturacionPlan.get(f.id_servicio)?.factura;
-    let total;
-    if (facturaMes) {
-      total = facturasPlanSumadas.has(facturaMes.id) ? 0 : Number(facturaMes.monto);
-      facturasPlanSumadas.add(facturaMes.id);
-    } else {
-      total = Number(f.servicio?.cobro?.monto_total ?? f.servicio?.precio_interno ?? 0);
-    }
-    g.montos.set(moneda, (g.montos.get(moneda) || 0) + (Number.isFinite(total) ? total : 0));
-  }
-
-  // El Map se serializa como array ordenado por importe descendente: la moneda
-  // principal queda primero y la UI puede pintarlas todas sin adivinar.
-  const aSalida = (g) => ({
-    cantidad: g.cantidad,
-    montos: [...g.montos.entries()]
-      .map(([moneda, total]) => ({ moneda, total: Math.round(total * 100) / 100 }))
-      .sort((a, b) => b.total - a.total)
-  });
-  return { por_facturar: aSalida(grupos.por_facturar), facturado: aSalida(grupos.facturado) };
-}
-
 const realizados = async (req, res) => {
   try {
-    const { id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda, rango_fecha, aprobacion_desde, aprobacion_hasta } = req.query;
+    const {
+      id_cliente, estado_cobro, estado_facturacion, desde, hasta, q, tipo_categoria, situacion, grupo_facturacion, moneda, rango_fecha,
+      aprobacion_desde, aprobacion_hasta, registro_desde, registro_hasta, comprobante_desde, comprobante_hasta,
+      monto_min, monto_max
+    } = req.query;
     const where = { estado: 1 };
     if (req.user.rol_codigo === 'tecnico') {
       where.OR = [
@@ -1689,8 +1627,8 @@ const realizados = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (estado_facturacion) where.estado_facturacion = estado_facturacion;
     if (rango_fecha === 'servicio') {
-      // Contabilidad filtra por su "Fecha servicio": inicio real en los
-      // mantenimientos, aprobación de la cotización en el resto.
+      // Contabilidad filtra por su "Fecha servicio": el inicio real de la
+      // ejecución, para todo tipo de servicio.
       const fechaServicioEnRango = whereFechaServicioEnRango({ desde, hasta });
       if (fechaServicioEnRango) where.AND = [...(where.AND || []), fechaServicioEnRango];
     } else if (desde || hasta) {
@@ -1737,6 +1675,13 @@ const realizados = async (req, res) => {
     // fecha y quedan fuera mientras el rango esté puesto.
     const aprobadaEnRango = whereAprobadaEnRango({ desde: aprobacion_desde, hasta: aprobacion_hasta });
     if (aprobadaEnRango) servicioWhere.cotizacion = { is: aprobadaEnRango };
+    // Rangos por "Fecha de registro" (de la OT) y por "Fecha de comprobante",
+    // con el mismo criterio que pinta esas columnas (utils/fechasContables.js).
+    // Se combinan con los demás rangos.
+    const registroEnRango = whereRegistroOtEnRango({ desde: registro_desde, hasta: registro_hasta });
+    if (registroEnRango) Object.assign(servicioWhere, registroEnRango);
+    const idsComprobanteEnRango = await idsServicioConComprobanteEnRango(prisma, { desde: comprobante_desde, hasta: comprobante_hasta });
+    if (idsComprobanteEnRango) where.AND = [...(where.AND || []), { id_servicio: { in: idsComprobanteEnRango } }];
     // Filtro por situación de pago (columna "Situación"), excluyendo gratuitos:
     //   cancelado → cobro pagado (Pagado/Cerrado).
     //   pendiente → cobro no pagado.
@@ -1747,20 +1692,37 @@ const realizados = async (req, res) => {
       servicioWhere.sin_cobro = { not: 1 };
       where.estado_cobro = { notIn: ['Pagado', 'Cerrado'] };
     }
-    // Filtro por grupo de facturación ("Por facturar" / "Facturado"): usa el
-    // MISMO predicado con el que se cuentan las tarjetas del resumen, así que la
-    // tabla filtrada contiene exactamente los servicios que el indicador suma.
-    // Va dentro de AND para no pisar los filtros ya construidos.
-    const whereGrupo = whereGrupoFacturacion(grupo_facturacion);
-    if (whereGrupo) where.AND = [...(where.AND || []), whereGrupo];
     // Contabilidad (con_monto=1) no lista lo que no tiene importe: gratuitos y
     // servicios en S/ 0.00. Ver utils/montoACobrar.js. Entra en el mismo `where`
     // que el resumen, así que las tarjetas tampoco los cuentan.
     if (req.query.con_monto === '1') where.AND = [...(where.AND || []), whereRealizadoConMonto()];
+    // Rango de montos ("Desde" / "Hasta") sobre la columna "Total", con el mismo
+    // criterio que la pinta. También entra en el resumen de las tarjetas.
+    const totalEnRango = whereTotalRealizadoEnRango({ min: monto_min, max: monto_max });
+    if (totalEnRango) where.AND = [...(where.AND || []), totalEnRango];
     // Ámbito del usuario: solo realizados de servicios/proyectos del ámbito.
     const tiposRealizados = tiposRegistroPermitidos(req.user);
     if (tiposRealizados) servicioWhere.tipo_registro = { in: tiposRealizados.length ? tiposRealizados : ['__sin_ambito__'] };
     if (Object.keys(servicioWhere).length) where.servicio = servicioWhere;
+    // Importes de facturación (facturado / por facturar) de TODO el conjunto
+    // filtrado, sin paginar: de aquí salen a la vez las tarjetas, el filtro por
+    // grupo y las columnas de cada fila (utils/situacionFacturacion.js). Los
+    // importes son dato económico y solo viajan a los roles que pueden verlos;
+    // el filtro por grupo funciona igual para todos.
+    const verFinanzas = ROLES_PRECIO.includes(req.user.rol_codigo);
+    const grupo = GRUPOS_FACTURACION.includes(grupo_facturacion) ? grupo_facturacion : null;
+    const situaciones = verFinanzas || grupo ? await situacionesFacturacion(prisma, where) : new Map();
+    // "Por facturar" / "Facturado": la tabla deja exactamente los servicios que
+    // cuenta su tarjeta, porque las dos usan enGrupoFacturacion. Un servicio
+    // facturado en parte está en ambos grupos. Las tarjetas se calculan sobre lo
+    // que queda en la tabla.
+    let situacionesVisibles = [...situaciones.values()];
+    if (grupo) {
+      const ids = [...situaciones].filter(([, s]) => enGrupoFacturacion(s, grupo)).map(([id]) => id);
+      where.AND = [...(where.AND || []), { id: { in: ids } }];
+      situacionesVisibles = ids.map(id => situaciones.get(id));
+    }
+    const resumen_facturacion = verFinanzas ? resumirFacturacion(situacionesVisibles) : undefined;
     const result = await paginar(
       prisma.tbl_servicios_realizados,
       {
@@ -1780,10 +1742,8 @@ const realizados = async (req, res) => {
               // servicios de plan no llevan precio propio, así que sin esto la
               // columna "Total" mostraba S/ 0.00 en cada visita.
               mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } },
-              // Fecha de aprobación: es la "Fecha servicio" de los no mantenimientos.
-              cotizacion: INCLUDE_COTIZACION_APROBACION,
               // Inicio real (primer paso a "En curso"): es la "Fecha servicio"
-              // de los mantenimientos, la de la columna "Inicio" de Mantenimientos.
+              // de todo servicio, la de la columna "Inicio" de los módulos operativos.
               historial_estados: INCLUDE_HISTORIAL_INICIO,
                     cobro: { include: { facturas: true } }
             }
@@ -1792,12 +1752,6 @@ const realizados = async (req, res) => {
       },
       req.query
     );
-    // Resumen de facturación de TODO el conjunto filtrado (no solo de la página
-    // visible): alimenta los dos indicadores de Contabilidad. Es dato económico,
-    // así que solo se calcula y envía a los roles que pueden verlo.
-    const resumen_facturacion = ROLES_PRECIO.includes(req.user.rol_codigo)
-      ? await resumenFacturacion(where)
-      : undefined;
 
     // Mantenimientos de plan (sin cobro propio): su factura y su cobro son los
     // de la cuota de su MES del plan. Se adjuntan a la fila (fecha de
@@ -1807,7 +1761,6 @@ const realizados = async (req, res) => {
       prisma,
       result.data.filter(r => r.servicio?.id_mantenimiento_plan).map(r => r.id_servicio)
     );
-    const verFinanzas = ROLES_PRECIO.includes(req.user.rol_codigo);
     // Lo guardado (de lo que tiran filtros y tarjetas) pudo quedar atrás — una
     // cuota que venció desde el último movimiento, o datos de antes de esta
     // regla —: se realinea el plan en segundo plano, como hace Gestión de
@@ -1830,14 +1783,19 @@ const realizados = async (req, res) => {
       ...result,
       ...(resumen_facturacion ? { resumen_facturacion } : {}),
       data: result.data.map(r => {
-        const { fecha, origen } = fechaServicioContable(r);
         const plan = facturacionPlan.get(r.id_servicio);
         return {
           ...r,
           ...(plan ? { estado_facturacion: plan.estado_facturacion, estado_cobro: plan.estado_cobro } : {}),
           ...(plan && verFinanzas ? { facturacion_plan: plan } : {}),
-          fecha_servicio: fecha,
-          fecha_servicio_origen: origen,
+          // Facturado / por facturar de la fila: la misma situación que suman
+          // las tarjetas y que decide el filtro por grupo.
+          ...(verFinanzas ? { facturacion: situaciones.get(r.id) || null } : {}),
+          fecha_servicio: fechaServicioContable(r.servicio),
+          fecha_registro: fechaRegistroOt(r.servicio),
+          // Sale de las facturas del cobro (o del mes del plan): dato de los
+          // roles con visibilidad financiera, como el bloque de cobro.
+          fecha_comprobante: verFinanzas ? fechaComprobanteContable(r.servicio, plan) : null,
           servicio: sanitizarEconomico(sanitizarPrecio(r.servicio, req.user.rol_codigo), req.user.rol_codigo)
         };
       })

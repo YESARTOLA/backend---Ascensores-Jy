@@ -8,6 +8,7 @@ const { METODOS_PAGO, METODOS_PAGO_CODIGOS, METODOS_REQUIEREN_CUENTA, MONEDA_POR
 const { ESTADO_FACTURACION_SIN, esFacturaActiva } = require('../utils/estadoFactura');
 const { bajaArchivoEnTx, purgarObjetosWasabi } = require('../utils/reversionEliminacion');
 const { INCLUDE_DOCUMENTOS, bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
+const { vincularDocumentosPagoEnTx, sincronizarDocumentosPagoEnTx, bajaDocumentosDeAbonosEnTx } = require('../utils/documentosPago');
 const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualPorCuota } = require('../utils/planMantenimientoMensual');
 const { sincronizarServiciosDeCobroPlan } = require('../utils/facturacionServiciosPlan');
@@ -379,7 +380,7 @@ const obtener = async (req, res) => {
             ascensores: { where: { estado: 1 }, include: { ascensor: true } }
           }
         },
-        pagos: { where: { estado: 1 }, include: { archivo: true, cuenta_bancaria: true }, orderBy: { id: 'desc' } },
+        pagos: { where: { estado: 1 }, include: { archivo: true, cuenta_bancaria: true, documentos: INCLUDE_DOCUMENTOS }, orderBy: { id: 'desc' } },
         cuotas: { where: { estado: 1 }, orderBy: { numero_cuota: 'asc' }, include: { facturas: { where: { estado: 1 } } } },
         recordatorios: { orderBy: { id: 'desc' } },
         facturas: { include: { archivo: true, documentos: INCLUDE_DOCUMENTOS, cuota: true } }
@@ -720,19 +721,25 @@ const registrarPago = async (req, res) => {
     // también la fecha de pago de las cuotas que este abono termine de cubrir.
     const fechaAbono = d.fecha_pago ? parseYMDLima(d.fecha_pago) : inicioDelDiaLima();
     const numAbono = cobro.pagos.length + 1;
-    await prisma.tbl_pagos.create({
-      data: {
-        id_cobro: id,
-        numero_abono: numAbono,
-        monto,
-        fecha_pago: fechaAbono,
-        metodo_pago: metodoPago,
-        id_archivo_comprobante: d.id_archivo_comprobante || null,
-        id_cuenta_bancaria: idCuentaBancaria,
-        observaciones: d.observaciones || null,
-        registrado_por: req.user.id,
-        user_id_registration: req.user.id
-      }
+    // El abono y sus documentos adicionales (constancia de detracción, de
+    // pago…) se registran juntos: si un documento no es válido, no queda un
+    // abono a medias.
+    const documentos = await prisma.$transaction(async (tx) => {
+      const pago = await tx.tbl_pagos.create({
+        data: {
+          id_cobro: id,
+          numero_abono: numAbono,
+          monto,
+          fecha_pago: fechaAbono,
+          metodo_pago: metodoPago,
+          id_archivo_comprobante: d.id_archivo_comprobante || null,
+          id_cuenta_bancaria: idCuentaBancaria,
+          observaciones: d.observaciones || null,
+          registrado_por: req.user.id,
+          user_id_registration: req.user.id
+        }
+      });
+      return vincularDocumentosPagoEnTx(tx, pago.id, d.documentos, req.user.id);
     });
 
     // Cálculos en centavos para evitar residuos de punto flotante.
@@ -820,11 +827,19 @@ const registrarPago = async (req, res) => {
 
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_pagos', id_entidad: id,
-      accion: 'CREATE', valor_nuevo: { monto, saldo: nuevoSaldo }, ip: req.ip
+      accion: 'CREATE',
+      valor_nuevo: {
+        monto, saldo: nuevoSaldo,
+        ...(documentos.length > 0 && {
+          documentos: documentos.map(c => ({ id: c.id, id_archivo: c.id_archivo, tipo_documento: c.tipo_documento }))
+        })
+      },
+      ip: req.ip
     });
     sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
     res.status(201).json({ ok: true, saldo: nuevoSaldo, estado: nuevoEstado });
   } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al registrar abono: ' + err.message });
   }
@@ -888,10 +903,14 @@ async function propagarCobroAlServicio(cobro, { estado_cobro, total_abonado, sal
  *  - Fecha: la "Fecha pago" de las cuotas y el "último abono" se recalculan a
  *    partir de los abonos (regla única en utils/fechaPagoCuotas.js).
  *  - Comprobante: el archivo reemplazado o quitado se da de baja.
+ *  - Documentos adicionales (constancia de detracción, de pago…): `documentos`
+ *    es la lista completa que debe quedar (utils/documentosPago.js); los
+ *    quitados se dan de baja con su archivo. Si el body no la trae, no se tocan.
  *  - Todo queda en auditoría con los valores anteriores.
  *
  * Body: { monto, fecha_pago: 'YYYY-MM-DD', metodo_pago, id_cuenta_bancaria?,
- *         id_archivo_comprobante?, observaciones? }
+ *         id_archivo_comprobante?, observaciones?,
+ *         documentos?: [{ id } | { id_archivo, tipo_documento, descripcion? }] }
  */
 const editarPago = async (req, res) => {
   try {
@@ -971,24 +990,37 @@ const editarPago = async (req, res) => {
       // El abono editado forma parte de cobro.pagos: el ajuste lee el monto nuevo.
       pago.monto = monto;
       pago.fecha_pago = fechaAbono;
-      const out = { ajuste: null, cuotasFecha: [], ultimoAbono: null, wasabiKey: null };
+      const out = { ajuste: null, cuotasFecha: [], ultimoAbono: null, wasabiKeys: [], documentos: null };
+      // Documentos adicionales: un documento inválido revierte toda la corrección.
+      if (Array.isArray(d.documentos)) {
+        out.documentos = await sincronizarDocumentosPagoEnTx(tx, idPago, d.documentos, req.user.id);
+        for (const doc of out.documentos.quitados) out.wasabiKeys.push(await bajaArchivoEnTx(tx, doc.id_archivo, req.user.id));
+      }
       if (deltaCents !== 0) out.ajuste = await aplicarCambioMontoAbono(tx, cobro, deltaCents, fechaAbono, req.user.id);
       // Fechas de pago de las cuotas y último abono: derivadas de los abonos.
       const sync = await sincronizarFechasPagoCuotas(tx, id, req.user.id);
       out.cuotasFecha = sync.cuotas;
       out.ultimoAbono = sync.ultimoAbono;
-      if (archivoReemplazado) out.wasabiKey = await bajaArchivoEnTx(tx, archivoReemplazado, req.user.id);
+      if (archivoReemplazado) out.wasabiKeys.push(await bajaArchivoEnTx(tx, archivoReemplazado, req.user.id));
       return out;
     });
 
     if (r.ajuste) {
       await propagarCobroAlServicio(cobro, r.ajuste, req.user.id, `Abono #${pago.numero_abono} corregido: S/ ${anterior.monto} → S/ ${monto}`);
     }
-    if (r.wasabiKey) await purgarObjetosWasabi([r.wasabiKey]);
+    await purgarObjetosWasabi(r.wasabiKeys);
+    const resumenDoc = c => ({ id: c.id, id_archivo: c.id_archivo, tipo_documento: c.tipo_documento });
     await registrarAuditoria({
       id_usuario: req.user.id, entidad: 'tbl_pagos', id_entidad: idPago,
-      accion: 'UPDATE', valor_anterior: anterior,
-      valor_nuevo: { ...nuevo, cuotas: r.ajuste?.cuotas || [], cuotas_fecha: r.cuotasFecha, ultimo_abono: r.ultimoAbono },
+      accion: 'UPDATE',
+      valor_anterior: {
+        ...anterior,
+        ...(r.documentos?.quitados.length > 0 && { documentos_quitados: r.documentos.quitados.map(resumenDoc) })
+      },
+      valor_nuevo: {
+        ...nuevo, cuotas: r.ajuste?.cuotas || [], cuotas_fecha: r.cuotasFecha, ultimo_abono: r.ultimoAbono,
+        ...(r.documentos?.creados.length > 0 && { documentos_agregados: r.documentos.creados.map(resumenDoc) })
+      },
       ip: req.ip
     });
     sincronizarRecordatorioCobro(id).catch(err => console.error('Sync rec cobro:', err));
@@ -998,6 +1030,7 @@ const editarPago = async (req, res) => {
       estado: r.ajuste ? r.ajuste.estado_cobro : cobro.estado_cobro
     });
   } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al editar el abono: ' + err.message });
   }
@@ -1415,8 +1448,12 @@ const eliminar = async (req, res) => {
       await tx.tbl_pagos.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_cobros_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
       await tx.tbl_recordatorios.updateMany({ where: { id_cobro: id, estado: 1 }, data: { estado: 0, ...stamp } });
-      // Documentos adicionales de las facturas: se purgan junto con su PDF.
-      const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, facturas.map(f => f.id), req.user.id);
+      // Documentos adicionales de las facturas y de los abonos: se purgan junto
+      // con su PDF / comprobante.
+      const idsArchivoDocumentos = [
+        ...await bajaDocumentosDeFacturasEnTx(tx, facturas.map(f => f.id), req.user.id),
+        ...await bajaDocumentosDeAbonosEnTx(tx, [id], req.user.id)
+      ];
       for (const idArchivo of idsArchivoDocumentos) archivoIds.add(idArchivo);
       if (esCobroDePlan) {
         await tx.tbl_facturas.updateMany({ where: { id_mantenimiento_plan: cobro.id_mantenimiento_plan, estado: 1 }, data: { estado: 0, ...stamp } });

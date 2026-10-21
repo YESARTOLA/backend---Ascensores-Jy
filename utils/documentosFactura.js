@@ -10,6 +10,8 @@
  * Este módulo concentra el catálogo de tipos y el comportamiento de los
  * documentos (vincular, dar de baja en cascada). Catálogo espejo en
  * frontend/src/utils/catalogosDocumentoFactura.js — mantener en sincronía.
+ * Los documentos adicionales de un abono usan el mismo catálogo
+ * (utils/documentosPago.js).
  */
 
 const TIPO_DOCUMENTO_FACTURA_OTRO = 'Otro';
@@ -96,14 +98,33 @@ function normalizarDocumentos(crudo) {
  * @returns {Promise<Array>} filas de tbl_facturas_archivos creadas
  */
 async function vincularDocumentosEnTx(tx, idFactura, crudo, idUsuario) {
+  return vincularDocumentosDeEnTx(tx, {
+    modelo: 'tbl_facturas_archivos',
+    campo: 'id_factura',
+    id: idFactura,
+    max: MAX_DOCUMENTOS_FACTURA,
+    nombre: 'factura'
+  }, crudo, idUsuario);
+}
+
+/**
+ * Vincula documentos adicionales a un registro dueño: la factura
+ * (tbl_facturas_archivos) o el abono (tbl_pagos_archivos, utils/documentosPago.js).
+ * Ambas tablas comparten forma y catálogo de tipos.
+ *
+ * @param destino { modelo, campo, id, max, nombre } — tabla de vínculos, columna
+ *   del dueño, id del dueño, tope de documentos y nombre para el mensaje de error
+ * @returns {Promise<Array>} filas creadas
+ */
+async function vincularDocumentosDeEnTx(tx, { modelo, campo, id, max, nombre }, crudo, idUsuario) {
   const documentos = normalizarDocumentos(crudo);
   if (documentos.length === 0) return [];
 
-  const yaVinculados = await tx.tbl_facturas_archivos.count({
-    where: { id_factura: idFactura, estado: 1 }
+  const yaVinculados = await tx[modelo].count({
+    where: { [campo]: id, estado: 1 }
   });
-  if (yaVinculados + documentos.length > MAX_DOCUMENTOS_FACTURA) {
-    throw errorHttp(`Máximo ${MAX_DOCUMENTOS_FACTURA} documentos por factura (hay ${yaVinculados}).`);
+  if (yaVinculados + documentos.length > max) {
+    throw errorHttp(`Máximo ${max} documentos por ${nombre} (hay ${yaVinculados}).`);
   }
 
   // Solo archivos que existan y estén activos: evita FK colgadas si el cliente
@@ -118,9 +139,9 @@ async function vincularDocumentosEnTx(tx, idFactura, crudo, idUsuario) {
   const creados = [];
   for (const d of documentos) {
     if (!validos.has(d.id_archivo)) continue;
-    creados.push(await tx.tbl_facturas_archivos.create({
+    creados.push(await tx[modelo].create({
       data: {
-        id_factura: idFactura,
+        [campo]: id,
         id_archivo: d.id_archivo,
         tipo_documento: d.tipo_documento,
         descripcion: d.descripcion,
@@ -170,5 +191,6 @@ module.exports = {
   descripcionDocumento,
   normalizarDocumentos,
   vincularDocumentosEnTx,
+  vincularDocumentosDeEnTx,
   bajaDocumentosDeFacturasEnTx
 };

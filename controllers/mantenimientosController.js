@@ -38,6 +38,7 @@ const {
 const { ESTADO_PLAN_ACTIVO, ESTADO_PLAN_CANCELADO } = require('../utils/estadoPlanMantenimiento');
 const { bajaServicioCascadaEnTx, bajaArchivoEnTx, liberarTecnicos } = require('../utils/reversionEliminacion');
 const { bajaDocumentosDeFacturasEnTx } = require('../utils/documentosFactura');
+const { bajaDocumentosDeAbonosEnTx } = require('../utils/documentosPago');
 const { sincronizarDiasYEventos } = require('../utils/diasServicio');
 const { normalizarProgramacion } = require('../utils/programacionDias');
 const {
@@ -2156,7 +2157,10 @@ const eliminar = async (req, res) => {
       // se desvinculan (fila de archivo a estado 0) pero NO se purgan del bucket.
       if (cobroPlan) {
         const facturasPlan = await tx.tbl_facturas.findMany({ where: { id_mantenimiento_plan: id, estado: 1 } });
-        const idsArchivoDocumentos = await bajaDocumentosDeFacturasEnTx(tx, facturasPlan.map(f => f.id), req.user.id);
+        const idsArchivoDocumentos = [
+          ...await bajaDocumentosDeFacturasEnTx(tx, facturasPlan.map(f => f.id), req.user.id),
+          ...await bajaDocumentosDeAbonosEnTx(tx, [cobroPlan.id], req.user.id)
+        ];
         for (const idArchivo of [...facturasPlan.map(f => f.id_archivo), ...idsArchivoDocumentos]) {
           await bajaArchivoEnTx(tx, idArchivo, req.user.id);
         }
@@ -2635,7 +2639,7 @@ const aprobarPeriodo = async (req, res) => {
  * POST /:id/periodos/revertir — deshace la aprobación de un MES (p. ej. se
  * aprobó por error). Espejo exacto de `aprobarPeriodo`: da de baja la cuota del
  * mes, le resta su monto al cobro único del plan y el mes vuelve a quedar sin
- * aprobar (sale de Contabilidad → "Por facturar"). Se puede volver a aprobar.
+ * aprobar (sale de Contabilidad → "Cuotas por facturar"). Se puede volver a aprobar.
  *
  * Solo mientras el mes no tenga consecuencias contables:
  *   · sin factura vigente (una anulada no cuenta: anularla es el camino para

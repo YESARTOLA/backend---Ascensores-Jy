@@ -34,64 +34,6 @@ const ESTADOS_FACTURACION_COMPLETA = [
   ESTADO_FACTURACION_ENVIADA
 ];
 
-// Estados en los que la emisión del comprobante TODAVÍA no está completa.
-// 'Parcialmente facturado' entra aquí: quedan cuotas por emitir.
-const ESTADOS_FACTURACION_PENDIENTE_EMISION = [
-  ESTADO_FACTURACION_SIN,
-  ESTADO_FACTURACION_PENDIENTE,
-  ESTADO_FACTURACION_PARCIAL
-];
-
-/**
- * ¿Este servicio realizado está PENDIENTE DE FACTURAR?
- *
- * No basta con que su estado sea 'Sin factura': la mayoría de los servicios en
- * ese estado están marcados "no requiere factura" (requiere_factura = 0) o son
- * gratuitos, y no se van a facturar nunca. "Por facturar" es la emisión que
- * realmente queda pendiente.
- *
- * @param {object} realizado Fila de tbl_servicios_realizados con su `servicio`.
- */
-function esPorFacturar(realizado) {
-  const srv = realizado?.servicio;
-  if (!srv) return false;
-  if (srv.requiere_factura === 0) return false;
-  if (srv.sin_cobro === 1) return false;
-  return ESTADOS_FACTURACION_PENDIENTE_EMISION.includes(realizado.estado_facturacion);
-}
-
-// Los dos grupos que Contabilidad presenta como indicadores: "Por facturar" y
-// "Facturado". Valores admitidos por el filtro `grupo_facturacion`.
-const GRUPOS_FACTURACION = ['por_facturar', 'facturado'];
-
-/**
- * Traducción a cláusula Prisma (sobre tbl_servicios_realizados) de los MISMOS
- * predicados que `esPorFacturar` / `esFacturado`.
- *
- * Existe para que el CONTEO de las tarjetas y el FILTRO de la tabla salgan del
- * mismo criterio: pulsar "Por facturar" deja en la tabla exactamente los
- * servicios que la tarjeta cuenta. Si cambia uno de los predicados, cambia
- * también esta función.
- *
- * @param {string} grupo 'por_facturar' | 'facturado'
- * @returns {object|null} cláusula Prisma, o null si el grupo no es válido.
- */
-function whereGrupoFacturacion(grupo) {
-  if (grupo === 'por_facturar') {
-    // Espejo de esPorFacturar: requiere_factura ≠ 0, no gratuito y emisión
-    // todavía incompleta (incluye 'Parcialmente facturado').
-    return {
-      estado_facturacion: { in: ESTADOS_FACTURACION_PENDIENTE_EMISION },
-      servicio: { is: { requiere_factura: { not: 0 }, sin_cobro: { not: 1 } } }
-    };
-  }
-  if (grupo === 'facturado') {
-    // Espejo de esFacturado: emisión completa ('Facturado' / 'Enviada').
-    return { estado_facturacion: { in: ESTADOS_FACTURACION_COMPLETA } };
-  }
-  return null;
-}
-
 function esEstadoFacturaValido(estado) {
   return ESTADOS_FACTURA.includes(estado);
 }
@@ -113,23 +55,30 @@ function esFacturado(estadoFacturacion) {
  *
  * Reglas:
  *  - Sin facturas activas → 'Sin factura'.
- *  - Si hay factura general (id_cuota = null):
- *      - todas (la única) en 'Enviada' → 'Enviada'
- *      - caso contrario                → 'Facturado'
+ *  - Facturación GENERAL (facturas sin cuota). Puede hacerse en una o varias
+ *    emisiones (p. ej. una primera factura por una parte y otra por el resto),
+ *    así que lo que decide es el IMPORTE emitido frente al total cobrable
+ *    (`total`: monto del cobro o, sin cobro, precio del servicio):
+ *      - la suma de las vigentes no llega al total → 'Parcialmente facturado'
+ *      - llega al total y todas en 'Enviada'        → 'Enviada'
+ *      - llega al total con alguna no enviada       → 'Facturado'
+ *    Sin total conocido (0) la facturación general se toma como completa.
  *  - Si la facturación es por cuota:
  *      - alguna cuota activa sin factura → 'Parcialmente facturado'
  *      - todas las cuotas facturadas y todas las facturas en 'Enviada' → 'Enviada'
  *      - todas facturadas con al menos una no enviada → 'Facturado'
  */
-function calcularEstadoFacturacion({ facturas, cuotas }) {
+function calcularEstadoFacturacion({ facturas, cuotas, total = 0 }) {
   const activas = (facturas || []).filter(esFacturaActiva);
   if (activas.length === 0) return ESTADO_FACTURACION_SIN;
 
-  const general = activas.find(f => f.id_cuota === null || f.id_cuota === undefined);
-  if (general) {
-    return general.estado_factura === ESTADO_FACTURA_ENVIADA
-      ? ESTADO_FACTURACION_ENVIADA
-      : ESTADO_FACTURACION_FACTURADO;
+  const hayGeneral = activas.some(f => f.id_cuota === null || f.id_cuota === undefined);
+  if (hayGeneral) {
+    const centavos = (v) => Math.round(Number(v || 0) * 100);
+    const emitido = activas.reduce((acc, f) => acc + centavos(f.monto), 0);
+    if (centavos(total) > 0 && emitido < centavos(total)) return ESTADO_FACTURACION_PARCIAL;
+    const todasEnviadas = activas.every(f => f.estado_factura === ESTADO_FACTURA_ENVIADA);
+    return todasEnviadas ? ESTADO_FACTURACION_ENVIADA : ESTADO_FACTURACION_FACTURADO;
   }
 
   const cuotasActivas = (cuotas || []).filter(c => (c.estado ?? 1) === 1);
@@ -157,10 +106,6 @@ module.exports = {
   ESTADO_FACTURACION_FACTURADO,
   ESTADO_FACTURACION_ENVIADA,
   ESTADOS_FACTURACION_COMPLETA,
-  ESTADOS_FACTURACION_PENDIENTE_EMISION,
-  GRUPOS_FACTURACION,
-  whereGrupoFacturacion,
-  esPorFacturar,
   esEstadoFacturaValido,
   esFacturaActiva,
   esFacturado,

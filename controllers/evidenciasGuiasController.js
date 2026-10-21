@@ -31,7 +31,8 @@ function tecnicoAsignado(user, asignaciones) {
  *    asignado y los corrigen los roles de gestión (ver registrosTecnico.js).
  *  - 'Coordinacion': registro propio de la Oficina Técnica, separado del
  *    expediente del técnico. TODOS los que acceden al servicio lo ven, pero
- *    solo Coordinador y Super Admin lo cargan, editan o eliminan.
+ *    solo Coordinador, Administrador y Super Admin lo cargan, editan o
+ *    eliminan.
  *
  * `momento` NULL = sin clasificar (legado, fotos de ítem del checklist o del
  * cierre); la UI las muestra junto a las de 'Despues'.
@@ -40,10 +41,10 @@ const MOMENTO_COORDINACION = 'Coordinacion';
 const MOMENTOS_VALIDOS = ['Antes', 'Despues', MOMENTO_COORDINACION];
 const ERROR_MOMENTO = `Momento inválido (use ${MOMENTOS_VALIDOS.join(', ')})`;
 
-// Quién puede escribir en la sección de Coordinación. El Super Admin entra
-// porque es el rol que destraba cualquier caso; Admin y Contabilidad NO, aunque
-// gestionen el resto del expediente: esta sección es del Coordinador.
-const ROLES_EVIDENCIA_COORDINACION = ['coordinador', 'super_admin'];
+// Quién puede escribir en la sección de Coordinación: el Coordinador, el
+// Administrador (también registra material de la Oficina Técnica) y el Super
+// Admin, que destraba cualquier caso. Contabilidad NO.
+const ROLES_EVIDENCIA_COORDINACION = ['coordinador', 'admin', 'super_admin'];
 const puedeEscribirCoordinacion = (user) =>
   ROLES_EVIDENCIA_COORDINACION.includes(user?.rol_codigo);
 
@@ -56,7 +57,7 @@ const puedeEscribirCoordinacion = (user) =>
 function motivoBloqueoCoordinacion(user, momento, accion) {
   if (momento !== MOMENTO_COORDINACION) return null;
   if (puedeEscribirCoordinacion(user)) return null;
-  return `La sección "Evidencias · Coordinación" es del Coordinador: no tiene permiso para ${accion} en ella`;
+  return `La sección "Evidencias · Coordinación" es del Coordinador y del Administrador: no tiene permiso para ${accion} en ella`;
 }
 
 const subirEvidencia = async (req, res) => {

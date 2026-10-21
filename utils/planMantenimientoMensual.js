@@ -25,9 +25,9 @@
 const { ymdDeFecha, parseYMDLima, combinarFechaHoraLima } = require('./tiempo');
 const { ESTADO_EVENTO_PROGRAMADO } = require('./estadoEvento');
 const { COLORES } = require('./recordatoriosAuto');
-const { estaServicioRealizado } = require('./estadoServicio');
+const { estaServicioRealizado, ESTADO_SERVICIO_CANCELADO } = require('./estadoServicio');
 const { ESTADO_FACTURA_ANULADA } = require('./estadoFactura');
-const { programacionDelPlan, ventanaMes } = require('./programacionPlanMantenimiento');
+const { programacionDelPlan, periodoFacturacionMes } = require('./programacionPlanMantenimiento');
 
 const COLOR_MANTENIMIENTO = COLORES.mantenimiento;
 
@@ -593,12 +593,21 @@ async function mesesDelPlan(client, idPlan) {
       }
     }
 
-    const ventana = ventanaMes(fechaInicioYMD, numeroMes);
+    // Periodo de facturación: arranca con el servicio más antiguo del mes (ver
+    // periodoFacturacionMes). De aquí sale el vencimiento de la cuota al aprobar.
+    // Un servicio cancelado no marca el periodo: ese trabajo no se hizo.
+    const periodo = periodoFacturacionMes(
+      fechaInicioYMD,
+      numeroMes,
+      activas
+        .filter(v => !(v.servicio && v.servicio.estado === 1 && v.servicio.estado_servicio === ESTADO_SERVICIO_CANCELADO))
+        .map(v => ymdDeFecha(v.fecha_programada))
+    );
     return {
       numero_mes: numeroMes,
-      desde: ventana.desde,
-      hasta: ventana.hasta,
-      etiqueta: etiquetaMes(numeroMes, ventana.desde),
+      desde: periodo.desde,
+      hasta: periodo.hasta,
+      etiqueta: etiquetaMes(numeroMes, periodo.desde),
       detalle,
       ascensores_mes,
       omitidas: omitidas.length,

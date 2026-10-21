@@ -5,7 +5,9 @@ const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, ymdLima } = require(
 const { generarCodigoCotizacion } = require('../utils/codigoCotizacion');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
-const { calcularTotalesVersion, normalizarPlanCuotas } = require('../utils/cotizacionCalculos');
+const {
+  calcularTotalesVersion, calcularImporteLinea, normalizarDescuentosItems, normalizarPlanCuotas
+} = require('../utils/cotizacionCalculos');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
@@ -650,8 +652,14 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'Un servicio (correctivo, emergencia o mantenimiento) se cotiza para un solo ascensor. Cree una cotización por cada ascensor.' });
     }
 
-    const items = Array.isArray(d.items) ? d.items : [];
+    let items = Array.isArray(d.items) ? d.items : [];
     if (items.length === 0) return res.status(400).json({ error: 'Debe agregar al menos un item' });
+    // Descuento de cada ítem: porcentaje o monto fijo (utils/cotizacionCalculos).
+    try {
+      items = normalizarDescuentosItems(items);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
 
     // La foto por ítem NO se exige al cotizar (tampoco en correctivos): es
     // requisito al APROBAR, cuando la cotización se convierte en servicio
@@ -783,8 +791,10 @@ const crear = async (req, res) => {
             cantidad: it.cantidad || 1,
             unidad: it.unidad || 'Unidad',
             precio_unitario: it.precio_unitario || 0,
-            descuento_porcentaje: it.descuento_porcentaje || 0,
-            importe: require('../utils/cotizacionCalculos').calcularImporteLinea(it),
+            descuento_tipo: it.descuento_tipo,
+            descuento_porcentaje: it.descuento_porcentaje,
+            descuento_monto: it.descuento_monto,
+            importe: calcularImporteLinea(it),
             id_archivo: it.id_archivo ? Number(it.id_archivo) : null,
             user_id_registration: req.user.id
           }
@@ -936,9 +946,16 @@ const actualizarVersion = async (req, res) => {
       return res.status(400).json({ error: 'Solo se editan versiones en Cotizado' });
     }
 
-    const items = Array.isArray(d.items) ? d.items : null;
+    let items = Array.isArray(d.items) ? d.items : null;
+    if (items) {
+      // Descuento de cada ítem: porcentaje o monto fijo (utils/cotizacionCalculos).
+      try {
+        items = normalizarDescuentosItems(items);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
     const igvTasa = await configuracion.obtener('IGV_RATE');
-    const { calcularImporteLinea } = require('../utils/cotizacionCalculos');
 
     // Editar los ítems no exige foto: se pide al aprobar (ver `aprobarVersion`).
 
@@ -1038,7 +1055,9 @@ const actualizarVersion = async (req, res) => {
               cantidad: it.cantidad || 1,
               unidad: it.unidad || 'Unidad',
               precio_unitario: it.precio_unitario || 0,
-              descuento_porcentaje: it.descuento_porcentaje || 0,
+              descuento_tipo: it.descuento_tipo,
+              descuento_porcentaje: it.descuento_porcentaje,
+              descuento_monto: it.descuento_monto,
               importe: calcularImporteLinea(it),
               id_archivo: it.id_archivo ? Number(it.id_archivo) : null,
               user_id_registration: req.user.id
@@ -1143,7 +1162,9 @@ const crearNuevaVersion = async (req, res) => {
             cantidad: it.cantidad,
             unidad: it.unidad,
             precio_unitario: it.precio_unitario,
+            descuento_tipo: it.descuento_tipo,
             descuento_porcentaje: it.descuento_porcentaje,
+            descuento_monto: it.descuento_monto,
             importe: it.importe,
             id_archivo: it.id_archivo,
             user_id_registration: req.user.id

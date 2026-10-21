@@ -14,6 +14,7 @@ const {
   clienteAlcanceWhere,
 } = require('../utils/alcanceUsuario');
 const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
+const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { bajaClienteCascadaEnTx, calcularImpactoCliente } = require('../utils/bajaClienteCascada');
 const { whereAscensorVisible } = require('../utils/eliminacionAscensor');
 const { purgarObjetosWasabi, liberarTecnicos } = require('../utils/reversionEliminacion');
@@ -514,7 +515,7 @@ const vista360 = async (req, res) => {
       idsServicios.length === 0 ? [] : prisma.tbl_entregas.findMany({
         where: { id_servicio: { in: idsServicios }, estado: 1 },
         orderBy: { fecha_entrega: 'desc' },
-        include: { archivo: true, servicio: { select: { codigo: true } } }
+        include: { archivo: true, documentos: INCLUDE_DOCUMENTOS_ENTREGA, servicio: { select: { codigo: true } } }
       }),
       // Documentos: archivos asociados a guías/evidencias/facturas/entregas del cliente
       idsServicios.length === 0 ? [] : prisma.tbl_archivos.findMany({
@@ -524,7 +525,8 @@ const vista360 = async (req, res) => {
             { guias: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
             { evidencias: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
             { facturas: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
-            { entregas: { some: { id_servicio: { in: idsServicios }, estado: 1 } } }
+            { entregas: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
+            { entregas_documentos: { some: { estado: 1, entrega: { id_servicio: { in: idsServicios }, estado: 1 } } } }
           ]
         },
         orderBy: { fecha_subida: 'desc' },

@@ -48,6 +48,7 @@ const {
 } = require('./bajaAscensorCascada');
 const { bajaArchivoEnTx, bajaServicioCascadaEnTx } = require('./reversionEliminacion');
 const { bajaDocumentosDeFacturasEnTx } = require('./documentosFactura');
+const { bajaDocumentosDeAbonosEnTx } = require('./documentosPago');
 const { ESTADO_EVENTO_CANCELADO } = require('./estadoEvento');
 
 // Al eliminar un edificio se arrastra también lo ya ejecutado o cobrado.
@@ -224,7 +225,7 @@ async function calcularImpactoEdificio(db, idEdificio) {
 /**
  * Da de baja los cobros y facturas activos que cumplen `filtro` (se aplica igual
  * a tbl_cobros y a tbl_facturas) y todo lo que cuelga de ellos: cuotas, pagos,
- * recordatorios de cobro, documentos de factura y archivos.
+ * recordatorios de cobro, documentos de factura y de abono, y archivos.
  */
 async function bajaIngresosEnTx(tx, filtro, userId, stamp, wasabiKeys) {
   const cobros = await tx.tbl_cobros.findMany({
@@ -233,6 +234,7 @@ async function bajaIngresosEnTx(tx, filtro, userId, stamp, wasabiKeys) {
   });
 
   const archivoIds = new Set();
+  for (const idArchivo of await bajaDocumentosDeAbonosEnTx(tx, cobros.map(c => c.id), userId)) archivoIds.add(idArchivo);
   for (const cobro of cobros) {
     for (const p of cobro.pagos) if (p.id_archivo_comprobante) archivoIds.add(p.id_archivo_comprobante);
     await tx.tbl_cobros_cuotas.updateMany({ where: { id_cobro: cobro.id, estado: 1 }, data: { estado: 0, ...stamp } });

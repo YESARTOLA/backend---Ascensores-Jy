@@ -16,6 +16,7 @@ const { MONEDAS_CODIGOS, MONEDA_POR_DEFECTO } = require('../utils/catalogosBanca
 const { normalizarDatosSitio } = require('../utils/datosSitioAscensor');
 const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
 const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
+const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const {
   aplicaAlcance,
   aplicaAlcanceEdificio,
@@ -289,7 +290,7 @@ const historial = async (req, res) => {
         prisma.tbl_entregas.findMany({
           where: { id_servicio: { in: idsServicios }, estado: 1 },
           orderBy: { fecha_entrega: 'desc' },
-          include: { archivo: true, servicio: { select: { codigo: true } } }
+          include: { archivo: true, documentos: INCLUDE_DOCUMENTOS_ENTREGA, servicio: { select: { codigo: true } } }
         }),
         prisma.tbl_facturas.findMany({
           where: { id_servicio: { in: idsServicios }, estado: 1 },

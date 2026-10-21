@@ -650,7 +650,7 @@ model tbl_servicios_evidencias {
   // Sección del álbum a la que pertenece la evidencia:
   //   "Antes" / "Despues" → el trabajo del técnico en obra;
   //   "Coordinacion"      → registro propio de la Oficina Técnica (solo lo
-  //                         cargan Coordinador y Super Admin).
+  //                         cargan Coordinador, Administrador y Super Admin).
   // NULL para evidencias sin clasificar (legado, fotos de ítem del checklist o
   // del cierre): en la UI se muestran junto a las de "Despues".
   momento                String?                                @db.VarChar(20)
@@ -748,7 +748,30 @@ model tbl_entregas {
   user_id_modification   Int?
   date_time_modification DateTime?               @db.Timestamptz(6)
   servicio               tbl_servicios_proyectos @relation(fields: [id_servicio], references: [id], onDelete: Cascade)
+  // `archivo` es el archivo único de las entregas registradas antes de que
+  // admitieran varios; las nuevas guardan todos sus documentos en `documentos`
+  // (utils/documentosEntrega.js). Se muestran juntos.
   archivo                tbl_archivos?           @relation(fields: [id_archivo], references: [id])
+  documentos             tbl_entregas_archivos[]
+}
+
+// Documentos de una entrega (actas, planos, manuales, certificados…), tantos
+// como haga falta y cargados en lote. Lógica en utils/documentosEntrega.js.
+model tbl_entregas_archivos {
+  id                     Int          @id @default(autoincrement())
+  id_entrega             Int
+  id_archivo             Int
+  descripcion            String?      @db.VarChar(200)
+  orden                  Int          @default(0)
+  estado                 Int          @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?    @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?    @db.Timestamptz(6)
+  entrega                tbl_entregas @relation(fields: [id_entrega], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos @relation(fields: [id_archivo], references: [id])
+
+  @@index([id_entrega])
 }
 
 // ---------------------------------------------------------------------
@@ -1229,8 +1252,33 @@ model tbl_pagos {
   user_id_modification   Int?
   date_time_modification DateTime?              @db.Timestamptz(6)
   cobro                  tbl_cobros             @relation(fields: [id_cobro], references: [id], onDelete: Cascade)
+  // `archivo` es el comprobante del abono (voucher, captura de la
+  // transferencia). Los demás documentos (constancia de detracción, de
+  // pago…) van en `documentos`.
   archivo                tbl_archivos?          @relation(fields: [id_archivo_comprobante], references: [id])
   cuenta_bancaria        tbl_cuentas_bancarias? @relation(fields: [id_cuenta_bancaria], references: [id])
+  documentos             tbl_pagos_archivos[]
+}
+
+// Documentos de soporte de un abono, además de su comprobante
+// (tbl_pagos.id_archivo_comprobante). Mismo catálogo de `tipo_documento` que
+// tbl_facturas_archivos (utils/documentosFactura.js).
+model tbl_pagos_archivos {
+  id                     Int          @id @default(autoincrement())
+  id_pago                Int
+  id_archivo             Int
+  tipo_documento         String       @default("Otro") @db.VarChar(40)
+  descripcion            String?      @db.VarChar(200)
+  orden                  Int          @default(0)
+  estado                 Int          @default(1)
+  user_id_registration   Int?
+  date_time_registration DateTime?    @default(now()) @db.Timestamptz(6)
+  user_id_modification   Int?
+  date_time_modification DateTime?    @db.Timestamptz(6)
+  pago                   tbl_pagos    @relation(fields: [id_pago], references: [id], onDelete: Cascade)
+  archivo                tbl_archivos @relation(fields: [id_archivo], references: [id])
+
+  @@index([id_pago])
 }
 
 model tbl_cobros_recordatorios {
@@ -1331,10 +1379,12 @@ model tbl_archivos {
   guias                       tbl_servicios_guias[]
   evidencias                  tbl_servicios_evidencias[]
   entregas                    tbl_entregas[]
+  entregas_documentos         tbl_entregas_archivos[]
   facturas                    tbl_facturas[]
   facturas_documentos         tbl_facturas_archivos[]
   pagos                       tbl_pagos[]
-  cotizaciones_pdf            tbl_cotizaciones_versiones[]           @relation("CotizacionVersionPdf")
+  pagos_documentos            tbl_pagos_archivos[]
+  cotizaciones_pdf          tbl_cotizaciones_versiones[]           @relation("CotizacionVersionPdf")
   cotizaciones_respaldo       tbl_cotizaciones_versiones[]           @relation("CotizacionVersionRespaldo")
   cotizaciones_archivos       tbl_cotizaciones_archivos[]
   servicios_ot                tbl_servicios_proyectos[]              @relation("ServicioOt")
@@ -1607,7 +1657,13 @@ model tbl_cotizaciones_items {
   cantidad               Decimal                    @default(1) @db.Decimal(12, 2)
   unidad                 String                     @default("Unidad") @db.VarChar(30)
   precio_unitario        Decimal                    @default(0) @db.Decimal(12, 2)
+  // Descuento del ítem: 'porcentaje' (descuento_porcentaje % sobre cantidad ×
+  // precio) o 'monto' (descuento_monto fijo restado al importe de la línea).
+  // Solo vale el campo del tipo elegido; el otro queda en 0
+  // (utils/cotizacionCalculos.js).
+  descuento_tipo         String                     @default("porcentaje") @db.VarChar(10)
   descuento_porcentaje   Decimal                    @default(0) @db.Decimal(5, 2)
+  descuento_monto        Decimal                    @default(0) @db.Decimal(12, 2)
   importe                Decimal                    @default(0) @db.Decimal(12, 2)
   // Foto del ítem. Obligatoria en cotizaciones del módulo 'correctivo'; opcional
   // en el resto. Se muestra luego en la página del servicio generado.

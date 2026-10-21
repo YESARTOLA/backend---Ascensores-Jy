@@ -52,4 +52,41 @@ function whereRealizadoConMonto() {
   };
 }
 
-module.exports = { whereCobroConMonto, whereCuotaConMonto, whereRealizadoConMonto };
+/** Monto de un filtro ("150", "150.5", "150,50"): número ≥ 0 con 2 decimales, o null. */
+function montoDeFiltro(valor) {
+  if (valor === undefined || valor === null || String(valor).trim() === '') return null;
+  const n = Number(String(valor).trim().replace(',', '.'));
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : null;
+}
+
+/**
+ * Servicios realizados cuyo "Total" de Contabilidad está entre `min` y `max`
+ * (extremos opcionales e inclusivos), o null si no se pidió rango. Mismo
+ * criterio que pinta la columna (frontend utils/planMantenimiento.js,
+ * precioMensualDelPlan), para que el filtro traiga lo que la columna dice:
+ *   · visita de un plan sin precio propio → el monto mensual del plan;
+ *   · cualquier otro servicio → su precio.
+ *
+ * Combínalo dentro de un AND, como whereRealizadoConMonto.
+ */
+function whereTotalRealizadoEnRango({ min, max }) {
+  const desde = montoDeFiltro(min);
+  const hasta = montoDeFiltro(max);
+  if (desde === null && hasta === null) return null;
+  const rango = {
+    ...(desde !== null ? { gte: desde } : {}),
+    ...(hasta !== null ? { lte: hasta } : {})
+  };
+  return {
+    servicio: {
+      is: {
+        OR: [
+          { id_mantenimiento_plan: { not: null }, precio_interno: 0, mantenimiento_plan: { is: { monto_mensual: rango } } },
+          { AND: [{ OR: [{ id_mantenimiento_plan: null }, { precio_interno: { not: 0 } }] }, { precio_interno: rango }] }
+        ]
+      }
+    }
+  };
+}
+
+module.exports = { whereCobroConMonto, whereCuotaConMonto, whereRealizadoConMonto, whereTotalRealizadoEnRango };

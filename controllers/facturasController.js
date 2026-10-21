@@ -3,11 +3,10 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const {
   cambiarEstadoServicio,
   estadoServicioDesdeCobro,
-  estaServicioFinalizado,
-  ESTADO_SERVICIO_EN_CURSO
+  estaServicioFinalizado
 } = require('../utils/estadoServicio');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima, parseYMDFinDiaLima, ymdDeFecha } = require('../utils/tiempo');
+const { parseYMDLima, parseYMDUTC, ymdDeFecha } = require('../utils/tiempo');
 const { descartarAlertaFacturarServicio } = require('../utils/recordatoriosAuto');
 const {
   TIPOS_COMPROBANTE_CODIGOS,
@@ -28,6 +27,7 @@ const { elegibilidadContable } = require('../utils/elegibilidadContable');
 const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
 const { sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
+const { conFechasDeServicios, idsFacturasConFechasEnRango } = require('../utils/fechasContables');
 const {
   MAX_DOCUMENTOS_FACTURA,
   SELECT_ARCHIVO,
@@ -38,24 +38,6 @@ const {
   vincularDocumentosEnTx,
   bajaDocumentosDeFacturasEnTx
 } = require('../utils/documentosFactura');
-
-/**
- * Añade a la factura la fecha en que se inició el servicio facturado:
- *  - `fecha_inicio_servicio`: primer paso a 'En curso' (inicio real en obra) y,
- *    si el servicio aún no se inició, la fecha programada.
- *  - `inicio_servicio_es_real`: distingue una de otra para la UI.
- * En facturas de plan de mantenimiento (sin servicio) se usa el inicio del plan.
- */
-function conFechaInicioServicio(f) {
-  const inicioReal = f.servicio?.historial_estados?.[0]?.fecha_cambio || null;
-  const programada = f.servicio?.fecha_programada || null;
-  const inicioPlan = !f.servicio ? (f.mantenimiento_plan?.fecha_inicio || null) : null;
-  return {
-    ...f,
-    fecha_inicio_servicio: inicioReal || programada || inicioPlan,
-    inicio_servicio_es_real: !!inicioReal
-  };
-}
 
 // Las dos situaciones que Facturas presenta como indicadores y como filtro
 // rápido de la cabecera. Valores admitidos por el parámetro `situacion`.
@@ -184,7 +166,10 @@ function resumirFacturas(analizadas) {
 
 const listar = async (req, res) => {
   try {
-    const { id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, moneda, desde, hasta } = req.query;
+    const {
+      id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, moneda, desde, hasta,
+      servicio_desde, servicio_hasta, registro_desde, registro_hasta
+    } = req.query;
     // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
     // tipo de servicio): asignarlos a where.OR directamente se pisarían.
     const and = [];
@@ -201,10 +186,12 @@ const listar = async (req, res) => {
     // 'cuota' = factura ligada a una cuota específica del plan.
     if (cobertura === 'general') where.id_cuota = null;
     else if (cobertura === 'cuota') where.id_cuota = { not: null };
+    // "Fecha de comprobante" = emisión. Es un día puro (@db.Date): los límites
+    // van a medianoche UTC; con límites en Lima el "hasta" metía el día siguiente.
     if (desde || hasta) {
       where.fecha_emision = {};
-      if (desde) where.fecha_emision.gte = parseYMDLima(desde);
-      if (hasta) where.fecha_emision.lte = parseYMDFinDiaLima(hasta);
+      if (desde) where.fecha_emision.gte = parseYMDUTC(desde);
+      if (hasta) where.fecha_emision.lte = parseYMDUTC(hasta);
     }
     if (q) and.push({ OR: [
       { numero_factura: { contains: q, mode: 'insensitive' } },
@@ -271,6 +258,16 @@ const listar = async (req, res) => {
     // Alcance por tipo de edificio (Administrador): factura de servicio o de plan.
     conAlcance(where, porServicioOPlanAscensorEdificioWhere(req.user));
 
+    // Rangos por "Fecha de servicio" y por "Fecha de registro" (de la OT): no
+    // son columnas de la factura sino de los servicios que cubre, así que el
+    // recorte va por id, con la misma función que pinta esas dos columnas
+    // (utils/fechasContables.js). Antes del análisis: el resumen también lo respeta.
+    const idsPorFechas = await idsFacturasConFechasEnRango(prisma, where, {
+      servicio: { desde: servicio_desde, hasta: servicio_hasta },
+      registro: { desde: registro_desde, hasta: registro_hasta }
+    });
+    if (idsPorFechas) and.push({ id: { in: idsPorFechas } });
+
     // Análisis del conjunto filtrado ANTES de paginar y antes de aplicar la
     // situación: de él salen los dos indicadores y el propio filtro rápido, así
     // que pulsar "Pendiente de cobro" deja en la tabla exactamente las facturas
@@ -305,13 +302,6 @@ const listar = async (req, res) => {
               ascensores: {
                 where: { estado: 1 },
                 select: { ascensor: { select: { edificio: { select: { id: true, nombre: true } } } } }
-              },
-              // Primer paso a 'En curso' = inicio real del servicio en obra.
-              historial_estados: {
-                where: { estado_nuevo: ESTADO_SERVICIO_EN_CURSO },
-                orderBy: { fecha_cambio: 'asc' },
-                take: 1,
-                select: { fecha_cambio: true }
               }
             }
           },
@@ -334,7 +324,8 @@ const listar = async (req, res) => {
       },
       req.query
     );
-    if (Array.isArray(result?.data)) result.data = result.data.map(conFechaInicioServicio);
+    // Fechas de servicio y de registro (OT) de lo que cubre cada factura.
+    if (Array.isArray(result?.data)) result.data = await conFechasDeServicios(prisma, result.data);
     // El resumen describe TODO el recorte elegido, no las 25 filas visibles, y
     // sale del mismo análisis que alimenta el filtro: no pueden desincronizarse.
     // La ruta ya está restringida a roles con visibilidad financiera (ver
@@ -353,17 +344,7 @@ const obtener = async (req, res) => {
       where: { id },
       include: {
         cliente: true,
-        servicio: {
-          include: {
-            tipo_servicio: true,
-            historial_estados: {
-              where: { estado_nuevo: ESTADO_SERVICIO_EN_CURSO },
-              orderBy: { fecha_cambio: 'asc' },
-              take: 1,
-              select: { fecha_cambio: true }
-            }
-          }
-        },
+        servicio: { include: { tipo_servicio: true } },
         mantenimiento_plan: { include: { tipo_servicio: true } },
         archivo: true,
         documentos: INCLUDE_DOCUMENTOS,
@@ -377,7 +358,8 @@ const obtener = async (req, res) => {
     // fechas). Es un solo comprobante por el monto mensual pactado; el detalle
     // se deriva del cronograma del plan, no se copia en la factura.
     const detalleMensual = f.id_cuota ? await detalleMensualDeCuota(prisma, f.id_cuota) : null;
-    res.json({ data: { ...conFechaInicioServicio(f), detalle_mensual: detalleMensual } });
+    const [conFechas] = await conFechasDeServicios(prisma, [f]);
+    res.json({ data: { ...conFechas, detalle_mensual: detalleMensual } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener factura' });
@@ -398,9 +380,15 @@ async function recomputarEstadoFacturacionServicio(idServicio, idUsuario) {
     where: { id_servicio: idServicio },
     include: { cuotas: { where: { estado: 1 } } }
   });
+  const servicio = await prisma.tbl_servicios_proyectos.findUnique({
+    where: { id: idServicio }, select: { precio_interno: true }
+  });
   const estadoFacturacion = calcularEstadoFacturacion({
     facturas,
-    cuotas: cobro?.cuotas || []
+    cuotas: cobro?.cuotas || [],
+    // Total cobrable: el del cobro y, sin cobro, el precio del servicio (el
+    // mismo tope con que validarCoberturaFactura admite las facturas generales).
+    total: Number(cobro?.monto_total ?? servicio?.precio_interno ?? 0)
   });
   await prisma.tbl_servicios_realizados.updateMany({
     where: { id_servicio: idServicio },
@@ -532,7 +520,7 @@ const crear = async (req, res) => {
       const cobroPropioVivo = servicio.cobro && servicio.cobro.estado === 1;
       if (cobroPlan || !cobroPropioVivo) {
         return res.status(400).json({
-          error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura contra la cuota del plan desde Contabilidad → Por facturar, Gestión de cobros → Por facturar o el detalle del plan (Facturación mensual).'
+          error: 'Este mantenimiento pertenece a un plan: se factura una sola vez al mes, no por servicio. Emita la factura contra la cuota del plan desde Contabilidad → Cuotas por facturar o Gestión de cobros → Por facturar.'
         });
       }
       esPlanLegacyConCobroPropio = true;
@@ -556,7 +544,8 @@ const crear = async (req, res) => {
     }
 
     // Modo: general (id_cuota null) vs por-cuota (id_cuota set), mutuamente
-    // excluyentes a nivel servicio. La general no supera el total cobrable
+    // excluyentes a nivel servicio. La general admite varias emisiones (una
+    // parcial y luego el resto) mientras la suma no supere el total cobrable
     // (monto del cobro o, en su defecto, el precio del servicio).
     const idCuota = d.id_cuota ? Number(d.id_cuota) : null;
     const errorCobertura = await validarCoberturaFactura({
@@ -564,6 +553,7 @@ const crear = async (req, res) => {
       nombre: 'servicio',
       cobro: servicio.cobro,
       totalCobrable: Number(servicio.cobro?.monto_total ?? servicio.precio_interno ?? 0),
+      generalAcumulable: true,
       idCuota,
       monto: d.monto
     });
@@ -987,35 +977,57 @@ async function sincronizarServicioTrasFactura(idServicio, idUsuario, motivo) {
  * Reglas de COBERTURA de una factura y de su monto, comunes a emitirla y a
  * editarla:
  *  - factura general y facturas por cuota se excluyen dentro del mismo
- *    servicio / plan; hay una sola general y una sola factura por cuota;
- *  - la general no supera el total cobrable; la de cuota iguala el monto de la cuota.
+ *    servicio / plan; hay una sola factura por cuota;
+ *  - la general: en un SERVICIO (`generalAcumulable`) puede emitirse en varias
+ *    partes —una primera factura parcial y luego una segunda, tercera… por lo
+ *    que falte— mientras la suma de las vigentes no supere el total cobrable;
+ *    en un PLAN sigue siendo una sola, por el total;
+ *  - la de cuota iguala el monto de la cuota.
  * Las anuladas no cuentan. `excluirId` deja fuera a la propia factura al editar.
+ *
+ * Lo que "falta facturar" aquí es lo mismo que muestran Contabilidad
+ * (utils/situacionFacturacion.js) y el detalle del cobro: total cobrable menos
+ * la suma de las facturas generales vigentes.
  *
  * @param {object} p
  * @param {object} p.ambito         { id_servicio } | { id_mantenimiento_plan }
  * @param {'servicio'|'plan'} p.nombre  cómo nombrar el ámbito en los mensajes
  * @param {object|null} p.cobro     cobro del ámbito (la cuota debe ser suya)
- * @param {number} p.totalCobrable  tope de la factura general (0 = sin tope)
+ * @param {number} p.totalCobrable  tope de la facturación general (0 = sin tope)
+ * @param {boolean} [p.generalAcumulable=false] admite varias facturas generales
+ *   hasta completar el total (servicios); false = una sola general (planes)
  * @param {number|null} p.idCuota
  * @param {number|string} p.monto
  * @param {number} [p.excluirId]
  * @returns {Promise<string|null>} mensaje de error, o null si es válida
  */
-async function validarCoberturaFactura({ ambito, nombre, cobro, totalCobrable, idCuota, monto, excluirId }) {
+async function validarCoberturaFactura({ ambito, nombre, cobro, totalCobrable, generalAcumulable = false, idCuota, monto, excluirId }) {
   const facturasExistentes = await prisma.tbl_facturas.findMany({
     where: {
       ...ambito, estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA },
       ...(excluirId ? { id: { not: excluirId } } : {})
     }
   });
-  const hayGeneral = facturasExistentes.some(f => f.id_cuota === null);
+  const generales = facturasExistentes.filter(f => f.id_cuota === null);
+  const hayGeneral = generales.length > 0;
   const hayPorCuota = facturasExistentes.some(f => f.id_cuota !== null);
+  const centavos = (v) => Math.round(Number(v || 0) * 100);
+  const soles = (c) => (c / 100).toFixed(2);
 
   if (idCuota === null) {
     if (hayPorCuota) return `Este ${nombre} ya tiene facturas por cuota. No se puede emitir una factura general además.`;
-    if (hayGeneral) return `Este ${nombre} ya tiene una factura general emitida.`;
-    if (totalCobrable > 0 && Number(monto) - totalCobrable > 0.01) {
-      return `El monto de la factura (S/ ${Number(monto).toFixed(2)}) excede el total del ${nombre} (S/ ${totalCobrable.toFixed(2)}).`;
+    if (hayGeneral && !generalAcumulable) return `Este ${nombre} ya tiene una factura general emitida.`;
+    if (totalCobrable > 0) {
+      const emitido = generales.reduce((acc, f) => acc + centavos(f.monto), 0);
+      const restante = centavos(totalCobrable) - emitido;
+      if (hayGeneral && restante <= 0) {
+        return `Este ${nombre} ya está facturado por su total (S/ ${soles(centavos(totalCobrable))}): ${generales.map(f => f.numero_factura).join(', ')}.`;
+      }
+      if (centavos(monto) > restante) {
+        return hayGeneral
+          ? `El monto de la factura (S/ ${soles(centavos(monto))}) excede lo que falta facturar del ${nombre} (S/ ${soles(restante)}): ya se facturó S/ ${soles(emitido)} de S/ ${soles(centavos(totalCobrable))}.`
+          : `El monto de la factura (S/ ${soles(centavos(monto))}) excede el total del ${nombre} (S/ ${soles(centavos(totalCobrable))}).`;
+      }
     }
     return null;
   }
@@ -1045,7 +1057,10 @@ async function contextoCoberturaDeFactura(f) {
       ambito: { id_servicio: f.id_servicio },
       nombre: 'servicio',
       cobro: servicio?.cobro || null,
-      totalCobrable: Number(servicio?.cobro?.monto_total ?? servicio?.precio_interno ?? 0)
+      totalCobrable: Number(servicio?.cobro?.monto_total ?? servicio?.precio_interno ?? 0),
+      // Al editar el monto de una general, el tope es lo que falta facturar
+      // contando las OTRAS generales vigentes del servicio.
+      generalAcumulable: true
     };
   }
   if (f.id_mantenimiento_plan) {

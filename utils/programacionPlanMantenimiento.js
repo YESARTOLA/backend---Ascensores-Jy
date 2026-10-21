@@ -73,6 +73,42 @@ function ventanaMes(fechaInicioYMD, m) {
 }
 
 /**
+ * PERIODO DE FACTURACIÓN del mes `m` del plan: va de la mano con la fecha de
+ * sus servicios. Arranca el día de la visita más antigua programada en ese mes
+ * y dura un mes (15/10 → 14/11). La visita sigue la fecha de su servicio
+ * (diasServicio), así que crear o reprogramar el servicio en otro día mueve el
+ * periodo con él.
+ *
+ * Solo cuentan las fechas que van desde un mes antes de la ventana del mes
+ * hasta su cierre: adelantar el mantenimiento unos días mueve el periodo, pero
+ * una fecha de muchos meses antes (servicios antiguos enganchados al mes 1 al
+ * reconstruir el cronograma) daría un periodo absurdo y una cuota que nace
+ * vencida. Un servicio atrasado más allá del cierre tampoco lo mueve.
+ *
+ * Sin fechas que cuenten, o con la primera en el aniversario de `fecha_inicio`,
+ * el periodo es la ventana del mes (`ventanaMes`): lo de siempre.
+ *
+ * Solo cambia las fechas que se muestran y el vencimiento de la cuota al
+ * aprobar el mes; a qué mes pertenece cada visita lo sigue diciendo su
+ * `numero_mes`.
+ *
+ * @param {string} fechaInicioYMD
+ * @param {number} m
+ * @param {string[]} fechasVisitasYMD  Fechas de las visitas activas del mes
+ *                                     (sin las de servicios cancelados).
+ */
+function periodoFacturacionMes(fechaInicioYMD, m, fechasVisitasYMD = []) {
+  const ventana = ventanaMes(fechaInicioYMD, m);
+  const limiteInferior = anclaMes(fechaInicioYMD, m - 1);
+  const primera = (fechasVisitasYMD || [])
+    .map(f => String(f).substring(0, 10))
+    .filter(f => f && f >= limiteInferior && f <= ventana.hasta)
+    .sort()[0];
+  if (!primera || primera === ventana.desde) return ventana;
+  return { numero_mes: m, desde: primera, hasta: addDias(addMeses(primera, 1), -1) };
+}
+
+/**
  * Ventanas de los `duracionMeses` meses del plan, en orden.
  */
 function ventanasDelPlan(fechaInicioYMD, duracionMeses) {
@@ -242,6 +278,7 @@ module.exports = {
   addMeses,
   anclaMes,
   ventanaMes,
+  periodoFacturacionMes,
   ventanasDelPlan,
   mesDeFecha,
   programacionDeAscensor,

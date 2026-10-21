@@ -14,6 +14,7 @@ const configuracion = require('./configuracion');
 const { obtenerDatosEmpresa } = require('./empresaEmisora');
 const prisma = require('../config/prisma');
 const { keyDesdeRuta, obtenerStream } = require('./storage');
+const { tipoDescuento, DESCUENTO_MONTO } = require('./cotizacionCalculos');
 
 /** Lee un stream (Body de S3) completo a Buffer. */
 async function streamABuffer(stream) {
@@ -202,10 +203,11 @@ async function generarPdfCotizacion(ctx) {
   // Tabla de items
   const cols = [
     { titulo: '#', x: x0, w: 25, align: 'left' },
-    { titulo: 'Descripción', x: x0 + 25, w: ancho - 25 - 55 - 75 - 50 - 75, align: 'left' },
+    { titulo: 'Descripción', x: x0 + 25, w: ancho - 25 - 55 - 75 - 70 - 75, align: 'left' },
     { titulo: 'Cant.', x: 0, w: 55, align: 'right' },
     { titulo: 'P. Unit.', x: 0, w: 75, align: 'right' },
-    { titulo: '% Dscto', x: 0, w: 50, align: 'right' },
+    // Porcentaje o monto fijo, según el descuento_tipo del ítem.
+    { titulo: 'Dscto', x: 0, w: 70, align: 'right' },
     { titulo: 'Importe', x: 0, w: 75, align: 'right' }
   ];
   // calcular xs
@@ -238,6 +240,10 @@ async function generarPdfCotizacion(ctx) {
     }
     alterna = !alterna;
     const dsctoPct = Number(it.descuento_porcentaje) || 0;
+    const dsctoMonto = Number(it.descuento_monto) || 0;
+    const dscto = tipoDescuento(it) === DESCUENTO_MONTO
+      ? (dsctoMonto > 0 ? formatearMonto(dsctoMonto, ctx.version.moneda) : '—')
+      : (dsctoPct > 0 ? `${dsctoPct.toFixed(2)}%` : '—');
     doc.text(String(i + 1), cols[0].x + 4, y + 2, { width: cols[0].w - 8, align: cols[0].align });
     doc.text(it.descripcion, cols[1].x + 4, y + 2, { width: cols[1].w - 8 });
     // Miniatura debajo de la descripción.
@@ -250,7 +256,7 @@ async function generarPdfCotizacion(ctx) {
     }
     doc.text(`${Number(it.cantidad).toFixed(2)} ${it.unidad || ''}`, cols[2].x + 4, y + 2, { width: cols[2].w - 8, align: cols[2].align });
     doc.text(formatearMonto(it.precio_unitario, ctx.version.moneda), cols[3].x + 4, y + 2, { width: cols[3].w - 8, align: cols[3].align });
-    doc.text(dsctoPct > 0 ? `${dsctoPct.toFixed(2)}%` : '—', cols[4].x + 4, y + 2, { width: cols[4].w - 8, align: cols[4].align });
+    doc.text(dscto, cols[4].x + 4, y + 2, { width: cols[4].w - 8, align: cols[4].align });
     doc.text(formatearMonto(it.importe, ctx.version.moneda), cols[5].x + 4, y + 2, { width: cols[5].w - 8, align: cols[5].align });
     y += altura;
     doc.moveTo(x0, y).lineTo(x0 + ancho, y).strokeColor(PALETA.grisClaro).lineWidth(0.5).stroke();
