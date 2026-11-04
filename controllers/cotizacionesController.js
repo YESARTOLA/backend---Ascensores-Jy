@@ -1924,7 +1924,8 @@ const aprobar = async (req, res) => {
       //     @unique). Si la cotización tiene multiascensor, la fila usa el
       //     PRIMER ascensor; los demás siguen vinculados via tbl_servicios_proyectos_ascensores.
       //   - mantenimiento: 1 plan por cada ascensor (planes son independientes).
-      //   - atencion_rapida: no aplica al aprobar cotización (es captura inicial).
+      //   - atencion_rapida: 1 registro con el contacto de la ficha del cliente
+      //     (el modal de aprobación no lo pide).
       await replicarEnModulo(tx, {
         servicio,
         tipoServicio: cot.subtipo_servicio,

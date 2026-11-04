@@ -14,7 +14,8 @@
  *   - mantenimiento: crea 1 plan que cubre todos los ascensores (montos
  *     heredados de la junction del servicio originante).
  *   - atencion_rapida: crea 1 fila en tbl_atenciones_rapidas con
- *     id_servicio_convertido = servicio.id (registro de origen).
+ *     id_servicio_convertido = servicio.id (registro de origen). El contacto
+ *     sale del payload o, si no viene, de la ficha del cliente.
  *   - null / otro valor: no hace nada.
  *
  * Si los datos requeridos faltan para el módulo activo, lanza Error y la
@@ -31,6 +32,48 @@ const { estadoEmergenciaDesdeServicio, estadoCorrectivoDesdeServicio } = require
 
 function nivelUrgencia(valor, defaultValor) {
   return ['alta', 'media', 'baja'].includes(valor) ? valor : defaultValor;
+}
+
+const textoLimpio = v => String(v ?? '').trim();
+
+/**
+ * Contacto de la atención rápida. Lo explícito del payload manda; lo que falte
+ * se toma de la ficha del cliente (principal → administrativo → cobranzas →
+ * datos generales) y, en último caso, del contacto en sitio del servicio. Ni la
+ * aprobación de cotización ni el alta de servicios piden estos datos: el
+ * contacto ya está registrado en el cliente.
+ */
+async function contactoAtencionRapida(tx, d, servicio, idCliente) {
+  const nombre = textoLimpio(d.nombre_contacto);
+  const telefono = textoLimpio(d.telefono);
+  if (nombre && telefono) return { nombre, telefono };
+
+  const cliente = idCliente
+    ? await tx.tbl_clientes.findUnique({
+        where: { id: Number(idCliente) },
+        select: {
+          nombre: true, telefono: true, whatsapp: true,
+          contacto_principal_nombre: true, contacto_principal_telefono: true,
+          contacto_admin_nombre: true, contacto_admin_telefono: true,
+          contacto_cobranzas_nombre: true, contacto_cobranzas_telefono: true
+        }
+      })
+    : null;
+  const fuentes = [
+    ...(cliente ? [
+      [cliente.contacto_principal_nombre, cliente.contacto_principal_telefono],
+      [cliente.contacto_admin_nombre, cliente.contacto_admin_telefono],
+      [cliente.contacto_cobranzas_nombre, cliente.contacto_cobranzas_telefono],
+      [cliente.nombre, cliente.telefono || cliente.whatsapp]
+    ] : []),
+    [servicio.contacto_nombre, servicio.contacto_telefono]
+  ];
+  // Nombre y teléfono salen de la misma fuente para no mezclar personas.
+  const fuente = fuentes.find(([, tel]) => textoLimpio(tel)) || [];
+  return {
+    nombre: (nombre || textoLimpio(fuente[0]) || textoLimpio(cliente?.nombre)).slice(0, 150),
+    telefono: (telefono || textoLimpio(fuente[1])).slice(0, 30)
+  };
 }
 
 /**
@@ -202,10 +245,9 @@ async function replicarEnModulo(tx, args) {
   }
 
   if (modulo === 'atencion_rapida') {
-    const nombre = String(d.nombre_contacto || '').trim();
-    const telefono = String(d.telefono || '').trim();
+    const { nombre, telefono } = await contactoAtencionRapida(tx, d, servicio, idCliente);
     if (!nombre || !telefono) {
-      throw new Error('Nombre y teléfono del contacto son obligatorios para módulo Atención Rápida');
+      throw new Error('El cliente no tiene un contacto con teléfono registrado: complételo en su ficha para generar el registro de Atención Rápida');
     }
     await tx.tbl_atenciones_rapidas.create({
       data: {
