@@ -89,7 +89,8 @@ const listar = async (req, res) => {
     const where = whereEmergenciasVisibles(req.user);
     if (estado_emergencia) where.estado_emergencia = estado_emergencia;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
-    // Técnico asignado e inicio de ejecución (rango), sobre el servicio vinculado.
+    // Técnico asignado, inicio de ejecución (rango) y N.º de orden de trabajo,
+    // sobre el servicio vinculado.
     conAlcance(where, whereFiltrosAtencion(req.query));
     // Buscador libre: edificio/obra, cliente, ascensor, distrito, motivo y código del servicio.
     if (q) where.OR = [

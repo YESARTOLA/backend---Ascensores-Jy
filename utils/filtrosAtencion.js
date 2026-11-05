@@ -10,6 +10,12 @@
  *                                 `derivarEjecucion` expone como
  *                                 `fecha_inicio_real`; un caso que aún no
  *                                 arrancó no tiene inicio y no entra.
+ *   numero_ot                   — N.º de orden de trabajo del servicio
+ *                                 (coincidencia parcial, sin distinguir
+ *                                 mayúsculas). La OT la sube el técnico durante
+ *                                 la ejecución y vive en
+ *                                 tbl_servicios_proyectos.numero_ot; un caso
+ *                                 sin OT nunca coincide.
  */
 const { whereInicioEnRango } = require('./ejecucionFechas');
 const { parseYMDLima, parseYMDFinDiaLima } = require('./tiempo');
@@ -33,6 +39,9 @@ function whereFiltrosAtencion(query = {}) {
   const hasta = esYMD(query.inicio_hasta) ? parseYMDFinDiaLima(query.inicio_hasta) : null;
   const inicioEnRango = whereInicioEnRango({ desde, hasta });
   if (inicioEnRango) condiciones.push(inicioEnRango);
+
+  const numeroOt = String(query.numero_ot || '').trim();
+  if (numeroOt) condiciones.push({ numero_ot: { contains: numeroOt, mode: 'insensitive' } });
 
   return condiciones.length ? { servicio: { is: { AND: condiciones } } } : null;
 }

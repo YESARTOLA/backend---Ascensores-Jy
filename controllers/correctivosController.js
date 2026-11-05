@@ -112,7 +112,8 @@ const listar = async (req, res) => {
     if (estado_correctivo) where.estado_correctivo = estado_correctivo;
     if (nivel_urgencia) where.nivel_urgencia = nivel_urgencia;
     if (id_cliente) where.id_cliente = Number(id_cliente);
-    // Técnico asignado e inicio de ejecución (rango), sobre el servicio vinculado.
+    // Técnico asignado, inicio de ejecución (rango) y N.º de orden de trabajo,
+    // sobre el servicio vinculado.
     conAlcance(where, whereFiltrosAtencion(req.query));
     // Buscador libre: edificio/obra, cliente, ascensor, distrito, falla y código del servicio.
     if (q) where.OR = [

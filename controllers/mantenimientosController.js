@@ -1547,7 +1547,7 @@ function _resumenAscensores(filas) {
  * filtros multi (cliente, ascensor) y rango de fechas. Helper puro usado tanto
  * por listarInstancias (pestaña) como por exportar.
  */
-async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q, id_tecnico_filtro }) {
+async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q, numero_ot, id_tecnico_filtro }) {
   const wherePlan = { estado: 1, id_mantenimiento_plan: { not: null } };
   if (id_plan) wherePlan.id_mantenimiento_plan = Number(id_plan);
   if (ids_cliente && ids_cliente.length > 0) wherePlan.id_cliente = { in: ids_cliente };
@@ -1555,6 +1555,11 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
   if (id_tecnico_filtro) {
     wherePlan.asignaciones = { some: { id_tecnico: id_tecnico_filtro, estado: 1 } };
   }
+  // N.º de orden de trabajo (parcial, sin distinguir mayúsculas). Solo puede
+  // tenerla un servicio ya creado, así que el filtro va en la consulta y las
+  // visitas del cronograma aún sin servicio quedan fuera (ver más abajo).
+  const numeroOt = String(numero_ot || '').trim();
+  if (numeroOt) wherePlan.numero_ot = { contains: numeroOt, mode: 'insensitive' };
 
   const wherePlanFecha = { ...wherePlan };
   if (desde || hasta) {
@@ -1599,6 +1604,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         tipo_instancia: 'servicio',
         id_servicio: s.id,
         codigo_servicio: s.codigo,
+        numero_ot: s.numero_ot || null,
         id_plan: s.id_mantenimiento_plan,
         id_cliente: s.id_cliente,
         cliente_nombre: resumen.edificio_nombre || s.cliente?.nombre || null,
@@ -1630,7 +1636,8 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
   //    cada visita pertenece a UN ascensor concreto: el evento por sí solo no
   //    dice a cuál de los ascensores del plan corresponde. Las omitidas
   //    (activo = 0) no son programación vigente y quedan fuera.
-  //    Excepción: para el técnico no aplican (aún no hay servicio ni asignación).
+  //    Excepción: para el técnico no aplican (aún no hay servicio ni asignación),
+  //    ni al buscar por N.º de OT (sin servicio no hay orden de trabajo).
   const whereVisitas = {
     estado: 1,
     activo: 1,
@@ -1649,7 +1656,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
     if (desde) whereVisitas.fecha_programada.gte = parseYMDUTC(desde);
     if (hasta) whereVisitas.fecha_programada.lte = parseYMDUTC(hasta);
   }
-  const visitasPendientes = id_tecnico_filtro
+  const visitasPendientes = (id_tecnico_filtro || numeroOt)
     ? []
     : await prisma.tbl_mantenimientos_programacion.findMany({
         where: whereVisitas,
@@ -1676,6 +1683,7 @@ async function _obtenerInstanciasMantenimiento({ id_plan, ids_cliente, ids_ascen
         tipo_instancia: 'evento_futuro',
         id_servicio: null,
         codigo_servicio: null,
+        numero_ot: null,
         id_evento: v.id_evento,
         id_programacion: v.id,
         numero_mes: v.numero_mes,
@@ -1792,7 +1800,8 @@ async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
  * de los planes activos. Cada fila incluye el estado de ejecución, fechas
  * reales y días de ejecución. Usado por la pestaña "Mantenimientos" del módulo.
  *
- * Filtros opcionales por query: id_plan, id_cliente, id_ascensor, estado_ejecucion, desde, hasta.
+ * Filtros opcionales por query: id_plan, id_cliente, id_ascensor, estado_ejecucion,
+ * desde, hasta, q (buscador libre) y numero_ot (N.º de orden de trabajo).
  *
  * Acepta `page`/`pageSize`. Como las ocurrencias futuras son proyecciones que
  * no existen como filas en la base, el filtrado y el orden ocurren en memoria
@@ -1802,13 +1811,13 @@ async function _obtenerPlanesParaReporte({ ids_cliente, ids_ascensor }) {
  */
 const listarInstancias = async (req, res) => {
   try {
-    const { id_plan, id_cliente, id_ascensor, estado_ejecucion, desde, hasta, q } = req.query;
+    const { id_plan, id_cliente, id_ascensor, estado_ejecucion, desde, hasta, q, numero_ot } = req.query;
     const ids_cliente = _normalizarIds(id_cliente);
     const ids_ascensor = _normalizarIds(id_ascensor);
     const id_tecnico_filtro = idTecnicoFiltro(req.user);
     const todas = await _obtenerInstanciasMantenimiento({
       id_plan: id_plan ? Number(id_plan) : null,
-      ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q,
+      ids_cliente, ids_ascensor, estado_ejecucion, desde, hasta, q, numero_ot,
       id_tecnico_filtro
     });
     const resultado = paginarArray(todas, req.query);
