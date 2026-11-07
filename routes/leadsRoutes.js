@@ -17,6 +17,8 @@ router.use(verificarToken);
 // Los roles permitidos salen de utils/accesoLeads (SSoT del módulo). El alcance
 // POR LEAD (la Vendedora solo opera los suyos) lo aplica el controlador.
 router.get('/', permitirRoles(...ROLES_LECTURA_LEAD), c.listar);
+// Excel del listado: mismos roles y mismo alcance que la lista.
+router.get('/exportar', permitirRoles(...ROLES_LECTURA_LEAD), c.exportar);
 router.get('/vendedores', permitirRoles(...ROLES_LECTURA_LEAD), c.listarVendedores);
 // Catálogo de personas asignables (rutas ANTES de '/:id' para que no las capture).
 router.get('/asignables', permitirRoles(...ROLES_LECTURA_LEAD), c.listarAsignables);

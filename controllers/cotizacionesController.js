@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { paginar } = require('../utils/paginacion');
 const { parseYMDLima, parseYMDFinDiaLima, inicioDelDiaLima, ymdLima } = require('../utils/tiempo');
-const { generarCodigoCotizacion } = require('../utils/codigoCotizacion');
+const { generarCodigoCotizacion, whereNumeroCotizacion } = require('../utils/codigoCotizacion');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const {
@@ -240,7 +240,7 @@ function condicionRangoFechas({ estado_global, desde, hasta }) {
 // los mismos filtros activos (incluidos "Mostrar anuladas" y el ámbito del
 // usuario). Antes la exportación tenía su propia copia y se había desalineado.
 function construirWhereCotizaciones(query, user) {
-  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
+  const { q, numero, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
   const mostrarAnuladas = incluir_anuladas === '1' || incluir_anuladas === 'true';
 
   const and = [];
@@ -262,6 +262,9 @@ function construirWhereCotizaciones(query, user) {
     // Código de servicio generado por la cotización (cuando ya fue aprobada)
     { servicios: { some: { estado: 1, codigo: { contains: q, mode: 'insensitive' } } } }
   ] });
+  // Buscador por N.º de cotización (número exacto del correlativo).
+  const condNumero = whereNumeroCotizacion(numero);
+  if (condNumero) and.push(condNumero);
   // El filtro de estado no siempre es una igualdad: algunos valores arrastran
   // las fases posteriores del ciclo (ver EXPANSION_FILTRO_GLOBAL). Sin esto
   // una cotización aceptada desaparecía del filtro 'Aceptado' apenas su
@@ -2254,12 +2257,13 @@ const ymdADmy = (ymd) => (ymd ? String(ymd).split('-').reverse().join('/') : '�
 // sabe qué recorte del listado contiene. Mismos parámetros que
 // construirWhereCotizaciones; los ids se traducen a nombres.
 async function describirFiltrosCotizaciones(query) {
-  const { q, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
+  const { q, numero, estado_global, id_cliente, id_ascensor, id_tipo_servicio, desde, hasta, incluir_anuladas } = query;
   const partes = [];
   if (id_tipo_servicio) {
     partes.push(`Tipo de servicio: ${await nombrePorId('tbl_tipos_servicio', id_tipo_servicio, 'nombre') || id_tipo_servicio}`);
   }
   if (q) partes.push(`Búsqueda: «${q}»`);
+  if (String(numero || '').trim()) partes.push(`N.º de cotización: ${String(numero).trim()}`);
   if (estado_global) {
     const virtual = FILTROS_GLOBALES.find(f => f.valor === estado_global);
     partes.push(`Estado: ${virtual?.etiqueta || ETIQUETAS_FILTRO_GLOBAL[estado_global] || estado_global}`);

@@ -4,7 +4,7 @@ const { puedeVerFinanzasReq } = require('../utils/visibilidadFinanzas');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const { datosSitioParaServicio } = require('../utils/datosSitioAscensor');
 const { paginar } = require('../utils/paginacion');
-const { parseYMDLima, combinarFechaHoraLima } = require('../utils/tiempo');
+const { parseYMDLima, combinarFechaHoraLima, ymdLima } = require('../utils/tiempo');
 const { colorPorTipo } = require('../utils/visibilidadCalendario');
 const { sincronizarRecordatorioServicio } = require('../utils/recordatoriosAuto');
 const { replicarEnModulo } = require('../utils/replicarEnModulo');
@@ -235,45 +235,51 @@ function construirWhereLeads(query) {
   return where;
 }
 
+// Relaciones de cada fila del listado (las comparten la tabla y la exportación).
+const INCLUDE_LISTA = {
+  cliente: true,
+  tipo_servicio: { include: { padre: { select: { id: true, nombre: true } } } },
+  ubigeo: true,
+  tipo_ascensor: { select: { id: true, nombre: true } },
+  usuario_registrador: { select: { id: true, nombres: true } },
+  vendedor: { select: { id: true, nombres: true } },
+  // Solo el CONTADOR de documentos: la tabla pinta un chip con el
+  // número y el detalle se pide al abrir el modal.
+  _count: COUNT_DOCUMENTOS
+};
+
+// Resuelve el nombre amigable del rol histórico desde tbl_roles para no
+// hardcodear etiquetas en el frontend. Devuelve filas nuevas con
+// `rol_nombre_registrador`.
+async function conNombreRolRegistrador(leads) {
+  const codigosRol = [...new Set(
+    leads.map(l => l.rol_codigo_registrador).filter(Boolean)
+  )];
+  const rolesMap = codigosRol.length === 0
+    ? new Map()
+    : new Map((await prisma.tbl_roles.findMany({
+        where: { codigo: { in: codigosRol } },
+        select: { codigo: true, nombre: true }
+      })).map(r => [r.codigo, r.nombre]));
+
+  return leads.map(l => ({
+    ...l,
+    rol_nombre_registrador: l.rol_codigo_registrador ? (rolesMap.get(l.rol_codigo_registrador) || l.rol_codigo_registrador) : null
+  }));
+}
+
 const listar = async (req, res) => {
   try {
     // Alcance por usuario: la Vendedora solo ve los leads que tiene asignados.
     const where = conAlcance(construirWhereLeads(req.query), leadAlcanceWhere(req.user));
     const result = await paginar(
       prisma.tbl_leads,
-      {
-        where,
-        orderBy: { id: 'desc' },
-        include: {
-          cliente: true,
-          tipo_servicio: true,
-          ubigeo: true,
-          tipo_ascensor: { select: { id: true, nombre: true } },
-          usuario_registrador: { select: { id: true, nombres: true } },
-          vendedor: { select: { id: true, nombres: true } },
-          // Solo el CONTADOR de documentos: la tabla pinta un chip con el
-          // número y el detalle se pide al abrir el modal.
-          _count: COUNT_DOCUMENTOS
-        }
-      },
+      { where, orderBy: { id: 'desc' }, include: INCLUDE_LISTA },
       req.query
     );
 
-    // Resolver el nombre amigable del rol histórico desde tbl_roles para no
-    // hardcodear etiquetas en el frontend.
-    const codigosRol = [...new Set(
-      result.data.map(l => l.rol_codigo_registrador).filter(Boolean)
-    )];
-    const rolesMap = codigosRol.length === 0
-      ? new Map()
-      : new Map((await prisma.tbl_roles.findMany({
-          where: { codigo: { in: codigosRol } },
-          select: { codigo: true, nombre: true }
-        })).map(r => [r.codigo, r.nombre]));
-
-    const data = result.data.map(l => ({
+    const data = (await conNombreRolRegistrador(result.data)).map(l => ({
       ...l,
-      rol_nombre_registrador: l.rol_codigo_registrador ? (rolesMap.get(l.rol_codigo_registrador) || l.rol_codigo_registrador) : null,
       // El límite viaja con cada fila para que el frontend no lo hardcodee.
       ediciones_max: LIMITE_EDICIONES_LEAD
     }));
@@ -281,6 +287,53 @@ const listar = async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al listar leads' });
+  }
+};
+
+// Filtros activos en palabras, para la cabecera del Excel: quien abra el archivo
+// sabe qué recorte del listado contiene. Mismos parámetros que
+// construirWhereLeads; los ids se traducen a nombres.
+async function describirFiltrosLeads(query) {
+  const { q, id_vendedor, provincia, codigo_ubigeo, id_padre, buen_pagador } = query;
+  const partes = [];
+  if (id_padre === 'sin') partes.push('Tipo de servicio: Sin clasificar');
+  else if (Number(id_padre) > 0) {
+    const padre = await prisma.tbl_tipos_servicio.findUnique({ where: { id: Number(id_padre) }, select: { nombre: true } });
+    partes.push(`Tipo de servicio: ${padre?.nombre || id_padre}`);
+  }
+  if ((q || '').trim()) partes.push(`Búsqueda: «${q.trim()}»`);
+  if (Number(id_vendedor) > 0) {
+    const vendedor = await prisma.tbl_usuarios.findUnique({ where: { id: Number(id_vendedor) }, select: { nombres: true } });
+    partes.push(`Vendedora: ${vendedor?.nombres?.trim() || id_vendedor}`);
+  }
+  if (codigo_ubigeo) {
+    const ubigeo = await prisma.tbl_ubigeo_peru.findUnique({ where: { codigo: String(codigo_ubigeo) } });
+    partes.push(`Ubicación: ${ubigeo ? `${ubigeo.distrito}, ${ubigeo.provincia}` : codigo_ubigeo}`);
+  } else if (provincia) {
+    partes.push(`Provincia: ${provincia}`);
+  }
+  if (buen_pagador && esBuenPagadorValido(buen_pagador)) partes.push(`Ref. de pago: ${buen_pagador}`);
+  return partes;
+}
+
+// Excel del listado con los mismos filtros y el mismo alcance que la tabla
+// (la Vendedora solo exporta sus leads): trae el conjunto completo, sin paginar.
+const exportar = async (req, res) => {
+  try {
+    const where = conAlcance(construirWhereLeads(req.query), leadAlcanceWhere(req.user));
+    const [leads, filtros] = await Promise.all([
+      prisma.tbl_leads.findMany({ where, orderBy: { id: 'desc' }, include: INCLUDE_LISTA }),
+      describirFiltrosLeads(req.query)
+    ]);
+
+    const { generarExcelLeads } = require('../utils/leadsExport');
+    const buffer = await generarExcelLeads(await conNombreRolRegistrador(leads), { filtros });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="leads-${ymdLima()}.xlsx"`);
+    return res.end(buffer);
+  } catch (err) {
+    console.error('[leads.exportar]', err);
+    res.status(500).json({ error: 'Error al exportar leads: ' + err.message });
   }
 };
 
@@ -901,7 +954,7 @@ const listarAsignables = async (_req, res) => {
 };
 
 module.exports = {
-  listar, crear, actualizar, historial, convertir, cambiarEstado,
+  listar, exportar, crear, actualizar, historial, convertir, cambiarEstado,
   verificarDuplicados, listarAsignables,
   listarCotizaciones, subirCotizacion,
   listarDocumentos, agregarDocumentos, eliminarDocumento,

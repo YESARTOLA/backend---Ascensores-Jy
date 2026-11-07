@@ -19,4 +19,22 @@ async function generarCodigoCotizacion() {
   return `COT-${anio}-${String(ultimoNum + 1).padStart(6, '0')}`;
 }
 
-module.exports = { generarCodigoCotizacion };
+/**
+ * Condición Prisma del buscador por N.º de cotización. Acepta el número suelto
+ * ("393", "000393"), con año ("2026-393") o el código completo
+ * ("COT-2026-000393"). El número se compara EXACTO contra el correlativo y no
+ * con `contains`: "39" no debe traer la 000393, ni "20" todas las del 2026.
+ * Sin año trae ese número en todos los años. Cualquier otro texto (p.ej. el
+ * código a medio escribir, "COT-2026") busca dentro del código.
+ */
+function whereNumeroCotizacion(texto) {
+  const t = String(texto || '').trim();
+  if (!t) return null;
+  const correlativo = (n) => String(Number(n)).padStart(6, '0');
+  if (/^\d+$/.test(t)) return { codigo: { endsWith: `-${correlativo(t)}` } };
+  const conAnio = t.match(/^(?:COT)?-?(\d{4})-(\d+)$/i);
+  if (conAnio) return { codigo: `COT-${conAnio[1]}-${correlativo(conAnio[2])}` };
+  return { codigo: { contains: t, mode: 'insensitive' } };
+}
+
+module.exports = { generarCodigoCotizacion, whereNumeroCotizacion };

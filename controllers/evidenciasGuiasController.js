@@ -223,6 +223,38 @@ const actualizarEvidencia = async (req, res) => {
   }
 };
 
+// Lo que se carga de una evidencia para decidir si se puede eliminar (y para
+// dejarla entera en la auditoría).
+const INCLUDE_ELIMINAR = {
+  archivo: true,
+  servicio: {
+    select: {
+      estado_servicio: true,
+      asignaciones: { where: { estado: 1 }, select: { id_tecnico: true } }
+    }
+  }
+};
+
+/**
+ * Regla única para eliminar una evidencia, compartida por el borrado de una
+ * foto y el masivo. Devuelve { status, error } si no se puede, o null.
+ */
+function motivoBloqueoEliminar(user, previa) {
+  // Si otro rol pudiera borrarlas, el control de la sección sería aparente.
+  const bloqueoSeccion = motivoBloqueoCoordinacion(user, previa.momento, 'eliminar evidencias');
+  if (bloqueoSeccion) return { status: 403, error: bloqueoSeccion };
+  if (esRolGestion(user)) {
+    const bloqueo = motivoBloqueo(user, previa.servicio, 'eliminar evidencias');
+    if (bloqueo) return { status: 400, error: bloqueo };
+  } else if (!tecnicoAsignado(user, previa.servicio?.asignaciones)) {
+    // Foto del expediente de otro ascensor.
+    return { status: 404, error: 'Evidencia no encontrada' };
+  } else if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
+    return { status: 400, error: `El servicio está ${previa.servicio.estado_servicio}: no se puede eliminar evidencias` };
+  }
+  return null;
+}
+
 const eliminarEvidencia = async (req, res) => {
   try {
     // Coordinación revisa el material antes de pasarlo a Administración, así que
@@ -233,30 +265,12 @@ const eliminarEvidencia = async (req, res) => {
     const id = Number(req.params.id);
     const previa = await prisma.tbl_servicios_evidencias.findUnique({
       where: { id },
-      include: {
-        archivo: true,
-        servicio: {
-          select: {
-            estado_servicio: true,
-            asignaciones: { where: { estado: 1 }, select: { id_tecnico: true } }
-          }
-        }
-      }
+      include: INCLUDE_ELIMINAR
     });
     if (!previa) return res.status(404).json({ error: 'Evidencia no encontrada' });
     if (previa.estado === 0) return res.status(400).json({ error: 'Evidencia ya eliminada' });
-    // Si otro rol pudiera borrarlas, el control de la sección sería aparente.
-    const bloqueoSeccion = motivoBloqueoCoordinacion(req.user, previa.momento, 'eliminar evidencias');
-    if (bloqueoSeccion) return res.status(403).json({ error: bloqueoSeccion });
-    if (esRolGestion(req.user)) {
-      const bloqueo = motivoBloqueo(req.user, previa.servicio, 'eliminar evidencias');
-      if (bloqueo) return res.status(400).json({ error: bloqueo });
-    } else if (!tecnicoAsignado(req.user, previa.servicio?.asignaciones)) {
-      // Foto del expediente de otro ascensor.
-      return res.status(404).json({ error: 'Evidencia no encontrada' });
-    } else if (estaServicioFinalizado(previa.servicio?.estado_servicio)) {
-      return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se puede eliminar evidencias` });
-    }
+    const bloqueo = motivoBloqueoEliminar(req.user, previa);
+    if (bloqueo) return res.status(bloqueo.status).json({ error: bloqueo.error });
 
     await prisma.tbl_servicios_evidencias.update({
       where: { id },
@@ -273,4 +287,53 @@ const eliminarEvidencia = async (req, res) => {
   }
 };
 
-module.exports = { subirEvidencia, listarEvidencias, actualizarEvidencia, eliminarEvidencia };
+/**
+ * Borrado masivo: varias evidencias de UN servicio en una sola operación
+ * (body `{ ids: [...] }`). Se aplica la misma regla que al borrar una foto, y
+ * es todo o nada: si alguna no se puede eliminar no se elimina ninguna, para
+ * que la selección no quede a medias sin que el usuario sepa cuáles se fueron.
+ * Las que ya estaban eliminadas (otra persona se adelantó) se omiten.
+ */
+const eliminarEvidenciasLote = async (req, res) => {
+  try {
+    if (!esRolGestion(req.user) && req.user.rol_codigo !== 'tecnico') {
+      return res.status(403).json({ error: 'No tiene permiso para eliminar evidencias' });
+    }
+    const id_servicio = Number(req.params.id);
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(Number))];
+    if (!ids.length || ids.some(id => !Number.isInteger(id) || id <= 0)) {
+      return res.status(400).json({ error: 'Indique las evidencias a eliminar' });
+    }
+    const previas = await prisma.tbl_servicios_evidencias.findMany({
+      where: { id: { in: ids }, id_servicio },
+      include: INCLUDE_ELIMINAR
+    });
+    // Un id de otro servicio se trata como inexistente, igual que en el borrado de una.
+    if (previas.length !== ids.length) return res.status(404).json({ error: 'Evidencia no encontrada' });
+    const vigentes = previas.filter(ev => ev.estado !== 0);
+    for (const previa of vigentes) {
+      const bloqueo = motivoBloqueoEliminar(req.user, previa);
+      if (bloqueo) return res.status(bloqueo.status).json({ error: bloqueo.error });
+    }
+
+    if (vigentes.length) {
+      await prisma.tbl_servicios_evidencias.updateMany({
+        where: { id: { in: vigentes.map(ev => ev.id) }, estado: 1 },
+        data: { estado: 0, user_id_modification: req.user.id, date_time_modification: new Date() }
+      });
+      for (const previa of vigentes) {
+        // eslint-disable-next-line no-await-in-loop
+        await registrarAuditoria({
+          id_usuario: req.user.id, entidad: 'tbl_servicios_evidencias', id_entidad: previa.id,
+          accion: 'DELETE', valor_anterior: previa, ip: req.ip
+        });
+      }
+    }
+    res.json({ ok: true, eliminadas: vigentes.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar evidencias' });
+  }
+};
+
+module.exports = { subirEvidencia, listarEvidencias, actualizarEvidencia, eliminarEvidencia, eliminarEvidenciasLote };
