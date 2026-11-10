@@ -36,8 +36,12 @@ const {
   tipoDocumentoValido,
   descripcionDocumento,
   vincularDocumentosEnTx,
+  idsArchivoUnicos,
+  vincularComprobantesEnTx,
+  promoverComprobanteEnTx,
   bajaDocumentosDeFacturasEnTx
 } = require('../utils/documentosFactura');
+const { normalizarNumerosOperacion, mismosNumerosOperacion } = require('../utils/numerosOperacion');
 
 // Las dos situaciones que Facturas presenta como indicadores y como filtro
 // rápido de la cabecera. Valores admitidos por el parámetro `situacion`.
@@ -164,6 +168,23 @@ function resumirFacturas(analizadas) {
   return { facturado: aSalida(facturado), pendiente: aSalida(pendiente) };
 }
 
+/**
+ * Facturas vivas con algún N° de operación que contenga `texto` (sin
+ * distinguir mayúsculas). Es una columna de lista (text[]), que el filtro de
+ * Prisma solo sabe comparar entera; contabilidad suele buscar por los últimos
+ * dígitos del voucher, así que el recorte parcial va en SQL.
+ */
+async function idsFacturasPorNumeroOperacion(texto) {
+  const t = String(texto || '').trim();
+  if (!t) return [];
+  const patron = `%${t.replace(/[\\%_]/g, '\\$&')}%`;
+  const filas = await prisma.$queryRaw`
+    SELECT f.id FROM tbl_facturas f
+    WHERE f.estado = 1
+      AND EXISTS (SELECT 1 FROM unnest(f.numeros_operacion) AS n WHERE n ILIKE ${patron})`;
+  return filas.map(f => Number(f.id));
+}
+
 const listar = async (req, res) => {
   try {
     const {
@@ -193,8 +214,11 @@ const listar = async (req, res) => {
       if (desde) where.fecha_emision.gte = parseYMDUTC(desde);
       if (hasta) where.fecha_emision.lte = parseYMDUTC(hasta);
     }
+    const idsPorOperacion = q ? await idsFacturasPorNumeroOperacion(q) : [];
     if (q) and.push({ OR: [
       { numero_factura: { contains: q, mode: 'insensitive' } },
+      // N° de operación de los pagos de la factura (voucher, transferencia).
+      ...(idsPorOperacion.length ? [{ id: { in: idsPorOperacion } }] : []),
       { cliente: { nombre: { contains: q, mode: 'insensitive' } } },
       // RUC / DNI del cliente: contabilidad busca por documento tanto como por nombre.
       { cliente: { numero_documento: { contains: q, mode: 'insensitive' } } },
@@ -415,11 +439,28 @@ async function sincronizarServiciosDelPlan(idPlan, idUsuario) {
 }
 
 /**
+ * Archivos de una factura recién creada: los del comprobante —`archivos` (ids,
+ * tantos como hagan falta) y el `id_archivo` único que mandaban los clientes
+ * anteriores— y los documentos adicionales con su tipo (`documentos`).
+ * Devuelve la factura con el id_archivo con que quedó.
+ */
+async function vincularArchivosDeFacturaNuevaEnTx(tx, creada, d, idUsuario) {
+  const { principal } = await vincularComprobantesEnTx(
+    tx,
+    creada,
+    idsArchivoUnicos([d.id_archivo, ...(Array.isArray(d.archivos) ? d.archivos : [])]),
+    idUsuario
+  );
+  await vincularDocumentosEnTx(tx, creada.id, d.documentos, idUsuario);
+  return { ...creada, id_archivo: principal };
+}
+
+/**
  * Crea una factura para el cobro ÚNICO de un plan de mantenimiento (sin servicio).
  * El plan se factura una sola vez por el total; admite factura general o por cuota,
  * con las mismas reglas de exclusividad que las facturas por servicio.
  */
-async function _crearFacturaPlan(req, res, d, tipoComprobante) {
+async function _crearFacturaPlan(req, res, d, tipoComprobante, numerosOperacion) {
   const idPlan = Number(d.id_mantenimiento_plan);
   const plan = await prisma.tbl_mantenimientos_planes.findUnique({
     where: { id: idPlan }, include: { cobro: true }
@@ -441,8 +482,8 @@ async function _crearFacturaPlan(req, res, d, tipoComprobante) {
 
   const estadoFacturaInicial = d.estado_factura && esEstadoFacturaValido(d.estado_factura)
     ? d.estado_factura : ESTADO_FACTURA_EMITIDA;
-  // La factura y sus documentos adicionales se registran juntos: si un
-  // documento no es válido, no queda una factura a medias.
+  // La factura, los archivos de su comprobante y sus documentos adicionales se
+  // registran juntos: si un documento no es válido, no queda una factura a medias.
   const factura = await prisma.$transaction(async (tx) => {
     const creada = await tx.tbl_facturas.create({
       data: {
@@ -455,14 +496,13 @@ async function _crearFacturaPlan(req, res, d, tipoComprobante) {
         numero_factura: d.numero_factura,
         fecha_emision: parseYMDLima(d.fecha_emision),
         monto: d.monto,
-        id_archivo: d.id_archivo || null,
+        numeros_operacion: numerosOperacion,
         estado_factura: estadoFacturaInicial,
         registrado_por: req.user.id,
         user_id_registration: req.user.id
       }
     });
-    await vincularDocumentosEnTx(tx, creada.id, d.documentos, req.user.id);
-    return creada;
+    return vincularArchivosDeFacturaNuevaEnTx(tx, creada, d, req.user.id);
   });
   await registrarAuditoria({
     id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'CREATE', valor_nuevo: factura, ip: req.ip
@@ -490,9 +530,11 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: `Tipo de comprobante inválido. Valores permitidos: ${TIPOS_COMPROBANTE_CODIGOS.join(', ')}` });
     }
     const tipoComprobante = normalizarTipoComprobante(d.tipo_comprobante);
+    // Varios N° de operación: la factura puede cobrarse en más de un pago.
+    const numerosOperacion = normalizarNumerosOperacion(d.numeros_operacion);
     // Factura de plan de mantenimiento (cobro único del plan, sin servicio).
     if (d.id_mantenimiento_plan) {
-      return await _crearFacturaPlan(req, res, d, tipoComprobante);
+      return await _crearFacturaPlan(req, res, d, tipoComprobante, numerosOperacion);
     }
     if (!d.id_servicio) {
       return res.status(400).json({ error: 'Servicio (o plan de mantenimiento) es obligatorio' });
@@ -563,8 +605,8 @@ const crear = async (req, res) => {
       ? d.estado_factura
       : ESTADO_FACTURA_EMITIDA;
 
-    // La factura y sus documentos adicionales se registran juntos: si un
-    // documento no es válido, no queda una factura a medias.
+    // La factura, los archivos de su comprobante y sus documentos adicionales
+    // se registran juntos: si un documento no es válido, no queda una factura a medias.
     const factura = await prisma.$transaction(async (tx) => {
       const creada = await tx.tbl_facturas.create({
         data: {
@@ -576,14 +618,13 @@ const crear = async (req, res) => {
           numero_factura: d.numero_factura,
           fecha_emision: parseYMDLima(d.fecha_emision),
           monto: d.monto,
-          id_archivo: d.id_archivo || null,
+          numeros_operacion: numerosOperacion,
           estado_factura: estadoFacturaInicial,
           registrado_por: req.user.id,
           user_id_registration: req.user.id
         }
       });
-      await vincularDocumentosEnTx(tx, creada.id, d.documentos, req.user.id);
-      return creada;
+      return vincularArchivosDeFacturaNuevaEnTx(tx, creada, d, req.user.id);
     });
 
     // Recalcular estado_facturacion agregado vía helper centralizado.
@@ -845,6 +886,7 @@ async function archivoActivo(idArchivo) {
  */
 async function cambiarComprobante(factura, idArchivoNuevo, idUsuario, ip) {
   let key = null;
+  let idArchivoFinal = idArchivoNuevo;
   await prisma.$transaction(async (tx) => {
     const r = await tx.tbl_facturas.updateMany({
       where: { id: factura.id, estado: 1, id_archivo: factura.id_archivo },
@@ -852,13 +894,44 @@ async function cambiarComprobante(factura, idArchivoNuevo, idUsuario, ip) {
     });
     if (r.count === 0) throw errorHttp('El comprobante de la factura cambió mientras tanto. Vuelve a abrirla.', 409);
     key = await bajaArchivoEnTx(tx, factura.id_archivo, idUsuario);
+    // Al quitar el archivo principal, si el comprobante tiene otros, el
+    // siguiente ocupa su lugar.
+    if (idArchivoNuevo === null) idArchivoFinal = await promoverComprobanteEnTx(tx, factura.id, idUsuario);
   });
   await purgarObjetosWasabi([key]);
   await registrarAuditoria({
     id_usuario: idUsuario, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'UPDATE',
-    valor_anterior: { id_archivo: factura.id_archivo }, valor_nuevo: { id_archivo: idArchivoNuevo }, ip
+    valor_anterior: { id_archivo: factura.id_archivo }, valor_nuevo: { id_archivo: idArchivoFinal }, ip
   });
 }
+
+/**
+ * Agrega uno o varios archivos al comprobante de la factura (sin límite
+ * práctico). Body: { archivos: [id_archivo, …] }. Si la factura no tenía
+ * comprobante, el primero pasa a ser el principal.
+ */
+const agregarComprobantes = async (req, res) => {
+  try {
+    const factura = await facturaVigente(Number(req.params.id));
+    if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+    const ids = idsArchivoUnicos(req.body?.archivos);
+    if (ids.length === 0) return res.status(400).json({ error: 'No se recibió ningún archivo' });
+    const r = await prisma.$transaction(tx => vincularComprobantesEnTx(tx, factura, ids, req.user.id));
+    if (r.agregados.length === 0) return res.status(400).json({ error: 'No se recibió ningún archivo válido' });
+
+    await registrarAuditoria({
+      id_usuario: req.user.id, entidad: 'tbl_facturas', id_entidad: factura.id, accion: 'UPDATE',
+      valor_anterior: { id_archivo: factura.id_archivo },
+      valor_nuevo: { id_archivo: r.principal, archivos_comprobante_agregados: r.agregados },
+      ip: req.ip
+    });
+    res.status(201).json(await respuestaDocumentos(await facturaVigente(factura.id)));
+  } catch (err) {
+    if (err.codigoHttp) return res.status(err.codigoHttp).json({ error: err.message });
+    console.error('[facturas.agregarComprobantes]', err);
+    res.status(500).json({ error: 'Error al agregar los archivos de la factura' });
+  }
+};
 
 /** Adjunta el comprobante a la factura o REEMPLAZA el que tiene. */
 const adjuntarComprobante = async (req, res) => {
@@ -878,7 +951,10 @@ const adjuntarComprobante = async (req, res) => {
   }
 };
 
-/** Quita el comprobante de la factura (la factura queda registrada sin archivo). */
+/**
+ * Quita el archivo principal del comprobante. Si había otros, el siguiente pasa
+ * a ser el principal; si no, la factura queda registrada sin archivo.
+ */
 const quitarComprobante = async (req, res) => {
   try {
     const factura = await facturaVigente(Number(req.params.id));
@@ -1121,6 +1197,7 @@ const contextoEdicion = async (req, res) => {
           monto: f.monto,
           id_cuota: f.id_cuota,
           numero_cuota: f.cuota?.numero_cuota ?? null,
+          numeros_operacion: f.numeros_operacion || [],
           estado_factura: f.estado_factura,
           es_plan: !f.id_servicio && !!f.id_mantenimiento_plan
         },
@@ -1139,13 +1216,15 @@ const contextoEdicion = async (req, res) => {
 function mismoValor(campo, anterior, nuevo) {
   if (campo === 'monto') return Math.round(Number(anterior) * 100) === Math.round(Number(nuevo) * 100);
   if (campo === 'fecha_emision') return ymdDeFecha(anterior) === ymdDeFecha(nuevo);
+  if (campo === 'numeros_operacion') return mismosNumerosOperacion(anterior, nuevo);
   return anterior === nuevo;
 }
 
 /**
  * Edita los datos de una factura. Body (todo opcional; lo que no viene no
  * cambia): { tipo_comprobante, numero_factura, fecha_emision, monto, id_cuota,
- * estado_factura }.
+ * estado_factura, numeros_operacion }. `numeros_operacion` es la lista
+ * completa que debe quedar.
  *
  * Solo se valida lo que cambia: corregir el número de una factura antigua no
  * tropieza con una regla de monto que entonces no existía. Una factura ANULADA
@@ -1186,6 +1265,9 @@ const actualizar = async (req, res) => {
       const idCuota = d.id_cuota === null || d.id_cuota === '' ? null : Number(d.id_cuota);
       if (idCuota !== null && (!Number.isInteger(idCuota) || idCuota <= 0)) return res.status(400).json({ error: 'Cuota inválida' });
       data.id_cuota = idCuota;
+    }
+    if (d.numeros_operacion !== undefined) {
+      data.numeros_operacion = normalizarNumerosOperacion(d.numeros_operacion);
     }
     if (d.estado_factura !== undefined) {
       if (!esEstadoFacturaValido(d.estado_factura)) {
@@ -1250,5 +1332,5 @@ const actualizar = async (req, res) => {
 module.exports = {
   listar, obtener, crear, cambiarEstado, eliminar, actualizar, contextoEdicion,
   listarDocumentos, agregarDocumentos, editarDocumento, eliminarDocumento,
-  adjuntarComprobante, quitarComprobante
+  adjuntarComprobante, quitarComprobante, agregarComprobantes
 };

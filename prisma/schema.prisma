@@ -1317,6 +1317,10 @@ model tbl_facturas {
   fecha_emision          DateTime                   @db.Date
   monto                  Decimal                    @db.Decimal(12, 2)
   id_archivo             Int?
+  // N° de operación de los pagos de la factura (transferencia, depósito…).
+  // Varios: una misma factura puede cobrarse en más de un pago. Normalización
+  // en utils/numerosOperacion.js.
+  numeros_operacion      String[]                   @default([])
   estado_factura         String                     @default("Emitida") @db.VarChar(30)
   registrado_por         Int?
   estado                 Int                        @default(1)
@@ -1329,9 +1333,10 @@ model tbl_facturas {
   cobro                  tbl_cobros?                @relation(fields: [id_cobro], references: [id])
   cuota                  tbl_cobros_cuotas?         @relation(fields: [id_cuota], references: [id])
   cliente                tbl_clientes               @relation(fields: [id_cliente], references: [id])
-  // `archivo` es el comprobante en sí (PDF de la factura/boleta). Los demás
-  // documentos de la factura (constancia de detracción, de pago, XML/CDR…)
-  // van en `documentos`.
+  // `archivo` es el comprobante en sí (PDF de la factura/boleta). Si el
+  // comprobante trae más de un archivo, los demás van en `documentos` con tipo
+  // 'Comprobante'; el resto de documentos (constancia de detracción, de pago,
+  // XML/CDR…) también va en `documentos`, con su tipo.
   archivo                tbl_archivos?              @relation(fields: [id_archivo], references: [id])
   documentos             tbl_facturas_archivos[]
 

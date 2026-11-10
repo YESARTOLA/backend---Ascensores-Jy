@@ -24,5 +24,7 @@ router.patch('/:id/documentos/:idDocumento', c.editarDocumento);
 router.delete('/:id/documentos/:idDocumento', c.eliminarDocumento);
 router.patch('/:id/comprobante', c.adjuntarComprobante);
 router.delete('/:id/comprobante', c.quitarComprobante);
+// Más archivos del comprobante (varios a la vez, sin límite práctico).
+router.post('/:id/comprobantes', c.agregarComprobantes);
 
 module.exports = router;

@@ -7,6 +7,12 @@
  * detracción, de retención, de pago, el XML/CDR de SUNAT, etc. Cada uno lleva su
  * tipo, para encontrarlo sin abrir archivo por archivo.
  *
+ * Si el comprobante mismo viene en más de un archivo (la factura en PDF más su
+ * representación impresa, varias páginas escaneadas…), el primero queda en
+ * tbl_facturas.id_archivo y los demás aquí con tipo 'Comprobante'
+ * (`vincularComprobantesEnTx`). La UI los muestra juntos como «Archivos de la
+ * factura» y deja ese tipo fuera del selector de documentos adicionales.
+ *
  * Este módulo concentra el catálogo de tipos y el comportamiento de los
  * documentos (vincular, dar de baja en cascada). Catálogo espejo en
  * frontend/src/utils/catalogosDocumentoFactura.js — mantener en sincronía.
@@ -15,6 +21,8 @@
  */
 
 const TIPO_DOCUMENTO_FACTURA_OTRO = 'Otro';
+/** Archivo adicional del propio comprobante (ver cabecera). */
+const TIPO_DOCUMENTO_COMPROBANTE = 'Comprobante';
 
 const TIPOS_DOCUMENTO_FACTURA = [
   { codigo: 'Constancia de detracción', etiqueta: 'Constancia de detracción' },
@@ -23,13 +31,18 @@ const TIPOS_DOCUMENTO_FACTURA = [
   { codigo: 'XML / CDR',                etiqueta: 'XML / CDR (SUNAT)' },
   { codigo: 'Guía de remisión',         etiqueta: 'Guía de remisión' },
   { codigo: 'Orden de compra',          etiqueta: 'Orden de compra' },
-  { codigo: TIPO_DOCUMENTO_FACTURA_OTRO, etiqueta: 'Otro' }
+  { codigo: TIPO_DOCUMENTO_FACTURA_OTRO, etiqueta: 'Otro' },
+  { codigo: TIPO_DOCUMENTO_COMPROBANTE, etiqueta: 'Comprobante (archivo de la factura)' }
 ];
 
 const TIPOS_DOCUMENTO_FACTURA_CODIGOS = TIPOS_DOCUMENTO_FACTURA.map(t => t.codigo);
 
-/** Tope de documentos adicionales por factura. Configurable por entorno. */
-const MAX_DOCUMENTOS_FACTURA = Number(process.env.FACTURA_MAX_DOCUMENTOS) || 20;
+/**
+ * Tope de documentos por factura (archivos del comprobante + adicionales). Es
+ * solo una barrera contra cargas desbocadas: en la práctica, ilimitado.
+ * Configurable por entorno.
+ */
+const MAX_DOCUMENTOS_FACTURA = Number(process.env.FACTURA_MAX_DOCUMENTOS) || 500;
 
 /** Campos del archivo que se exponen al frontend (nunca la fila completa). */
 const SELECT_ARCHIVO = {
@@ -153,6 +166,95 @@ async function vincularDocumentosDeEnTx(tx, { modelo, campo, id, max, nombre }, 
   return creados;
 }
 
+/** Ids de archivo: enteros positivos, sin repetir, en el orden recibido. */
+function idsArchivoUnicos(lista) {
+  const vistos = new Set();
+  const ids = [];
+  for (const v of Array.isArray(lista) ? lista : []) {
+    const id = Number(v && typeof v === 'object' ? v.id_archivo ?? v.id : v);
+    if (!Number.isInteger(id) || id <= 0 || vistos.has(id)) continue;
+    vistos.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Agrega archivos al COMPROBANTE de una factura. Si la factura todavía no tiene
+ * comprobante, el primero pasa a tbl_facturas.id_archivo; el resto se vincula
+ * como documentos de tipo 'Comprobante'. Se ignoran los archivos inexistentes o
+ * dados de baja y los que la factura ya tiene.
+ *
+ * @param factura  { id, id_archivo } — tal como está en la base dentro de `tx`
+ * @param idsArchivo  ids de tbl_archivos ya subidos (POST /archivos)
+ * @returns {Promise<{ principal: number|null, agregados: number[] }>}
+ *          `principal` = id_archivo con que queda la factura;
+ *          `agregados` = ids de archivo incorporados (principal incluido si cambió)
+ */
+async function vincularComprobantesEnTx(tx, factura, idsArchivo, idUsuario) {
+  let ids = idsArchivoUnicos(idsArchivo);
+  if (ids.length === 0) return { principal: factura.id_archivo || null, agregados: [] };
+
+  const [existentes, yaVinculados] = await Promise.all([
+    tx.tbl_archivos.findMany({ where: { id: { in: ids }, estado: 1 }, select: { id: true } }),
+    tx.tbl_facturas_archivos.findMany({
+      where: { id_factura: factura.id, estado: 1, id_archivo: { in: ids } },
+      select: { id_archivo: true }
+    })
+  ]);
+  const validos = new Set(existentes.map(a => a.id));
+  const repetidos = new Set(yaVinculados.map(v => v.id_archivo));
+  ids = ids.filter(id => validos.has(id) && !repetidos.has(id) && id !== factura.id_archivo);
+  if (ids.length === 0) return { principal: factura.id_archivo || null, agregados: [] };
+
+  let principal = factura.id_archivo || null;
+  let resto = ids;
+  if (!principal) {
+    // El UPDATE exige que siga sin comprobante: dos cargas simultáneas no
+    // pueden pisarse el archivo principal en silencio.
+    const r = await tx.tbl_facturas.updateMany({
+      where: { id: factura.id, estado: 1, id_archivo: null },
+      data: { id_archivo: ids[0], user_id_modification: idUsuario, date_time_modification: new Date() }
+    });
+    if (r.count === 0) throw errorHttp('El comprobante de la factura cambió mientras tanto. Vuelve a abrirla.', 409);
+    principal = ids[0];
+    resto = ids.slice(1);
+  }
+  await vincularDocumentosEnTx(
+    tx,
+    factura.id,
+    resto.map(id => ({ id_archivo: id, tipo_documento: TIPO_DOCUMENTO_COMPROBANTE })),
+    idUsuario
+  );
+  return { principal, agregados: ids };
+}
+
+/**
+ * La factura se quedó sin su archivo principal (se quitó): si el comprobante
+ * tiene más archivos, el primero pasa a ser el principal, para que la factura
+ * no figure «sin comprobante» teniendo uno. El vínculo se da de baja pero el
+ * archivo NO (sigue en uso, ahora como principal).
+ *
+ * @returns {Promise<number|null>} id_archivo promovido, o null si no había otro
+ */
+async function promoverComprobanteEnTx(tx, idFactura, idUsuario) {
+  const siguiente = await tx.tbl_facturas_archivos.findFirst({
+    where: { id_factura: idFactura, estado: 1, tipo_documento: TIPO_DOCUMENTO_COMPROBANTE },
+    orderBy: [{ orden: 'asc' }, { id: 'asc' }]
+  });
+  if (!siguiente) return null;
+  const ahora = new Date();
+  await tx.tbl_facturas_archivos.update({
+    where: { id: siguiente.id },
+    data: { estado: 0, user_id_modification: idUsuario, date_time_modification: ahora }
+  });
+  await tx.tbl_facturas.update({
+    where: { id: idFactura },
+    data: { id_archivo: siguiente.id_archivo, user_id_modification: idUsuario, date_time_modification: ahora }
+  });
+  return siguiente.id_archivo;
+}
+
 /**
  * Da de baja los documentos adicionales de un conjunto de facturas (cascada de
  * eliminar factura / cobro / servicio / plan / edificio).
@@ -180,6 +282,7 @@ async function bajaDocumentosDeFacturasEnTx(tx, idsFactura, idUsuario) {
 
 module.exports = {
   TIPO_DOCUMENTO_FACTURA_OTRO,
+  TIPO_DOCUMENTO_COMPROBANTE,
   TIPOS_DOCUMENTO_FACTURA,
   TIPOS_DOCUMENTO_FACTURA_CODIGOS,
   MAX_DOCUMENTOS_FACTURA,
@@ -192,5 +295,8 @@ module.exports = {
   normalizarDocumentos,
   vincularDocumentosEnTx,
   vincularDocumentosDeEnTx,
+  idsArchivoUnicos,
+  vincularComprobantesEnTx,
+  promoverComprobanteEnTx,
   bajaDocumentosDeFacturasEnTx
 };

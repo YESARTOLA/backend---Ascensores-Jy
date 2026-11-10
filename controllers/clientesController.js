@@ -13,7 +13,7 @@ const {
   puedeVerTipoRegistro,
   clienteAlcanceWhere,
 } = require('../utils/alcanceUsuario');
-const { INCLUDE_DOCUMENTOS } = require('../utils/documentosFactura');
+const { INCLUDE_DOCUMENTOS, TIPO_DOCUMENTO_COMPROBANTE } = require('../utils/documentosFactura');
 const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { bajaClienteCascadaEnTx, calcularImpactoCliente } = require('../utils/bajaClienteCascada');
 const { whereAscensorVisible } = require('../utils/eliminacionAscensor');
@@ -525,6 +525,8 @@ const vista360 = async (req, res) => {
             { guias: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
             { evidencias: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
             { facturas: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
+            // Los demás archivos del comprobante, cuando trae más de uno.
+            { facturas_documentos: { some: { estado: 1, tipo_documento: TIPO_DOCUMENTO_COMPROBANTE, factura: { id_servicio: { in: idsServicios }, estado: 1 } } } },
             { entregas: { some: { id_servicio: { in: idsServicios }, estado: 1 } } },
             { entregas_documentos: { some: { estado: 1, entrega: { id_servicio: { in: idsServicios }, estado: 1 } } } }
           ]
