@@ -4,7 +4,11 @@
 // vive en utils/fechaServicioContable.js; aquí se usa tal cual.
 //
 //  - Fecha de registro: cuándo se registró la ORDEN DE TRABAJO del servicio
-//    (`ot_subida_en`, la graba serviciosController.guardarOt). Sin OT, no hay.
+//    (`ot_subida_en`, la graba serviciosController.guardarOt). Un CORRECTIVO
+//    que aún no tiene OT se registra para facturar cuando la coordinación
+//    aprueba su cotización (ahí nace el servicio y entra a Contabilidad, y se
+//    puede facturar antes de ejecutarlo): su fecha es esa PRIMERA aprobación.
+//    El resto, sin OT, no tiene.
 //  - Fecha de comprobante (fila de Contabilidad): la emisión del comprobante
 //    que cubre el servicio. Mantenimiento de un plan (modelo mensual): la
 //    factura de su MES (utils/facturacionServiciosPlan.js). Cualquier otro: la
@@ -20,6 +24,7 @@ const { ESTADO_FACTURA_ANULADA } = require('./estadoFactura');
 const { ESTADO_CANCELADO } = require('./ejecucionFechas');
 const { facturacionDeServiciosPlan } = require('./facturacionServiciosPlan');
 const { INCLUDE_HISTORIAL_INICIO, fechaServicioContable } = require('./fechaServicioContable');
+const { ESTADOS_VERSION } = require('./estadoCotizacion');
 
 const WHERE_FACTURA_VIGENTE = { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } };
 const esFacturaVigente = (f) => !!f && f.estado === 1 && f.estado_factura !== ESTADO_FACTURA_ANULADA;
@@ -37,20 +42,71 @@ const diaEnRango = (dia, { desde, hasta }) => !!dia
 
 const hayRango = (rango) => !!(rango && (rango.desde || rango.hasta));
 
-// --- Fecha de registro (OT) -------------------------------------------------
+// --- Fecha de registro (OT o aprobación del correctivo) ---------------------
 
-const fechaRegistroOt = (servicio) => servicio?.ot_subida_en || null;
+const MODULO_CORRECTIVO = 'correctivo';
+
+// Versiones que cuentan como aprobación: las mismas que el filtro
+// "Aprobación de cotización" (whereAprobadaEnRango).
+const WHERE_VERSION_APROBADA = { estado: 1, estado_version: ESTADOS_VERSION.APROBADO };
+
+// Relaciones del servicio que necesita `fechaRegistroContable` además de
+// `ot_subida_en`: el módulo de su tipo y la PRIMERA aprobación de su cotización
+// (una re-aprobación cambia montos, no la fecha en que se registró).
+const SELECT_REGISTRO_APROBACION = {
+  tipo_servicio: { select: { modulo_asociado: true } },
+  cotizacion: {
+    select: {
+      versiones: {
+        where: { ...WHERE_VERSION_APROBADA, fecha_aprobacion: { not: null } },
+        select: { fecha_aprobacion: true },
+        orderBy: { fecha_aprobacion: 'asc' },
+        take: 1
+      }
+    }
+  }
+};
+
+const esCorrectivo = (servicio) => servicio?.tipo_servicio?.modulo_asociado === MODULO_CORRECTIVO;
+const primeraAprobacionCotizacion = (servicio) => servicio?.cotizacion?.versiones?.[0]?.fecha_aprobacion || null;
 
 /**
- * Condición Prisma sobre el SERVICIO: su OT se registró entre `desde` y `hasta`
- * (días de Lima). Null si no se pidió rango. Sin OT no entra.
+ * Fecha de registro del servicio y de dónde sale.
+ * @param {object} servicio  con `ot_subida_en` y SELECT_REGISTRO_APROBACION.
+ * @returns {{ fecha: Date|null, origen: 'ot'|'aprobacion'|null }}
  */
-function whereRegistroOtEnRango({ desde, hasta }) {
+function registroContable(servicio) {
+  if (servicio?.ot_subida_en) return { fecha: servicio.ot_subida_en, origen: 'ot' };
+  const aprobacion = esCorrectivo(servicio) ? primeraAprobacionCotizacion(servicio) : null;
+  return aprobacion ? { fecha: aprobacion, origen: 'aprobacion' } : { fecha: null, origen: null };
+}
+
+const fechaRegistroContable = (servicio) => registroContable(servicio).fecha;
+
+/**
+ * Condición Prisma sobre el SERVICIO: su fecha de registro (`registroContable`)
+ * cae entre `desde` y `hasta` (días de Lima). Null si no se pidió rango.
+ *  - Con OT: la OT se registró en el rango.
+ *  - Correctivo sin OT: su PRIMERA aprobación cae en el rango, es decir, alguna
+ *    versión aprobada está en el rango y ninguna se aprobó antes de `desde`.
+ */
+function whereRegistroContableEnRango({ desde, hasta }) {
   if (!desde && !hasta) return null;
-  const ot_subida_en = {};
-  if (desde) ot_subida_en.gte = parseYMDLima(desde);
-  if (hasta) ot_subida_en.lte = parseYMDFinDiaLima(hasta);
-  return { ot_subida_en };
+  const rango = {};
+  if (desde) rango.gte = parseYMDLima(desde);
+  if (hasta) rango.lte = parseYMDFinDiaLima(hasta);
+  const versiones = { some: { ...WHERE_VERSION_APROBADA, fecha_aprobacion: rango } };
+  if (desde) versiones.none = { ...WHERE_VERSION_APROBADA, fecha_aprobacion: { lt: rango.gte } };
+  return {
+    OR: [
+      { ot_subida_en: rango },
+      {
+        ot_subida_en: null,
+        tipo_servicio: { modulo_asociado: MODULO_CORRECTIVO },
+        cotizacion: { is: { versiones } }
+      }
+    ]
+  };
 }
 
 // --- Fecha de comprobante (Contabilidad) ------------------------------------
@@ -116,7 +172,8 @@ async function idsServicioConComprobanteEnRango(client, { desde, hasta }) {
 // Lo que hace falta de un servicio para sus dos fechas.
 const SELECT_SERVICIO_FECHAS = {
   id: true, codigo: true, ot_subida_en: true,
-  historial_estados: INCLUDE_HISTORIAL_INICIO
+  historial_estados: INCLUDE_HISTORIAL_INICIO,
+  ...SELECT_REGISTRO_APROBACION
 };
 
 function fechasDeServicio(s) {
@@ -124,7 +181,7 @@ function fechasDeServicio(s) {
     id: s.id,
     codigo: s.codigo,
     fecha_servicio: fechaServicioContable(s),
-    fecha_registro: fechaRegistroOt(s)
+    fecha_registro: fechaRegistroContable(s)
   };
 }
 
@@ -225,8 +282,10 @@ async function idsFacturasConFechasEnRango(client, where, { servicio, registro }
 }
 
 module.exports = {
-  fechaRegistroOt,
-  whereRegistroOtEnRango,
+  SELECT_REGISTRO_APROBACION,
+  registroContable,
+  fechaRegistroContable,
+  whereRegistroContableEnRango,
   fechaComprobanteContable,
   idsServicioConComprobanteEnRango,
   conFechasDeServicios,

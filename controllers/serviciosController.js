@@ -44,7 +44,7 @@ const { normalizarMoneda } = require('../utils/catalogosBancarios');
 const { whereRealizadoConMonto, whereTotalRealizadoEnRango } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
 const { INCLUDE_HISTORIAL_INICIO, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
-const { fechaRegistroOt, whereRegistroOtEnRango, fechaComprobanteContable, idsServicioConComprobanteEnRango } = require('../utils/fechasContables');
+const { SELECT_REGISTRO_APROBACION, registroContable, whereRegistroContableEnRango, fechaComprobanteContable, idsServicioConComprobanteEnRango } = require('../utils/fechasContables');
 const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
@@ -1675,11 +1675,13 @@ const realizados = async (req, res) => {
     // fecha y quedan fuera mientras el rango esté puesto.
     const aprobadaEnRango = whereAprobadaEnRango({ desde: aprobacion_desde, hasta: aprobacion_hasta });
     if (aprobadaEnRango) servicioWhere.cotizacion = { is: aprobadaEnRango };
-    // Rangos por "Fecha de registro" (de la OT) y por "Fecha de comprobante",
-    // con el mismo criterio que pinta esas columnas (utils/fechasContables.js).
-    // Se combinan con los demás rangos.
-    const registroEnRango = whereRegistroOtEnRango({ desde: registro_desde, hasta: registro_hasta });
-    if (registroEnRango) Object.assign(servicioWhere, registroEnRango);
+    // Rangos por "Fecha de registro" (la OT o, en un correctivo sin OT, la
+    // aprobación de su cotización) y por "Fecha de comprobante", con el mismo
+    // criterio que pinta esas columnas (utils/fechasContables.js). Se combinan
+    // con los demás rangos. Va en AND: trae su propio OR y no debe pisar el
+    // del buscador.
+    const registroEnRango = whereRegistroContableEnRango({ desde: registro_desde, hasta: registro_hasta });
+    if (registroEnRango) servicioWhere.AND = [...(servicioWhere.AND || []), registroEnRango];
     const idsComprobanteEnRango = await idsServicioConComprobanteEnRango(prisma, { desde: comprobante_desde, hasta: comprobante_hasta });
     if (idsComprobanteEnRango) where.AND = [...(where.AND || []), { id_servicio: { in: idsComprobanteEnRango } }];
     // Filtro por situación de pago (columna "Situación"), excluyendo gratuitos:
@@ -1745,7 +1747,10 @@ const realizados = async (req, res) => {
               // Inicio real (primer paso a "En curso"): es la "Fecha servicio"
               // de todo servicio, la de la columna "Inicio" de los módulos operativos.
               historial_estados: INCLUDE_HISTORIAL_INICIO,
-                    cobro: { include: { facturas: true } }
+              // Primera aprobación de la cotización: "Fecha registro" de un
+              // correctivo que aún no tiene OT (utils/fechasContables.js).
+              cotizacion: SELECT_REGISTRO_APROBACION.cotizacion,
+              cobro: { include: { facturas: true } }
             }
           }
         }
@@ -1784,6 +1789,7 @@ const realizados = async (req, res) => {
       ...(resumen_facturacion ? { resumen_facturacion } : {}),
       data: result.data.map(r => {
         const plan = facturacionPlan.get(r.id_servicio);
+        const registro = registroContable(r.servicio);
         return {
           ...r,
           ...(plan ? { estado_facturacion: plan.estado_facturacion, estado_cobro: plan.estado_cobro } : {}),
@@ -1792,7 +1798,9 @@ const realizados = async (req, res) => {
           // las tarjetas y que decide el filtro por grupo.
           ...(verFinanzas ? { facturacion: situaciones.get(r.id) || null } : {}),
           fecha_servicio: fechaServicioContable(r.servicio),
-          fecha_registro: fechaRegistroOt(r.servicio),
+          fecha_registro: registro.fecha,
+          // 'ot' | 'aprobacion' (correctivo sin OT) | null: para el tooltip.
+          fecha_registro_origen: registro.origen,
           // Sale de las facturas del cobro (o del mes del plan): dato de los
           // roles con visibilidad financiera, como el bloque de cobro.
           fecha_comprobante: verFinanzas ? fechaComprobanteContable(r.servicio, plan) : null,
