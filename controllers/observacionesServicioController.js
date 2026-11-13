@@ -16,7 +16,7 @@ const prisma = require('../config/prisma');
 const { registrarActividadTecnico } = require('../utils/actividadTecnico');
 const { registrarAuditoria } = require('../utils/auditoria');
 const { esServicioPostRevision } = require('../utils/estadoServicio');
-const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
+const { esRolGestion, motivoBloqueo, expedienteCongelado } = require('../utils/registrosTecnico');
 const { sincronizarRecordatorioObservaciones, crearAlertaObservacion, descartarAlertaObservacion, sincronizarRecordatorioCotizacionUrgente } = require('../utils/recordatoriosAuto');
 const {
   DESTINATARIOS_POR_DEFECTO, normalizarDestinatarios, etiquetasDestinatarios
@@ -86,10 +86,10 @@ const crear = async (req, res) => {
     if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
 
     // Mismo gate que guías de salida: a partir de "En revisión administrativa"
-    // (y todo el flujo posterior) no se aceptan nuevas observaciones técnicas.
-    // El predicado deja pasar "Finalizado"
-    // para regularización.
-    if (esServicioPostRevision(servicio.estado_servicio)) {
+    // (y todo el flujo posterior) no se aceptan nuevas observaciones técnicas,
+    // salvo de Administración (ver utils/registrosTecnico.js). El predicado deja
+    // pasar "Finalizado" para regularización.
+    if (expedienteCongelado(req.user, servicio.estado_servicio)) {
       return res.status(400).json({
         error: `El servicio está ${servicio.estado_servicio}: no se pueden registrar observaciones técnicas`
       });

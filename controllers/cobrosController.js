@@ -17,6 +17,7 @@ const { whereCobroConMonto, whereCuotaConMonto } = require('../utils/montoACobra
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
 const { fechaUltimoAbono, sincronizarFechasPagoCuotas } = require('../utils/fechaPagoCuotas');
 const { aplicarCambioMontoAbono } = require('../utils/recalculoCobro');
+const { INCLUDE_HISTORIAL_INICIO, fechasServicioContable } = require('../utils/fechaServicioContable');
 
 const ETIQUETA_POR_METODO = Object.fromEntries(METODOS_PAGO.map(m => [m.codigo, m.etiqueta]));
 
@@ -261,7 +262,10 @@ const listar = async (req, res) => {
             asignaciones: { where: { estado: 1 }, include: { tecnico: true } },
             // La OT vive en el servicio (relación "ServicioOt"), no en su folder contable.
             archivo_ot: true,
-            servicio_realizado: true
+            servicio_realizado: true,
+            // Inicio real (primer paso a "En curso"): la fecha de EJECUCIÓN que
+            // "Fecha de servicio" muestra bajo la de programación.
+            historial_estados: INCLUDE_HISTORIAL_INICIO
           }
         },
         // Cobro de plan de mantenimiento (sin servicio): se muestra con el plan,
@@ -279,7 +283,13 @@ const listar = async (req, res) => {
     });
     // Persistir mora antes de calcular
     for (const c of cobros) await persistirEstadoMora(c);
-    let data = cobros.map(calcularMetricas);
+    // "Fecha de servicio": programación (principal) y ejecución (debajo, solo si
+    // ya arrancó), con el mismo criterio que Contabilidad. Un cobro de plan no
+    // tiene servicio propio (cubre varias visitas) y queda sin fechas.
+    let data = cobros.map(c => ({
+      ...calcularMetricas(c),
+      ...(c.servicio ? fechasServicioContable(c.servicio) : { fecha_programacion: null, fecha_ejecucion: null })
+    }));
 
     if (q) {
       const ql = q.toLowerCase();
@@ -1185,6 +1195,18 @@ const cuotasCalendario = async (req, res) => {
 };
 
 /**
+ * ¿Cuota VENCIDA? Impaga y con la fecha de vencimiento cumplida, con la misma
+ * regla de atraso que el cobro (diffDays < 0, ver calcularMetricas). Regla
+ * ÚNICA de la bandeja de cuotas por facturar: decide a la vez la etiqueta
+ * «Vencida» de la fila, el filtro `vencidas=1` y su contador del resumen.
+ */
+function cuotaVencida(cuota, ahora = new Date()) {
+  if (!cuota || cuota.estado_cuota === 'Pagada') return false;
+  if (aCentavos(cuota.monto_pagado) >= aCentavos(cuota.monto)) return false;
+  return diffDays(cuota.fecha_vencimiento, ahora) < 0;
+}
+
+/**
  * Cuotas PENDIENTES DE FACTURAR (Gestión de cobros → pestaña "Por facturar").
  *
  * Una cuota está pendiente de facturar cuando su cobro NO tiene una factura
@@ -1196,14 +1218,16 @@ const cuotasCalendario = async (req, res) => {
  * Cada fila trae la fecha de vencimiento (la fecha registrada de la cuota), el
  * cliente, el proyecto/servicio o plan y el tipo, para saber qué falta facturar
  * y en qué fecha. Filtros: q (cliente/servicio/documento), id_cliente,
- * id_proyecto, tipo_categoria, moneda, rango de fecha_vencimiento y orden.
+ * id_proyecto, tipo_categoria, moneda, rango de fecha_vencimiento, vencidas
+ * ('1' = solo las vencidas, ver cuotaVencida) y orden.
  */
 const cuotasNoFacturadas = async (req, res) => {
   try {
     const {
       q, id_cliente, id_proyecto, tipo_categoria, moneda,
-      fecha_desde, fecha_hasta, orden, direccion
+      fecha_desde, fecha_hasta, vencidas, orden, direccion
     } = req.query;
+    const ahora = new Date();
 
     const cobroWhere = { estado: 1 };
     if (id_cliente) cobroWhere.id_cliente = Number(id_cliente);
@@ -1286,6 +1310,7 @@ const cuotasNoFacturadas = async (req, res) => {
           monto: cu.monto,
           monto_pagado: cu.monto_pagado,
           estado_cuota: cu.estado_cuota,
+          vencida: cuotaVencida(cu, ahora),
           cobro: cobro ? {
             id: cobro.id,
             numero_cuotas: cobro.numero_cuotas,
@@ -1334,6 +1359,11 @@ const cuotasNoFacturadas = async (req, res) => {
       });
     }
 
+    // Vencidas: se cuentan ANTES de aplicar su propio filtro, para que el botón
+    // diga cuántas quedarían con el resto de filtros activos.
+    const cuotasVencidas = filas.filter(f => f.vencida).length;
+    if (vencidas === '1') filas = filas.filter(f => f.vencida);
+
     if (orden) {
       const dir = direccion === 'desc' ? -1 : 1;
       const getters = {
@@ -1361,6 +1391,7 @@ const cuotasNoFacturadas = async (req, res) => {
     const resultado = paginarArray(filas, req.query);
     resultado.resumen = {
       total_cuotas: filas.length,
+      cuotas_vencidas: cuotasVencidas,
       total_monto: aSoles(filas.reduce((acc, f) => acc + aCentavos(f.monto), 0)),
       total_por_cobrar: aSoles(filas.reduce((acc, f) => acc + Math.max(0, aCentavos(f.monto) - aCentavos(f.monto_pagado)), 0))
     };

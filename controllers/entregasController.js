@@ -3,6 +3,13 @@ const { registrarAuditoria } = require('../utils/auditoria');
 const { puedeVerFinanzasReq, servicioSinPrecios } = require('../utils/visibilidadFinanzas');
 const { paginar } = require('../utils/paginacion');
 const { estaServicioFinalizado } = require('../utils/estadoServicio');
+const { puedeEditarServicioCerrado } = require('../utils/registrosTecnico');
+
+// Las entregas se congelan cuando el servicio termina, salvo para Administración,
+// que las sigue registrando y corrigiendo con el servicio cerrado (no si está
+// cancelado). Ver utils/registrosTecnico.js.
+const entregasCongeladas = (user, estadoSrv) =>
+  estaServicioFinalizado(estadoSrv) && !puedeEditarServicioCerrado(user, estadoSrv);
 const { parseYMDLima } = require('../utils/tiempo');
 const { porServicioRelacionWhere, porServicioAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const {
@@ -67,7 +74,7 @@ const crear = async (req, res) => {
       return res.status(400).json({ error: 'Servicio, tipo y fecha obligatorios' });
     }
     const estadoSrv = await _estadoServicio(Number(d.id_servicio));
-    if (estaServicioFinalizado(estadoSrv)) {
+    if (entregasCongeladas(req.user, estadoSrv)) {
       return res.status(400).json({ error: `El servicio está ${estadoSrv}: no se puede registrar entregas` });
     }
     const { ent, documentos } = await prisma.$transaction(async (tx) => {
@@ -110,7 +117,7 @@ const actualizar = async (req, res) => {
     const previo = await prisma.tbl_entregas.findUnique({ where: { id } });
     if (!previo) return res.status(404).json({ error: 'No encontrada' });
     const estadoSrv = await _estadoServicio(previo.id_servicio);
-    if (estaServicioFinalizado(estadoSrv)) {
+    if (entregasCongeladas(req.user, estadoSrv)) {
       return res.status(400).json({ error: `El servicio está ${estadoSrv}: no se puede modificar entregas` });
     }
     const { ent, documentos } = await prisma.$transaction(async (tx) => {

@@ -3,7 +3,7 @@ const { ESTADO_EVENTO_FINALIZADO, ESTADO_EVENTO_CANCELADO } = require('../utils/
 const { registrarAuditoria } = require('../utils/auditoria');
 // Roles con visibilidad de datos económicos (SSoT compartido con el resto del backend).
 const { ROLES_FINANZAS: ROLES_PRECIO } = require('../utils/visibilidadFinanzas');
-const { esRolGestion, motivoBloqueo } = require('../utils/registrosTecnico');
+const { esRolGestion, motivoBloqueo, expedienteCongelado } = require('../utils/registrosTecnico');
 const { adjuntarAutorSinTecnico } = require('../utils/autorRegistro');
 const { generarCodigoServicio } = require('../utils/codigoServicio');
 const {
@@ -43,7 +43,7 @@ const {
 const { normalizarMoneda } = require('../utils/catalogosBancarios');
 const { whereRealizadoConMonto, whereTotalRealizadoEnRango } = require('../utils/montoACobrar');
 const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
-const { INCLUDE_HISTORIAL_INICIO, fechaServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
+const { INCLUDE_HISTORIAL_INICIO, fechasServicioContable, whereFechaServicioEnRango } = require('../utils/fechaServicioContable');
 const { SELECT_REGISTRO_APROBACION, registroContable, whereRegistroContableEnRango, fechaComprobanteContable, idsServicioConComprobanteEnRango } = require('../utils/fechasContables');
 const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
@@ -1627,8 +1627,8 @@ const realizados = async (req, res) => {
     if (estado_cobro) where.estado_cobro = estado_cobro;
     if (estado_facturacion) where.estado_facturacion = estado_facturacion;
     if (rango_fecha === 'servicio') {
-      // Contabilidad filtra por su "Fecha servicio": el inicio real de la
-      // ejecución, para todo tipo de servicio.
+      // Contabilidad filtra por su "Fecha servicio": la fecha de PROGRAMACIÓN
+      // del servicio, la principal de la columna (utils/fechaServicioContable.js).
       const fechaServicioEnRango = whereFechaServicioEnRango({ desde, hasta });
       if (fechaServicioEnRango) where.AND = [...(where.AND || []), fechaServicioEnRango];
     } else if (desde || hasta) {
@@ -1744,8 +1744,8 @@ const realizados = async (req, res) => {
               // servicios de plan no llevan precio propio, así que sin esto la
               // columna "Total" mostraba S/ 0.00 en cada visita.
               mantenimiento_plan: { select: { id: true, monto_mensual: true, moneda: true } },
-              // Inicio real (primer paso a "En curso"): es la "Fecha servicio"
-              // de todo servicio, la de la columna "Inicio" de los módulos operativos.
+              // Inicio real (primer paso a "En curso"): la fecha de EJECUCIÓN
+              // que la columna "Fecha servicio" muestra bajo la de programación.
               historial_estados: INCLUDE_HISTORIAL_INICIO,
               // Primera aprobación de la cotización: "Fecha registro" de un
               // correctivo que aún no tiene OT (utils/fechasContables.js).
@@ -1797,7 +1797,9 @@ const realizados = async (req, res) => {
           // Facturado / por facturar de la fila: la misma situación que suman
           // las tarjetas y que decide el filtro por grupo.
           ...(verFinanzas ? { facturacion: situaciones.get(r.id) || null } : {}),
-          fecha_servicio: fechaServicioContable(r.servicio),
+          // "Fecha servicio": programación (principal) y ejecución (debajo,
+          // solo si ya arrancó).
+          ...fechasServicioContable(r.servicio),
           fecha_registro: registro.fecha,
           // 'ot' | 'aprobacion' (correctivo sin OT) | null: para el tooltip.
           fecha_registro_origen: registro.origen,
@@ -1853,13 +1855,14 @@ const guardarOt = async (req, res) => {
       where: { id },
       select: {
         id: true, estado: true, estado_servicio: true, numero_ot: true, id_archivo_ot: true,
+        ot_subida_en: true, ot_subida_por: true,
         asignaciones: { where: { estado: 1 }, select: { id_tecnico: true, responsable_documentacion: true } }
       }
     });
     if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
     // Una vez que el servicio pasó a revisión/cobro su documentación queda
-    // congelada: corregir la OT ahí cambiaría lo que contabilidad ya revisó.
-    if (esServicioPostRevision(servicio.estado_servicio)) {
+    // congelada, salvo para Administración (ver utils/registrosTecnico.js).
+    if (expedienteCongelado(req.user, servicio.estado_servicio)) {
       return res.status(409).json({
         error: `El servicio está en "${servicio.estado_servicio}": la OT ya no se puede modificar`
       });
@@ -1870,13 +1873,18 @@ const guardarOt = async (req, res) => {
       return res.status(403).json({ error: 'Solo el responsable documental puede registrar la OT' });
     }
 
+    // `ot_subida_en` es la fecha de registro del servicio en Contabilidad y
+    // Facturas (utils/fechasContables.js). Si Administración corrige la OT de un
+    // servicio ya revisado, se conserva la original: una corrección documental no
+    // debe mover el servicio a otro periodo contable.
+    const conservaRegistro = esServicioPostRevision(servicio.estado_servicio) && !!servicio.ot_subida_en;
     const actualizado = await prisma.tbl_servicios_proyectos.update({
       where: { id },
       data: {
         numero_ot: numero,
         id_archivo_ot: idArchivo,
-        ot_subida_por: req.user.id,
-        ot_subida_en: new Date(),
+        ot_subida_por: conservaRegistro ? servicio.ot_subida_por : req.user.id,
+        ot_subida_en: conservaRegistro ? servicio.ot_subida_en : new Date(),
         user_id_modification: req.user.id,
         date_time_modification: new Date()
       },
@@ -1918,7 +1926,7 @@ const eliminarOt = async (req, res) => {
       select: { id: true, estado: true, estado_servicio: true, numero_ot: true, id_archivo_ot: true }
     });
     if (!servicio || servicio.estado !== 1) return res.status(404).json({ error: 'Servicio no encontrado' });
-    if (esServicioPostRevision(servicio.estado_servicio)) {
+    if (expedienteCongelado(req.user, servicio.estado_servicio)) {
       return res.status(409).json({
         error: `El servicio está en "${servicio.estado_servicio}": la OT ya no se puede modificar`
       });
@@ -1927,10 +1935,14 @@ const eliminarOt = async (req, res) => {
       return res.status(400).json({ error: 'El servicio no tiene OT registrada' });
     }
 
+    // En un servicio ya revisado, quitar la OT para reemplazarla no borra su
+    // fecha de registro contable (ver guardarOt): la nueva OT hereda la original.
+    const conservaRegistro = esServicioPostRevision(servicio.estado_servicio);
     await prisma.tbl_servicios_proyectos.update({
       where: { id },
       data: {
-        numero_ot: null, id_archivo_ot: null, ot_subida_por: null, ot_subida_en: null,
+        numero_ot: null, id_archivo_ot: null,
+        ...(conservaRegistro ? {} : { ot_subida_por: null, ot_subida_en: null }),
         user_id_modification: req.user.id, date_time_modification: new Date()
       }
     });
@@ -1978,7 +1990,7 @@ const crearGuia = async (req, res) => {
     if (!puedeUsuarioGestionarGuia(req.user, servicio.asignaciones)) {
       return res.status(403).json({ error: 'No tiene permisos para gestionar guías de este servicio' });
     }
-    if (esServicioPostRevision(servicio.estado_servicio)) {
+    if (expedienteCongelado(req.user, servicio.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${servicio.estado_servicio}: no se pueden registrar guías de salida` });
     }
 
@@ -2040,7 +2052,7 @@ const actualizarGuia = async (req, res) => {
     if (!puedeUsuarioGestionarGuia(req.user, guiaPrevia.servicio.asignaciones)) {
       return res.status(403).json({ error: 'No tiene permisos para gestionar guías de este servicio' });
     }
-    if (esServicioPostRevision(guiaPrevia.servicio.estado_servicio)) {
+    if (expedienteCongelado(req.user, guiaPrevia.servicio.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${guiaPrevia.servicio.estado_servicio}: no se pueden modificar guías de salida` });
     }
 
@@ -2151,7 +2163,7 @@ const eliminarGuia = async (req, res) => {
     if (previa.id_servicio !== id_servicio) {
       return res.status(400).json({ error: 'La guía no pertenece a este servicio' });
     }
-    if (esServicioPostRevision(previa.servicio?.estado_servicio)) {
+    if (expedienteCongelado(req.user, previa.servicio?.estado_servicio)) {
       return res.status(400).json({ error: `El servicio está ${previa.servicio.estado_servicio}: no se pueden eliminar guías de salida` });
     }
 
