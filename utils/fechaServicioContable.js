@@ -1,4 +1,4 @@
-// "Fecha servicio" de Contabilidad y de Gestión de cobros: criterio ÚNICO para
+// "Fecha servicio" de Contabilidad, Facturas y Gestión de cobros: criterio ÚNICO para
 // las fechas que se muestran en cada fila y para el filtro por rango, así el
 // filtro trae exactamente lo que la columna dice. La columna lleva DOS fechas
 // del servicio (pedido de la usuaria, 12/11/2026):
@@ -15,8 +15,9 @@
 // `fecha_realizacion` del realizado: en correctivos ese registro nace al
 // aprobarse la cotización, antes de ejecutar el trabajo.
 //
-// Facturas sigue mostrando en su "Fecha servicio" la de ejecución
-// (`fechaServicioContable`, vía utils/fechasContables.js).
+// Facturas usa las mismas dos fechas desde el 14/11/2026 (antes mostraba solo
+// la ejecución), con las de cada servicio que cubre la factura: ver
+// utils/fechasContables.js.
 
 const { parseYMDUTC } = require('./tiempo');
 const { fechaInicioReal, INCLUDE_HISTORIAL_INICIO } = require('./ejecucionFechas');
@@ -50,9 +51,6 @@ function fechasServicioContable(servicio) {
   };
 }
 
-// "Fecha servicio" de Facturas: la de ejecución (ver arriba).
-const fechaServicioContable = fechaEjecucionServicio;
-
 /**
  * Condición Prisma sobre tbl_servicios_realizados: la fecha de PROGRAMACIÓN del
  * servicio entre `desde` y `hasta` (YYYY-MM-DD; extremos opcionales e
@@ -75,6 +73,5 @@ module.exports = {
   fechaProgramacionServicio,
   fechaEjecucionServicio,
   fechasServicioContable,
-  fechaServicioContable,
   whereFechaServicioEnRango
 };

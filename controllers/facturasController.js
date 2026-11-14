@@ -28,6 +28,7 @@ const { detalleMensualDeCuota } = require('../utils/planMantenimientoMensual');
 const { sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
 const { porServicioOPlanAscensorEdificioWhere, conAlcance } = require('../utils/alcanceUsuario');
 const { conFechasDeServicios, idsFacturasConFechasEnRango } = require('../utils/fechasContables');
+const { whereAprobadaEnRango } = require('../utils/estadoCotizacion');
 const {
   MAX_DOCUMENTOS_FACTURA,
   SELECT_ARCHIVO,
@@ -189,7 +190,7 @@ const listar = async (req, res) => {
   try {
     const {
       id_cliente, id_servicio, q, estado_factura, tipo_comprobante, cobertura, tipo_categoria, situacion, moneda, desde, hasta,
-      servicio_desde, servicio_hasta, registro_desde, registro_hasta
+      servicio_desde, servicio_hasta, registro_desde, registro_hasta, aprobacion_desde, aprobacion_hasta
     } = req.query;
     // Se acumulan en AND porque hay dos filtros que usan OR (búsqueda libre y
     // tipo de servicio): asignarlos a where.OR directamente se pisarían.
@@ -291,6 +292,13 @@ const listar = async (req, res) => {
       registro: { desde: registro_desde, hasta: registro_hasta }
     });
     if (idsPorFechas) and.push({ id: { in: idsPorFechas } });
+    // Rango por FECHA DE APROBACIÓN de la cotización del servicio facturado:
+    // mismo criterio que Contabilidad, Gestión de cobros y Cotizaciones
+    // (whereAprobadaEnRango). Las facturas sin cotización detrás (planes de
+    // mantenimiento, servicios directos) no tienen esa fecha y quedan fuera
+    // mientras el rango esté puesto, igual que en Contabilidad.
+    const aprobadaEnRango = whereAprobadaEnRango({ desde: aprobacion_desde, hasta: aprobacion_hasta });
+    if (aprobadaEnRango) and.push({ servicio: { is: { cotizacion: { is: aprobadaEnRango } } } });
 
     // Análisis del conjunto filtrado ANTES de paginar y antes de aplicar la
     // situación: de él salen los dos indicadores y el propio filtro rápido, así

@@ -18,12 +18,15 @@
 //    el suyo o, si es una factura de plan, los mantenimientos de su mes (o de
 //    todo el plan, si es general). Con varios servicios se da el rango
 //    (primera y última) y el filtro acepta la factura si alguno cae dentro.
+//    Su "Fecha servicio" es la misma que la de Contabilidad (pedido de la
+//    usuaria, 14/11/2026): la PROGRAMACIÓN, que es la que filtra, y debajo la
+//    EJECUCIÓN (inicio real), si ya se ejecutó.
 
 const { ymdLima, ymdDeFecha, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC } = require('./tiempo');
 const { ESTADO_FACTURA_ANULADA } = require('./estadoFactura');
 const { ESTADO_CANCELADO } = require('./ejecucionFechas');
 const { facturacionDeServiciosPlan } = require('./facturacionServiciosPlan');
-const { INCLUDE_HISTORIAL_INICIO, fechaServicioContable } = require('./fechaServicioContable');
+const { INCLUDE_HISTORIAL_INICIO, fechasServicioContable } = require('./fechaServicioContable');
 const { ESTADOS_VERSION } = require('./estadoCotizacion');
 
 const WHERE_FACTURA_VIGENTE = { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } };
@@ -33,6 +36,8 @@ const esFacturaVigente = (f) => !!f && f.estado === 1 && f.estado_factura !== ES
 // instantes (se leen en Lima); la de emisión es un día puro (@db.Date).
 const diaDeInstante = (fecha) => (fecha ? ymdLima(new Date(fecha)) : null);
 const diaDeEmision = (fecha) => (fecha ? ymdDeFecha(fecha) : null);
+// La programación del servicio (`fecha_programada`) también es un día puro.
+const diaDeProgramacion = diaDeEmision;
 
 // ¿El día cae en el rango { desde, hasta } (YYYY-MM-DD, extremos opcionales e
 // inclusivos)?
@@ -169,32 +174,48 @@ async function idsServicioConComprobanteEnRango(client, { desde, hasta }) {
 
 // --- Fechas de servicio y de registro de cada factura (Facturas) ------------
 
-// Lo que hace falta de un servicio para sus dos fechas.
+// Lo que hace falta de un servicio para sus fechas.
 const SELECT_SERVICIO_FECHAS = {
-  id: true, codigo: true, ot_subida_en: true,
+  id: true, codigo: true, fecha_programada: true, ot_subida_en: true,
   historial_estados: INCLUDE_HISTORIAL_INICIO,
   ...SELECT_REGISTRO_APROBACION
 };
 
+// `fecha_servicio` = programación (la principal de la columna y la que filtra);
+// `fecha_ejecucion` = inicio real. Mismo criterio que Contabilidad
+// (utils/fechaServicioContable.js).
 function fechasDeServicio(s) {
+  const { fecha_programacion, fecha_ejecucion } = fechasServicioContable(s);
+  const registro = registroContable(s);
   return {
     id: s.id,
     codigo: s.codigo,
-    fecha_servicio: fechaServicioContable(s),
-    fecha_registro: fechaRegistroContable(s)
+    fecha_servicio: fecha_programacion,
+    fecha_ejecucion,
+    fecha_registro: registro.fecha,
+    fecha_registro_origen: registro.origen
   };
 }
 
-// Primera y última fecha (por día de Lima) de la lista.
-function extremos(fechas) {
+// Primera y última fecha de la lista. `dia` da el día con el que se comparan:
+// de Lima para los instantes (ejecución, registro) y tal cual para los días
+// puros (programación).
+function extremos(fechas, dia = diaDeInstante) {
   let primera = null;
   let ultima = null;
   for (const f of fechas) {
     if (!f) continue;
-    if (!primera || diaDeInstante(f) < diaDeInstante(primera)) primera = f;
-    if (!ultima || diaDeInstante(f) > diaDeInstante(ultima)) ultima = f;
+    if (!primera || dia(f) < dia(primera)) primera = f;
+    if (!ultima || dia(f) > dia(ultima)) ultima = f;
   }
   return [primera, ultima];
+}
+
+// Origen común de la fecha de registro ('ot' | 'aprobacion'), o null si no hay
+// o si los servicios de la factura la toman de sitios distintos.
+function origenComun(lista) {
+  const origenes = [...new Set(lista.filter(s => s.fecha_registro).map(s => s.fecha_registro_origen))];
+  return origenes.length === 1 ? origenes[0] : null;
 }
 
 /**
@@ -204,9 +225,12 @@ function extremos(fechas) {
  * @param {Array<{id, id_servicio, id_mantenimiento_plan, id_cuota}>} facturas
  * @returns {Promise<Map<number, {
  *   fecha_servicio: Date|null, fecha_servicio_hasta: Date|null,
+ *   fecha_ejecucion: Date|null, fecha_ejecucion_hasta: Date|null,
  *   fecha_registro: Date|null, fecha_registro_hasta: Date|null,
- *   servicios_fechas: Array<{id, codigo, fecha_servicio, fecha_registro}>
- * }>>}  `*_hasta` = la última, cuando la factura cubre varios servicios.
+ *   fecha_registro_origen: 'ot'|'aprobacion'|null,
+ *   servicios_fechas: Array<{id, codigo, fecha_servicio, fecha_ejecucion, fecha_registro, fecha_registro_origen}>
+ * }>>}  `fecha_servicio` = programación; `*_hasta` = la última, cuando la
+ *        factura cubre varios servicios.
  */
 async function fechasDeServiciosDeFacturas(client, facturas) {
   const salida = new Map();
@@ -242,13 +266,17 @@ async function fechasDeServiciosDeFacturas(client, facturas) {
 
   for (const f of facturas) {
     const lista = cubiertos(f).map(id => fechasPorServicio.get(id)).filter(Boolean);
-    const [servicioDesde, servicioHasta] = extremos(lista.map(s => s.fecha_servicio));
+    const [servicioDesde, servicioHasta] = extremos(lista.map(s => s.fecha_servicio), diaDeProgramacion);
+    const [ejecucionDesde, ejecucionHasta] = extremos(lista.map(s => s.fecha_ejecucion));
     const [registroDesde, registroHasta] = extremos(lista.map(s => s.fecha_registro));
     salida.set(f.id, {
       fecha_servicio: servicioDesde,
       fecha_servicio_hasta: servicioHasta,
+      fecha_ejecucion: ejecucionDesde,
+      fecha_ejecucion_hasta: ejecucionHasta,
       fecha_registro: registroDesde,
       fecha_registro_hasta: registroHasta,
+      fecha_registro_origen: origenComun(lista),
       servicios_fechas: lista
     });
   }
@@ -262,9 +290,9 @@ async function conFechasDeServicios(client, facturas) {
 }
 
 /**
- * id de las facturas de `where` con algún servicio cuya fecha de servicio y
- * de registro caen en sus rangos (los que se pidieron), o null si no se pidió
- * ninguno de los dos.
+ * id de las facturas de `where` con algún servicio cuya fecha de servicio
+ * (programación, como en Contabilidad) y de registro caen en sus rangos (los
+ * que se pidieron), o null si no se pidió ninguno de los dos.
  */
 async function idsFacturasConFechasEnRango(client, where, { servicio, registro }) {
   if (!hayRango(servicio) && !hayRango(registro)) return null;
@@ -274,7 +302,7 @@ async function idsFacturasConFechasEnRango(client, where, { servicio, registro }
   });
   const fechas = await fechasDeServiciosDeFacturas(client, facturas);
   const cumple = (s) =>
-    (!hayRango(servicio) || diaEnRango(diaDeInstante(s.fecha_servicio), servicio))
+    (!hayRango(servicio) || diaEnRango(diaDeProgramacion(s.fecha_servicio), servicio))
     && (!hayRango(registro) || diaEnRango(diaDeInstante(s.fecha_registro), registro));
   return facturas
     .filter(f => (fechas.get(f.id)?.servicios_fechas || []).some(cumple))
