@@ -5,20 +5,25 @@
  * En Perú el comprobante que corresponde depende de quién recibe:
  *   · Factura → contribuyentes con RUC (empresas, juntas de propietarios…).
  *   · Boleta  → consumidor final, identificado con DNI.
+ *   · Nota    → no depende del documento del receptor; nunca se sugiere,
+ *               solo se elige a mano.
  *
  * Esa correspondencia se usa solo para SUGERIR el tipo al emitir (ver
  * `tipoComprobanteSugerido`): quien emite puede cambiarlo, porque hay casos
  * legítimos en ambos sentidos. No se valida contra el documento del cliente.
  *
  * `serie_prefijo` es la letra con la que arranca la serie del comprobante
- * (F001-000123 / B001-000123); alimenta el placeholder del formulario.
+ * (F001-000123 / B001-000123 / N001-000123); alimenta el placeholder del
+ * formulario.
  */
 const TIPO_COMPROBANTE_FACTURA = 'Factura';
 const TIPO_COMPROBANTE_BOLETA = 'Boleta';
+const TIPO_COMPROBANTE_NOTA = 'Nota';
 
 const TIPOS_COMPROBANTE = [
   { codigo: TIPO_COMPROBANTE_FACTURA, etiqueta: 'Factura', serie_prefijo: 'F', documento: 'RUC' },
-  { codigo: TIPO_COMPROBANTE_BOLETA,  etiqueta: 'Boleta',  serie_prefijo: 'B', documento: 'DNI' }
+  { codigo: TIPO_COMPROBANTE_BOLETA,  etiqueta: 'Boleta',  serie_prefijo: 'B', documento: 'DNI' },
+  { codigo: TIPO_COMPROBANTE_NOTA,    etiqueta: 'Nota',    serie_prefijo: 'N', documento: null }
 ];
 
 const TIPOS_COMPROBANTE_CODIGOS = TIPOS_COMPROBANTE.map(t => t.codigo);
@@ -50,6 +55,7 @@ function tipoComprobanteSugerido(tipoDocumento) {
 module.exports = {
   TIPO_COMPROBANTE_FACTURA,
   TIPO_COMPROBANTE_BOLETA,
+  TIPO_COMPROBANTE_NOTA,
   TIPOS_COMPROBANTE,
   TIPOS_COMPROBANTE_CODIGOS,
   TIPO_COMPROBANTE_POR_DEFECTO,
