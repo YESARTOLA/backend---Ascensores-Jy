@@ -31,6 +31,7 @@ const { derivarEjecucion } = require('../utils/ejecucionFechas');
 const { validarPertenenciaAscensores } = require('../utils/ascensoresMonto');
 const { MONEDA_POR_DEFECTO, normalizarMoneda } = require('../utils/catalogosBancarios');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
+const { cobrosPorServicioDelPlan } = require('../utils/cobroServicioPlanLegacy');
 const { reconstruirCronogramaPlan } = require('../utils/reconstruirCronogramaPlan');
 const {
   estaServicioRealizado, esServicioEditable, ESTADO_SERVICIO_CANCELADO, ESTADO_SERVICIO_PENDIENTE, ESTADO_SERVICIO_ASIGNADO
@@ -2230,6 +2231,13 @@ const listarPeriodos = async (req, res) => {
           }))
         }
       });
+    }
+    // Plan legacy (sin cobro único): no factura por mes sino por servicio. En
+    // vez de meses que no se pueden aprobar, el detalle muestra el cobro y la
+    // factura de cada mantenimiento (utils/cobroServicioPlanLegacy).
+    if (!data.id_cobro) {
+      data.factura_por_servicio = true;
+      data.cobros_por_servicio = await cobrosPorServicioDelPlan(prisma, id);
     }
     res.json({ data });
   } catch (err) {

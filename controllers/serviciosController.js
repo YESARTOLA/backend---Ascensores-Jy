@@ -48,6 +48,7 @@ const { SELECT_REGISTRO_APROBACION, registroContable, whereRegistroContableEnRan
 const { INCLUDE_DOCUMENTOS_ENTREGA } = require('../utils/documentosEntrega');
 const { combinarFechaHoraLima, parseYMDLima, parseYMDFinDiaLima, parseYMDUTC, ymdDeFecha, addDiasYMD } = require('../utils/tiempo');
 const { crearCobroInicial } = require('../utils/crearCobroInicial');
+const { planFacturaPorMes, montoCobroServicioPlanLegacy, crearCobroServicioPlanLegacy } = require('../utils/cobroServicioPlanLegacy');
 const { facturacionDeServiciosPlan, sincronizarFacturacionServiciosPlan } = require('../utils/facturacionServiciosPlan');
 const {
   sincronizarRecordatorioServicio,
@@ -1353,15 +1354,20 @@ const finalizarServicio = async (req, res) => {
         facturas: { where: { estado: 1, estado_factura: { not: ESTADO_FACTURA_ANULADA } } }
       }
     });
-    // Servicios de un plan de mantenimiento: la facturación es ÚNICA a nivel de
-    // plan (un solo cobro por el total del plan, creado al crear el plan), nunca
-    // por servicio. Por eso estos servicios no llevan cobro propio ni alerta de
-    // "facturar"; su folder contable queda 'Sin cobro' / 'Sin factura'.
-    const esServicioDePlan = !!servicio.id_mantenimiento_plan;
+    // Servicios de un plan de mantenimiento del modelo mensual: la facturación
+    // es ÚNICA a nivel de plan (un solo cobro que crece una cuota por mes),
+    // nunca por servicio. Por eso no llevan cobro propio ni alerta de "facturar".
+    // Los planes LEGACY (sin cobro único) cobran y facturan por servicio: a sus
+    // mantenimientos se les crea el cobro propio (utils/cobroServicioPlanLegacy).
+    const esServicioDePlan = await planFacturaPorMes(prisma, servicio.id_mantenimiento_plan);
+    const montoPlanLegacy = (servicio.id_mantenimiento_plan && !esServicioDePlan && !cobroPrevio && servicio.sin_cobro !== 1)
+      ? await montoCobroServicioPlanLegacy(prisma, servicio)
+      : null;
     // Mantenimiento gratuito / cobertura: nunca debe ir a "Pendiente de iniciar"
     // porque no se le crea cobro (ver fallback más abajo). Si por error legacy
     // existiera un cobroPrevio para este servicio, su estado tampoco aplica.
-    const esGratuito = servicio.sin_cobro === 1;
+    // Tampoco el mantenimiento de un plan legacy sin importe.
+    const esGratuito = servicio.sin_cobro === 1 || (montoPlanLegacy !== null && montoPlanLegacy <= 0);
     // Mantenimiento de plan: factura y cobro son los de SU MES del plan (la
     // cuota del cobro único), que pudo aprobarse, facturarse o pagarse antes de
     // ejecutar las visitas (utils/facturacionServiciosPlan).
@@ -1420,9 +1426,13 @@ const finalizarServicio = async (req, res) => {
 
     // Fallback: crear cobro si el servicio no viene de cotización aprobada
     // (servicios directos). Los aprobados desde cotización ya tienen su cobro.
-    // Los servicios de un PLAN de mantenimiento NUNCA crean cobro propio: la
-    // facturación es única a nivel de plan.
-    if (!cobroPrevio && servicio.sin_cobro !== 1 && !esServicioDePlan) {
+    // Los servicios de un plan del modelo mensual NUNCA crean cobro propio: la
+    // facturación es única a nivel de plan. Los de un plan legacy, sí.
+    if (montoPlanLegacy !== null) {
+      if (montoPlanLegacy > 0) {
+        await crearCobroServicioPlanLegacy(prisma, servicio, montoPlanLegacy, req.user.id);
+      }
+    } else if (!cobroPrevio && servicio.sin_cobro !== 1 && !esServicioDePlan) {
       await crearCobroInicial(prisma, {
         idServicio: id,
         idCliente: servicio.id_cliente,
@@ -1521,8 +1531,8 @@ const finalizarServicio = async (req, res) => {
     //   · servicio_finalizado_revisar  → coordinador (revisar y corregir)
     //   · servicio_finalizado_facturar → contabilidad (emitir factura)
     //   · servicio_finalizado_aviso    → admin (aviso informativo)
-    // La alerta "facturar" se OMITE para servicios de plan: la facturación es
-    // única a nivel de plan, no por servicio.
+    // La alerta "facturar" se OMITE para servicios de un plan del modelo
+    // mensual: la facturación es única a nivel de plan, no por servicio.
     Promise.allSettled([
       sincronizarRecordatorioRevisarServicio(id),
       esServicioDePlan ? Promise.resolve() : sincronizarRecordatorioFacturarServicio(id),
